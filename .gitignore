@@ -1,0 +1,9 @@
+# The upstream Linux checkout is a local nested repository. It is kept outside
+# the AOK history and mounted from a case-sensitive volume on macOS.
+kernel/linux/
+.aok-linux-*.sparseimage
+
+# macOS metadata.
+.DS_Store
+host/.build/
+kernel/.build/

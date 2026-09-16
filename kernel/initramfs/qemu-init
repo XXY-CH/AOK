@@ -1,0 +1,54 @@
+#!/bin/sh
+
+set -u
+
+log() {
+    printf '%s\n' "$*"
+}
+
+mount -t proc proc /proc 2>/dev/null || log 'AOK_PROBE_PROC=mount-failed'
+mount -t sysfs sysfs /sys 2>/dev/null || log 'AOK_PROBE_SYSFS=mount-failed'
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || log 'AOK_PROBE_DEVTMPFS=mount-failed'
+mkdir -p /sys/kernel/security
+mount -t securityfs securityfs /sys/kernel/security 2>/dev/null || log 'AOK_PROBE_SECURITYFS=mount-failed'
+
+log 'AOK_PROBE_INIT=started'
+log "AOK_PROBE_CMDLINE=$(cat /proc/cmdline 2>/dev/null || true)"
+log "AOK_PROBE_UNAME=$(uname -a 2>/dev/null || true)"
+
+if [ -r /proc/config.gz ]; then
+    log 'AOK_PROBE_CONFIG_GZ=present'
+else
+    log 'AOK_PROBE_CONFIG_GZ=absent'
+fi
+
+if [ -e /sys/kernel/sched_ext ]; then
+    log "AOK_PROBE_SCHED_EXT=runtime:$(cat /sys/kernel/sched_ext/state 2>/dev/null || printf present)"
+else
+    log 'AOK_PROBE_SCHED_EXT=runtime-unbound'
+fi
+
+if [ -e /sys/kernel/security/landlock ]; then
+    log 'AOK_PROBE_LANDLOCK=runtime-present'
+else
+    log 'AOK_PROBE_LANDLOCK=api-only-check-required'
+fi
+if [ -r /sys/kernel/security/lsm ]; then
+    log "AOK_PROBE_LSM=$(cat /sys/kernel/security/lsm)"
+fi
+
+if [ -e /dev/vsock ]; then
+    log 'AOK_PROBE_VSOCK=present'
+else
+    log 'AOK_PROBE_VSOCK=absent'
+fi
+
+if [ -d /sys/bus/virtio/drivers ]; then
+    log "AOK_PROBE_VIRTIO_DRIVERS=$(ls /sys/bus/virtio/drivers 2>/dev/null | tr '\n' ',')"
+fi
+
+log 'AOK_PROBE_STATUS=pass'
+
+while :; do
+    sleep 3600
+done

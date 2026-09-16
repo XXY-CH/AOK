@@ -1,0 +1,1340 @@
+diff --git a/include/linux/aok.h b/include/linux/aok.h
+index 3615f21d9..0d1e4f9b5 100644
+--- a/include/linux/aok.h
++++ b/include/linux/aok.h
+@@ -3,18 +3,58 @@
+ #define _LINUX_AOK_H
+ 
+ #include <linux/refcount.h>
++#include <linux/spinlock_types.h>
+ #include <linux/types.h>
+ 
++struct file;
++struct pid;
++struct task_struct;
++
++/* Bounded per-aproc event ring; see aok_aproc_read() for overflow rules. */
++#define AOK_EVENT_QUEUE_LEN	128
++#define AOK_MAX_TASKS		4096
++
++/* State and right vocabulary lives in include/uapi/linux/aok.h. */
++
++struct aok_event_slot {
++	u64 aid;
++	u64 task_koid;
++	u64 event_seq;
++	u32 kind;
++	u32 state;
++};
++
+ struct aok_aproc {
+ 	refcount_t refs;
+ 	u64 aid;
+ 	u32 state;
++	spinlock_t lock;		/* guards tasks/events/state */
++	struct list_head tasks;		/* member tasks via task->aok_tasks */
++	unsigned long ntasks;
++	unsigned long task_total;
++	bool freeze_req;		/* late joiners freeze on first run */
++	u64 rights_ceiling;
++	u64 event_seq;			/* last assigned, monotonic */
++	unsigned long events_dropped;
++	struct aok_event_slot events[AOK_EVENT_QUEUE_LEN];
+ };
+ 
+ struct aok_handle {
+-	struct aok_aproc *aproc;
++	struct aok_aproc *aproc;	/* NULL for the root job */
+ 	u64 rights;
+ 	u32 type;
++	u64 read_seq;			/* per-open event cursor */
++};
++
++/* Handoff between aok syscalls and the copy_process() hook. */
++struct aok_spawn_req {
++	struct aok_aproc *aproc;
++	struct task_struct *task;	/* pinned by the hook for the syscall */
++	struct file *pidfd_file;
++	int pidfd;
+ };
+ 
++int aok_fork_child(struct task_struct *p);
++void aok_task_exit(struct task_struct *tsk);
++
+ #endif /* _LINUX_AOK_H */
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index b58db4256..dcc1f2be3 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -812,6 +812,12 @@ struct kmap_ctrl {
+ #endif
+ };
+ 
++#ifdef CONFIG_AOK_EXPERIMENTAL
++/* AOK slice: aproc membership, task identity and spawn handoff. */
++struct aok_aproc;
++struct aok_spawn_req;
++#endif
++
+ struct task_struct {
+ #ifdef CONFIG_THREAD_INFO_IN_TASK
+ 	/*
+@@ -1668,6 +1674,17 @@ struct task_struct {
+ 	struct unwind_task_info		unwind_info;
+ #endif
+ 
++#ifdef CONFIG_AOK_EXPERIMENTAL
++	/* AOK slice fields, see kernel/aok.c; cleared or inherited in
++	 * copy_process() via aok_fork_child().
++	 */
++	struct aok_aproc		*aok_aproc;
++	u64				aok_koid;
++	struct aok_spawn_req		*aok_spawn;
++	bool				aok_freeze;
++	struct list_head		aok_tasks;
++#endif
++
+ 	/* CPU-specific state of this task: */
+ 	struct thread_struct		thread;
+ 
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index 510e70eb2..d40cf5e97 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -870,8 +870,29 @@ __SYSCALL(__NR_aok_handle_duplicate, sys_aok_handle_duplicate)
+ #define __NR_aok_root_cap_claim 473
+ __SYSCALL(__NR_aok_root_cap_claim, sys_aok_root_cap_claim)
+ 
++#define __NR_aok_aproc_spawn 474
++__SYSCALL(__NR_aok_aproc_spawn, sys_aok_aproc_spawn)
++
++#define __NR_aok_aproc_attach 475
++__SYSCALL(__NR_aok_aproc_attach, sys_aok_aproc_attach)
++
++#define __NR_aok_aproc_freeze 476
++__SYSCALL(__NR_aok_aproc_freeze, sys_aok_aproc_freeze)
++
++#define __NR_aok_aproc_resume 477
++__SYSCALL(__NR_aok_aproc_resume, sys_aok_aproc_resume)
++
++#define __NR_aok_aproc_abort 478
++__SYSCALL(__NR_aok_aproc_abort, sys_aok_aproc_abort)
++
++#define __NR_aok_aproc_reap 479
++__SYSCALL(__NR_aok_aproc_reap, sys_aok_aproc_reap)
++
++#define __NR_aok_aproc_status 480
++__SYSCALL(__NR_aok_aproc_status, sys_aok_aproc_status)
++
+ #undef __NR_syscalls
+-#define __NR_syscalls 474
++#define __NR_syscalls 481
+ 
+ /*
+  * 32 bit systems traditionally used different
+diff --git a/include/uapi/linux/aok.h b/include/uapi/linux/aok.h
+index b2d11069c..ac6e67dec 100644
+--- a/include/uapi/linux/aok.h
++++ b/include/uapi/linux/aok.h
+@@ -5,19 +5,90 @@
+ #include <linux/types.h>
+ 
+ #define AOK_OBJECT_APROC 1U
++
+ #define AOK_APROC_STATE_CREATED 0U
++#define AOK_APROC_STATE_RUNNING 1U
++#define AOK_APROC_STATE_FROZEN 2U
++#define AOK_APROC_STATE_EXITED 3U
++#define AOK_APROC_STATE_FAILED 4U
++#define AOK_APROC_STATE_REAPED 5U
+ 
+ #define AOK_RIGHT_INSPECT (1ULL << 0)
+ #define AOK_RIGHT_DUPLICATE (1ULL << 1)
+ #define AOK_RIGHT_MANAGE_CHILD (1ULL << 2)
++#define AOK_RIGHT_SIGNAL (1ULL << 3)
++#define AOK_RIGHT_ATTACH (1ULL << 4)
++#define AOK_RIGHT_DESTROY (1ULL << 5)
+ #define AOK_RIGHTS_INITIAL (AOK_RIGHT_INSPECT | AOK_RIGHT_DUPLICATE)
+ #define AOK_RIGHTS_ROOT (AOK_RIGHT_INSPECT | AOK_RIGHT_DUPLICATE | AOK_RIGHT_MANAGE_CHILD)
++#define AOK_RIGHTS_APROC_INITIAL \
++	(AOK_RIGHT_INSPECT | AOK_RIGHT_DUPLICATE | AOK_RIGHT_MANAGE_CHILD | \
++	 AOK_RIGHT_SIGNAL | AOK_RIGHT_ATTACH | AOK_RIGHT_DESTROY)
+ 
+ /* Experimental object-only bootstrap, restricted to the initial PID 1. */
+ #define AOK_PARENT_BOOTSTRAP (-1)
+ 
+ #define AOK_OBJECT_ROOT_JOB 2U
+ 
++/*
++ * Task-lifecycle slice: resume reports what the kernel can hand back to the
++ * runtime. The kernel never saves model state itself; without a registered
++ * runtime checkpoint (not part of this slice) resume reports NONE.
++ */
++#define AOK_RESUME_RECOVERY_NONE 0U
++#define AOK_RESUME_RECOVERY_MESSAGES 1U
++#define AOK_RESUME_RECOVERY_MESSAGES_KV 2U
++
++/* Ordered aproc event kinds; records are read one per read(2). */
++#define AOK_EVENT_TASK_JOINED 1U
++#define AOK_EVENT_TASK_EXITED 2U
++#define AOK_EVENT_STATE 3U
++
++/*
++ * Minimal first-task ABI of this slice: the first task of aok_aproc_create()
++ * and every aok_aproc_spawn() task is a fork of the caller. The child returns
++ * 0 from the syscall (fork semantics) and must exit on its own; the parent
++ * receives the pidfd of the new task. The first task receives no capability
++ * of its own in this slice.
++ */
++struct aok_aproc_create_result {
++	__u64 size;
++	__s32 pidfd;
++	__u32 reserved;
++	__u64 reserved2[3];
++};
++
++struct aok_task_spawn_attr {
++	__u64 size;
++	__u32 flags;
++	__u32 reserved;
++	__u64 reserved2[3];
++};
++
++struct aok_aproc_status {
++	__u64 size;
++	__u64 aid;
++	__u32 state;
++	__u32 task_count;
++	__u64 task_total;
++	__u64 event_seq;
++	__u64 events_dropped;
++	__u64 rights_ceiling;
++	__u32 recovery;
++	__u32 reserved;
++	__u64 reserved2[3];
++};
++
++struct aok_aproc_event {
++	__u64 size;
++	__u64 aid;
++	__u64 task_koid;
++	__u64 event_seq;
++	__u32 kind;
++	__u32 state;
++	__u64 reserved[3];
++};
++
+ struct aok_aproc_create_args {
+ 	__u64 size;
+ 	__s32 parent_job_fd;
+diff --git a/init/Kconfig b/init/Kconfig
+index 7f0cc0cdc..c01c76ead 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1905,12 +1905,15 @@ config KCMP
+ config AOK_EXPERIMENTAL
+ 	bool "AOK experimental object ABI"
+ 	depends on ARM64 && EXPERT
++	select FREEZER
+ 	default n
+ 	help
+-	  Enable the AOK object-only prototype and its private syscall numbers.
+-	  Creation is limited to the initial PID 1. This is not the complete
+-	  aproc/task or root capability ABI and is not a security boundary.
+-	  Say N unless testing the AOK patch series.
++	  Enable the AOK experimental object ABI and its private syscall
++	  numbers: capability handles, the root job bootstrap and the
++	  aproc task/pidfd lifecycle slice (create/spawn/attach, freezer
++	  based freeze/resume, abort and reap, ordered per-aproc events).
++	  This is not the complete aproc/task ABI and is not a security
++	  boundary. Say N unless testing the AOK patch series.
+ 
+ config RSEQ
+ 	bool "Enable rseq() system call" if EXPERT
+diff --git a/kernel/aok.c b/kernel/aok.c
+index 12a10970c..3ae47286e 100644
+--- a/kernel/aok.c
++++ b/kernel/aok.c
+@@ -4,32 +4,191 @@
+ #include <linux/anon_inodes.h>
+ #include <linux/errno.h>
+ #include <linux/file.h>
++#include <linux/freezer.h>
+ #include <linux/fs.h>
+ #include <linux/kernel.h>
++#include <linux/mm.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/pid.h>
+ #include <linux/sched.h>
++#include <linux/sched/signal.h>
++#include <linux/sched/task.h>
+ #include <linux/slab.h>
+ #include <linux/syscalls.h>
+ #include <linux/uaccess.h>
+ #include <uapi/linux/aok.h>
+ 
+ static atomic64_t aok_next_aid = ATOMIC64_INIT(0);
++static atomic64_t aok_next_koid = ATOMIC64_INIT(0);
+ static bool aok_root_claimed;
+ static DEFINE_MUTEX(aok_root_lock);
+ 
+-static int aok_alloc_aid(u64 *aid)
++/* Freezer integration, see freezing_slow_path() in kernel/freezer.c. */
++static atomic_t aok_frozen_aprocs = ATOMIC_INIT(0);
++static DEFINE_MUTEX(aok_freezer_lock);
++
++static int aok_alloc_id(atomic64_t *counter, u64 *id)
+ {
+-	s64 old = atomic64_read(&aok_next_aid);
++	s64 old = atomic64_read(counter);
+ 
+ 	/* Saturate instead of wrapping into a previously issued identity. */
+ 	do {
+ 		if (old == S64_MAX)
+ 			return -EOVERFLOW;
+-	} while (!atomic64_try_cmpxchg(&aok_next_aid, &old, old + 1));
+-	*aid = old + 1;
++	} while (!atomic64_try_cmpxchg(counter, &old, old + 1));
++	*id = old + 1;
++	return 0;
++}
++
++static void aok_freezer_enter(void)
++{
++	mutex_lock(&aok_freezer_lock);
++	if (atomic_inc_return(&aok_frozen_aprocs) == 1)
++		static_branch_inc(&freezer_active);
++	mutex_unlock(&aok_freezer_lock);
++}
++
++static void aok_freezer_leave(void)
++{
++	mutex_lock(&aok_freezer_lock);
++	if (atomic_dec_and_test(&aok_frozen_aprocs))
++		static_branch_dec(&freezer_active);
++	mutex_unlock(&aok_freezer_lock);
++}
++
++/* Callers hold aproc->lock. */
++static void aok_emit_locked(struct aok_aproc *aproc, u32 kind, u64 task_koid)
++{
++	struct aok_event_slot *slot;
++
++	aproc->event_seq++;
++	if (aproc->event_seq > AOK_EVENT_QUEUE_LEN)
++		aproc->events_dropped++;
++	slot = &aproc->events[(aproc->event_seq - 1) % AOK_EVENT_QUEUE_LEN];
++	slot->aid = aproc->aid;
++	slot->task_koid = task_koid;
++	slot->event_seq = aproc->event_seq;
++	slot->kind = kind;
++	slot->state = aproc->state;
++}
++
++/* Callers hold aproc->lock; p must not be a member of another aproc. */
++static int aok_join_locked(struct aok_aproc *aproc, struct task_struct *p)
++{
++	u64 koid;
++	int ret;
++
++	if (aproc->ntasks >= AOK_MAX_TASKS)
++		return -EBUSY;
++	switch (aproc->state) {
++	case AOK_APROC_STATE_RUNNING:
++	case AOK_APROC_STATE_FROZEN:
++		break;
++	default:
++		return -EINVAL;
++	}
++	ret = aok_alloc_id(&aok_next_koid, &koid);
++	if (ret)
++		return ret;
++	p->aok_koid = koid;
++	p->aok_aproc = aproc;
++	if (aproc->freeze_req)
++		WRITE_ONCE(p->aok_freeze, true);
++	list_add_tail(&p->aok_tasks, &aproc->tasks);
++	aproc->ntasks++;
++	aproc->task_total++;
++	get_task_struct(p);
++	refcount_inc(&aproc->refs);
++	aok_emit_locked(aproc, AOK_EVENT_TASK_JOINED, koid);
+ 	return 0;
+ }
+ 
++/**
++ * aok_fork_child - copy_process() hook, runs in the parent while the child
++ * is still holding tasklist_lock, before the child is published. Joins the
++ * child to the aproc named by current->aok_spawn (explicit create/spawn) or
++ * to current's own aproc (default inheritance, which no ordinary syscall
++ * can opt out of). Failure unwinds through the stock bad_fork_core_free
++ * path, so this hook must not sleep; the pidfd is created by the spawning
++ * syscall after kernel_clone() returns.
++ */
++int aok_fork_child(struct task_struct *p)
++{
++	struct aok_spawn_req *req = current->aok_spawn;
++	struct aok_aproc *aproc;
++	int ret;
++
++	p->aok_spawn = NULL;
++	p->aok_freeze = false;
++	p->aok_koid = 0;
++	INIT_LIST_HEAD(&p->aok_tasks);
++
++	aproc = req ? req->aproc : current->aok_aproc;
++	if (!aproc)
++		return 0;
++
++	spin_lock(&aproc->lock);
++	ret = aok_join_locked(aproc, p);
++	spin_unlock(&aproc->lock);
++	if (!ret && req) {
++		get_task_struct(p);	/* pinned for the spawning syscall */
++		req->task = p;
++	}
++	return ret;
++}
++
++/* Reserve an uninstalled pidfd for a just-forked task. */
++static int aok_pidfd_for(struct task_struct *task, struct file **filep)
++{
++	struct pid *pid = get_task_pid(task, PIDTYPE_PID);
++	int fd;
++
++	if (!pid)
++		return -ESRCH;
++	fd = pidfd_prepare(pid, 0, filep);
++	put_pid(pid);
++	return fd;
++}
++
++/**
++ * aok_task_exit - do_exit() hook. Task exit never destroys the aproc; it
++ * only releases this task's membership and appends an ordered event. The
++ * aproc reaches EXITED when its last live task has exited.
++ *
++ * task_lock() pairs with the attach path: after exit_signals() set
++ * PF_EXITING and this hook observed no membership, an attach in progress
++ * must fail its PF_EXITING recheck instead of joining a task that will
++ * never run aok_task_exit() again.
++ */
++void aok_task_exit(struct task_struct *tsk)
++{
++	struct aok_aproc *aproc;
++	u64 koid;
++
++	task_lock(tsk);
++	aproc = tsk->aok_aproc;
++	if (!aproc) {
++		task_unlock(tsk);
++		return;
++	}
++	spin_lock(&aproc->lock);
++	tsk->aok_aproc = NULL;
++	WRITE_ONCE(tsk->aok_freeze, false);
++	list_del_init(&tsk->aok_tasks);
++	koid = tsk->aok_koid;
++	aproc->ntasks--;
++	if (!aproc->ntasks && aproc->state == AOK_APROC_STATE_RUNNING)
++		aproc->state = AOK_APROC_STATE_EXITED;
++	aok_emit_locked(aproc, AOK_EVENT_TASK_EXITED, koid);
++	spin_unlock(&aproc->lock);
++	task_unlock(tsk);
++
++	put_task_struct(tsk);
++	if (refcount_dec_and_test(&aproc->refs))
++		kfree(aproc);
++}
++
+ static int aok_aproc_release(struct inode *inode, struct file *file)
+ {
+ 	struct aok_handle *handle = file->private_data;
+@@ -41,9 +200,57 @@ static int aok_aproc_release(struct inode *inode, struct file *file)
+ 	return 0;
+ }
+ 
++/*
++ * One ordered event record per read; the cursor advances before copyout, so
++ * a faulting buffer loses that record (pipe-like consume semantics). A
++ * cursor older than the retained ring returns -EOVERFLOW; drain means 0.
++ */
++static ssize_t aok_aproc_read(struct file *file, char __user *buf,
++			      size_t count, loff_t *ppos)
++{
++	struct aok_handle *handle = file->private_data;
++	struct aok_aproc *aproc = handle->aproc;
++	struct aok_aproc_event ev = { .size = sizeof(ev) };
++	const struct aok_event_slot *slot;
++	u64 seq, oldest;
++
++	if (!aproc)
++		return -EINVAL;
++	if (!(handle->rights & AOK_RIGHT_INSPECT))
++		return -EACCES;
++	if (count < sizeof(ev))
++		return -EINVAL;
++
++	spin_lock(&aproc->lock);
++	seq = handle->read_seq;
++	oldest = aproc->event_seq > AOK_EVENT_QUEUE_LEN ?
++		 aproc->event_seq - AOK_EVENT_QUEUE_LEN + 1 : 1;
++	if (seq + 1 < oldest) {
++		spin_unlock(&aproc->lock);
++		return -EOVERFLOW;
++	}
++	if (seq >= aproc->event_seq) {
++		spin_unlock(&aproc->lock);
++		return 0;
++	}
++	slot = &aproc->events[seq % AOK_EVENT_QUEUE_LEN];
++	ev.aid = slot->aid;
++	ev.task_koid = slot->task_koid;
++	ev.event_seq = slot->event_seq;
++	ev.kind = slot->kind;
++	ev.state = slot->state;
++	handle->read_seq = seq + 1;
++	spin_unlock(&aproc->lock);
++
++	if (copy_to_user(buf, &ev, sizeof(ev)))
++		return -EFAULT;
++	return sizeof(ev);
++}
++
+ static const struct file_operations aok_aproc_fops = {
+ 	.owner = THIS_MODULE,
+ 	.release = aok_aproc_release,
++	.read = aok_aproc_read,
+ };
+ 
+ static int aok_copy_create_args(struct aok_aproc_create_args *args,
+@@ -66,6 +273,26 @@ static int aok_copy_create_args(struct aok_aproc_create_args *args,
+ 	return 0;
+ }
+ 
++static int aok_copy_spawn_attr(struct aok_task_spawn_attr *attr,
++			       const struct aok_task_spawn_attr __user *uattr)
++{
++	u64 size;
++	int ret;
++
++	if (get_user(size, &uattr->size))
++		return -EFAULT;
++	if (size < sizeof(*attr) || size > PAGE_SIZE)
++		return -EINVAL;
++	ret = copy_struct_from_user(attr, sizeof(*attr), uattr, size);
++	if (ret)
++		return ret;
++	if (attr->size != size ||
++	    attr->flags || attr->reserved || attr->reserved2[0] ||
++	    attr->reserved2[1] || attr->reserved2[2])
++		return -EINVAL;
++	return 0;
++}
++
+ static int aok_root_cap_release(struct inode *inode, struct file *file)
+ {
+ 	kfree(file->private_data);
+@@ -120,43 +347,95 @@ static int aok_copy_info(struct aok_object_info __user *uinfo,
+ 	return copy_struct_to_user(uinfo, size, info, sizeof(*info), NULL);
+ }
+ 
+-SYSCALL_DEFINE2(aok_aproc_create,
++static int aok_copy_status(struct aok_aproc_status __user *ustatus,
++			   const struct aok_aproc_status *status)
++{
++	u64 size;
++
++	if (get_user(size, &ustatus->size))
++		return -EFAULT;
++	if (size < sizeof(*status) || size > PAGE_SIZE)
++		return -EINVAL;
++	return copy_struct_to_user(ustatus, size, status, sizeof(*status), NULL);
++}
++
++static int aok_copy_result(struct aok_aproc_create_result __user *uresult,
++			   const struct aok_aproc_create_result *result)
++{
++	u64 size;
++
++	if (get_user(size, &uresult->size))
++		return -EFAULT;
++	if (size < sizeof(*result) || size > PAGE_SIZE)
++		return -EINVAL;
++	return copy_struct_to_user(uresult, size, result, sizeof(*result), NULL);
++}
++
++/* Resolve the parent capability and compute the child rights ceiling. */
++static int aok_parent_ceiling(int parent_fd, u64 *ceiling)
++{
++	struct fd parent = fdget(parent_fd);
++	struct aok_handle *parent_handle;
++	u64 limit = AOK_RIGHTS_APROC_INITIAL;
++
++	if (fd_empty(parent))
++		return -EBADF;
++	if (fd_file(parent)->f_op != &aok_root_fops &&
++	    fd_file(parent)->f_op != &aok_aproc_fops) {
++		fdput(parent);
++		return -EINVAL;
++	}
++	parent_handle = fd_file(parent)->private_data;
++	if (!(parent_handle->rights & AOK_RIGHT_MANAGE_CHILD)) {
++		fdput(parent);
++		return -EACCES;
++	}
++	if (parent_handle->aproc) {
++		spin_lock(&parent_handle->aproc->lock);
++		if (parent_handle->aproc->state != AOK_APROC_STATE_RUNNING) {
++			spin_unlock(&parent_handle->aproc->lock);
++			fdput(parent);
++			return -EINVAL;
++		}
++		spin_unlock(&parent_handle->aproc->lock);
++		limit &= parent_handle->rights;
++	}
++	fdput(parent);
++	*ceiling = limit;
++	return 0;
++}
++
++SYSCALL_DEFINE3(aok_aproc_create,
+ 		const struct aok_aproc_create_args __user *, uargs,
+-		struct aok_object_info __user *, uinfo)
++		struct aok_object_info __user *, uinfo,
++		struct aok_aproc_create_result __user *, uresult)
+ {
+ 	struct aok_aproc_create_args args;
++	struct aok_aproc_create_result result = {
++		.size = sizeof(result),
++	};
+ 	struct aok_object_info info = {
+ 		.size = sizeof(info),
+ 		.type = AOK_OBJECT_APROC,
+-		.state = AOK_APROC_STATE_CREATED,
+-		.rights = AOK_RIGHTS_INITIAL,
++		.state = AOK_APROC_STATE_RUNNING,
+ 	};
++	struct kernel_clone_args kargs = { .exit_signal = SIGCHLD };
++	struct aok_spawn_req req = {};
+ 	struct aok_aproc *aproc;
+ 	struct aok_handle *handle;
+ 	struct file *file;
++	long nr;
+ 	int fd, ret;
+ 
+ 	ret = aok_copy_create_args(&args, uargs);
+ 	if (ret)
+ 		return ret;
+-	{
+-		struct fd parent = fdget(args.parent_job_fd);
+-		struct aok_handle *parent_handle;
+-
+-		if (fd_empty(parent))
+-			return -EBADF;
+-		if (fd_file(parent)->f_op != &aok_root_fops &&
+-		    fd_file(parent)->f_op != &aok_aproc_fops) {
+-			fdput(parent);
+-			return -EINVAL;
+-		}
+-		parent_handle = fd_file(parent)->private_data;
+-		if (!(parent_handle->rights & AOK_RIGHT_MANAGE_CHILD)) {
+-			fdput(parent);
+-			return -EACCES;
+-		}
+-		fdput(parent);
+-	}
++	/* Touch the result header early so a bad pointer fails before fork. */
++	if (get_user(result.size, &uresult->size))
++		return -EFAULT;
++	ret = aok_parent_ceiling(args.parent_job_fd, &info.rights);
++	if (ret)
++		return ret;
+ 	aproc = kzalloc(sizeof(*aproc), GFP_KERNEL);
+ 	if (!aproc)
+ 		return -ENOMEM;
+@@ -165,40 +444,552 @@ SYSCALL_DEFINE2(aok_aproc_create,
+ 		kfree(aproc);
+ 		return -ENOMEM;
+ 	}
+-	ret = aok_alloc_aid(&aproc->aid);
++	ret = aok_alloc_id(&aok_next_aid, &aproc->aid);
+ 	if (ret)
+ 		goto err_free;
+ 	refcount_set(&aproc->refs, 1);
+-	aproc->state = AOK_APROC_STATE_CREATED;
++	spin_lock_init(&aproc->lock);
++	INIT_LIST_HEAD(&aproc->tasks);
++	aproc->state = AOK_APROC_STATE_RUNNING;
++	aproc->rights_ceiling = info.rights;
+ 	handle->aproc = aproc;
+-	handle->rights = AOK_RIGHTS_INITIAL;
++	handle->rights = info.rights;
+ 	info.aid = aproc->aid;
+ 	fd = get_unused_fd_flags(O_CLOEXEC);
+ 	if (fd < 0) {
+ 		ret = fd;
+ 		goto err_free;
+ 	}
++	/* Probe pidfd availability so fd exhaustion fails before the fork. */
++	ret = get_unused_fd_flags(O_CLOEXEC);
++	if (ret < 0)
++		goto err_put_fd;
++	put_unused_fd(ret);
+ 	file = anon_inode_getfile("aok-aproc", &aok_aproc_fops, handle, O_RDWR);
+ 	if (IS_ERR(file)) {
+-		put_unused_fd(fd);
+ 		ret = PTR_ERR(file);
+-		goto err_free;
++		goto err_put_fd;
+ 	}
+-	/* Publish only after copyout succeeds; no installed fd on failure. */
++	/*
++	 * Publish only after every copyout succeeds; no installed fd on
++	 * failure. A result copyout fault after the fork rolls the
++	 * descriptors back and kills the first task rather than leaking
++	 * either.
++	 */
+ 	ret = aok_copy_info(uinfo, &info);
+-	if (ret) {
+-		put_unused_fd(fd);
+-		fput(file);
+-		return ret;
++	if (ret)
++		goto err_put_file;
++	req.aproc = aproc;
++	current->aok_spawn = &req;
++	nr = kernel_clone(&kargs);
++	current->aok_spawn = NULL;
++	if (nr == 0)
++		return 0;
++	if (nr < 0) {
++		ret = nr;
++		goto err_put_file;
+ 	}
++	ret = aok_pidfd_for(req.task, &req.pidfd_file);
++	if (ret < 0)
++		goto err_kill_task_nofd;
++	req.pidfd = ret;
++	result.pidfd = req.pidfd;
++	ret = aok_copy_result(uresult, &result);
++	if (ret)
++		goto err_kill_task;
+ 	fd_install(fd, file);
++	fd_install(req.pidfd, req.pidfd_file);
++	put_task_struct(req.task);
+ 	return fd;
++
++err_kill_task:
++	put_unused_fd(req.pidfd);
++	fput(req.pidfd_file);
++err_kill_task_nofd:
++	send_sig(SIGKILL, req.task, 0);
++	put_task_struct(req.task);
++err_put_file:
++	fput(file);
++	put_unused_fd(fd);
++	return ret;
++err_put_fd:
++	put_unused_fd(fd);
+ err_free:
+ 	kfree(handle);
+ 	kfree(aproc);
+ 	return ret;
+ }
+ 
++SYSCALL_DEFINE2(aok_aproc_spawn, int, aproc_fd,
++		const struct aok_task_spawn_attr __user *, uattr)
++{
++	struct aok_task_spawn_attr attr;
++	struct kernel_clone_args kargs = { .exit_signal = SIGCHLD };
++	struct aok_spawn_req req = {};
++	struct aok_aproc *aproc;
++	struct aok_handle *handle;
++	struct fd f;
++	long nr;
++	int ret;
++
++	ret = aok_copy_spawn_attr(&attr, uattr);
++	if (ret)
++		return ret;
++	f = fdget(aproc_fd);
++	if (fd_empty(f))
++		return -EBADF;
++	if (fd_file(f)->f_op != &aok_aproc_fops) {
++		fdput(f);
++		return -EINVAL;
++	}
++	handle = fd_file(f)->private_data;
++	aproc = handle->aproc;
++	if (!(handle->rights & AOK_RIGHT_MANAGE_CHILD)) {
++		fdput(f);
++		return -EACCES;
++	}
++	spin_lock(&aproc->lock);
++	if (aproc->state != AOK_APROC_STATE_RUNNING) {
++		spin_unlock(&aproc->lock);
++		fdput(f);
++		return -EINVAL;
++	}
++	spin_unlock(&aproc->lock);
++	/* Probe pidfd availability so fd exhaustion fails before the fork. */
++	ret = get_unused_fd_flags(O_CLOEXEC);
++	if (ret < 0) {
++		fdput(f);
++		return ret;
++	}
++	put_unused_fd(ret);
++
++	req.aproc = aproc;
++	current->aok_spawn = &req;
++	nr = kernel_clone(&kargs);
++	current->aok_spawn = NULL;
++	fdput(f);
++	if (nr == 0)
++		return 0;
++	if (nr < 0)
++		return nr;
++	ret = aok_pidfd_for(req.task, &req.pidfd_file);
++	if (ret < 0) {
++		send_sig(SIGKILL, req.task, 0);
++		put_task_struct(req.task);
++		return ret;
++	}
++	req.pidfd = ret;
++	fd_install(req.pidfd, req.pidfd_file);
++	put_task_struct(req.task);
++	return req.pidfd;
++}
++
++SYSCALL_DEFINE2(aok_aproc_attach, int, aproc_fd, int, pidfd)
++{
++	struct aok_aproc *aproc;
++	struct aok_handle *handle;
++	struct fd f, pf;
++	struct pid *pid;
++	struct task_struct *task;
++	int ret;
++
++	f = fdget(aproc_fd);
++	if (fd_empty(f))
++		return -EBADF;
++	if (fd_file(f)->f_op != &aok_aproc_fops) {
++		fdput(f);
++		return -EINVAL;
++	}
++	handle = fd_file(f)->private_data;
++	aproc = handle->aproc;
++	if (!(handle->rights & AOK_RIGHT_ATTACH)) {
++		fdput(f);
++		return -EACCES;
++	}
++	pf = fdget(pidfd);
++	if (fd_empty(pf)) {
++		fdput(f);
++		return -EBADF;
++	}
++	/*
++	 * PID numbers never take part in authorization: the pidfd resolves
++	 * the task, then namespace, job state and membership are checked.
++	 */
++	pid = pidfd_pid(fd_file(pf));
++	if (IS_ERR(pid)) {
++		fdput(pf);
++		fdput(f);
++		return -EINVAL;
++	}
++	task = get_pid_task(pid, PIDTYPE_PID);
++	if (!task) {
++		ret = -ESRCH;
++		goto out_fds;
++	}
++	/* task_lock pairs with aok_task_exit(); see its comment. */
++	task_lock(task);
++	if (task->flags & PF_EXITING || !task->mm ||
++	    task == current || task->aok_aproc) {
++		ret = task == current ? -EINVAL :
++		      task->aok_aproc ? -EBUSY : -ESRCH;
++		task_unlock(task);
++		put_task_struct(task);
++		goto out_fds;
++	}
++	if (task_active_pid_ns(task) != task_active_pid_ns(current)) {
++		task_unlock(task);
++		put_task_struct(task);
++		ret = -EPERM;
++		goto out_fds;
++	}
++	spin_lock(&aproc->lock);
++	ret = aok_join_locked(aproc, task);
++	spin_unlock(&aproc->lock);
++	task_unlock(task);
++	put_task_struct(task);
++out_fds:
++	fdput(pf);
++	fdput(f);
++	return ret;
++}
++
++static struct task_struct **
++aok_collect_tasks(struct aok_aproc *aproc, unsigned int *countp)
++{
++	struct task_struct *t, **tasks;
++	unsigned long n;
++
++again:
++	spin_lock(&aproc->lock);
++	n = aproc->ntasks;
++	spin_unlock(&aproc->lock);
++	tasks = kvmalloc_array(n + 1, sizeof(*tasks), GFP_KERNEL);
++	if (!tasks)
++		return ERR_PTR(-ENOMEM);
++	spin_lock(&aproc->lock);
++	if (aproc->ntasks > n) {
++		spin_unlock(&aproc->lock);
++		kvfree(tasks);
++		goto again;
++	}
++	*countp = 0;
++	list_for_each_entry(t, &aproc->tasks, aok_tasks) {
++		get_task_struct(t);
++		tasks[(*countp)++] = t;
++	}
++	spin_unlock(&aproc->lock);
++	return tasks;
++}
++
++static void aok_put_tasks(struct task_struct **tasks, unsigned int count)
++{
++	unsigned int i;
++
++	for (i = 0; i < count; i++)
++		put_task_struct(tasks[i]);
++	kvfree(tasks);
++}
++
++SYSCALL_DEFINE1(aok_aproc_freeze, int, fd)
++{
++	struct task_struct **tasks;
++	struct aok_handle *handle;
++	struct aok_aproc *aproc;
++	unsigned int count, i;
++	struct fd f;
++	bool transitioned;
++
++	f = fdget(fd);
++	if (fd_empty(f))
++		return -EBADF;
++	if (fd_file(f)->f_op != &aok_aproc_fops) {
++		fdput(f);
++		return -EINVAL;
++	}
++	handle = fd_file(f)->private_data;
++	aproc = handle->aproc;
++	if (!(handle->rights & AOK_RIGHT_SIGNAL)) {
++		fdput(f);
++		return -EACCES;
++	}
++	spin_lock(&aproc->lock);
++	if (aproc->state == AOK_APROC_STATE_FROZEN) {
++		spin_unlock(&aproc->lock);
++		fdput(f);
++		return 0;
++	}
++	if (aproc->state != AOK_APROC_STATE_RUNNING) {
++		spin_unlock(&aproc->lock);
++		fdput(f);
++		return -EINVAL;
++	}
++	spin_unlock(&aproc->lock);
++
++	/*
++	 * Collect the members before committing the transition: an
++	 * allocation failure here leaves the aproc RUNNING and the call
++	 * retryable, instead of committing FROZEN with nobody frozen.
++	 */
++	tasks = aok_collect_tasks(aproc, &count);
++	if (IS_ERR(tasks)) {
++		fdput(f);
++		return PTR_ERR(tasks);
++	}
++
++	spin_lock(&aproc->lock);
++	transitioned = false;
++	if (aproc->state == AOK_APROC_STATE_RUNNING) {
++		aproc->state = AOK_APROC_STATE_FROZEN;
++		aproc->freeze_req = true;
++		aok_emit_locked(aproc, AOK_EVENT_STATE, 0);
++		transitioned = true;
++	} else if (aproc->state != AOK_APROC_STATE_FROZEN) {
++		/* Lost a race with abort/reap; touch nothing. */
++		spin_unlock(&aproc->lock);
++		aok_put_tasks(tasks, count);
++		fdput(f);
++		return -EINVAL;
++	}
++	spin_unlock(&aproc->lock);
++
++	/*
++	 * The static key pairs with resume/abort of the same freeze, so only
++	 * the caller that performed the transition takes a reference.
++	 */
++	if (transitioned)
++		aok_freezer_enter();
++	for (i = 0; i < count; i++) {
++		WRITE_ONCE(tasks[i]->aok_freeze, true);
++		freeze_task(tasks[i]);
++	}
++	aok_put_tasks(tasks, count);
++	fdput(f);
++	return 0;
++}
++
++SYSCALL_DEFINE1(aok_aproc_resume, int, fd)
++{
++	struct task_struct **tasks;
++	struct aok_handle *handle;
++	struct aok_aproc *aproc;
++	unsigned int count, i;
++	struct fd f;
++	bool transitioned;
++	u32 state_after;
++
++	f = fdget(fd);
++	if (fd_empty(f))
++		return -EBADF;
++	if (fd_file(f)->f_op != &aok_aproc_fops) {
++		fdput(f);
++		return -EINVAL;
++	}
++	handle = fd_file(f)->private_data;
++	aproc = handle->aproc;
++	if (!(handle->rights & AOK_RIGHT_SIGNAL)) {
++		fdput(f);
++		return -EACCES;
++	}
++	spin_lock(&aproc->lock);
++	if (aproc->state != AOK_APROC_STATE_FROZEN) {
++		spin_unlock(&aproc->lock);
++		fdput(f);
++		return -EINVAL;
++	}
++	spin_unlock(&aproc->lock);
++
++	/*
++	 * Collect before transitioning: on failure the aproc stays FROZEN
++	 * and the freezer reference is untouched, leaving the call
++	 * retryable instead of stranding frozen tasks with no static key.
++	 */
++	tasks = aok_collect_tasks(aproc, &count);
++	if (IS_ERR(tasks)) {
++		fdput(f);
++		return PTR_ERR(tasks);
++	}
++
++	spin_lock(&aproc->lock);
++	transitioned = false;
++	state_after = aproc->state;
++	if (state_after == AOK_APROC_STATE_FROZEN) {
++		aproc->state = AOK_APROC_STATE_RUNNING;
++		aproc->freeze_req = false;
++		aok_emit_locked(aproc, AOK_EVENT_STATE, 0);
++		transitioned = true;
++		state_after = AOK_APROC_STATE_RUNNING;
++	}
++	spin_unlock(&aproc->lock);
++
++	for (i = 0; i < count; i++) {
++		WRITE_ONCE(tasks[i]->aok_freeze, false);
++		__thaw_task(tasks[i]);
++	}
++	aok_put_tasks(tasks, count);
++	/* Pairs with the freeze that transitioned into FROZEN. */
++	if (transitioned)
++		aok_freezer_leave();
++	fdput(f);
++	/* No runtime checkpoint registry exists in this slice. */
++	return state_after == AOK_APROC_STATE_RUNNING ?
++	       AOK_RESUME_RECOVERY_NONE : -EINVAL;
++}
++
++SYSCALL_DEFINE1(aok_aproc_abort, int, fd)
++{
++	struct task_struct **tasks;
++	struct aok_handle *handle;
++	struct aok_aproc *aproc;
++	unsigned int count, i;
++	struct fd f;
++	bool transitioned;
++	bool was_frozen;
++
++	f = fdget(fd);
++	if (fd_empty(f))
++		return -EBADF;
++	if (fd_file(f)->f_op != &aok_aproc_fops) {
++		fdput(f);
++		return -EINVAL;
++	}
++	handle = fd_file(f)->private_data;
++	aproc = handle->aproc;
++	if (!(handle->rights & AOK_RIGHT_SIGNAL)) {
++		fdput(f);
++		return -EACCES;
++	}
++	spin_lock(&aproc->lock);
++	if (aproc->state == AOK_APROC_STATE_FAILED) {
++		spin_unlock(&aproc->lock);
++		fdput(f);
++		return 0;
++	}
++	if (aproc->state == AOK_APROC_STATE_REAPED) {
++		spin_unlock(&aproc->lock);
++		fdput(f);
++		return -EINVAL;
++	}
++	spin_unlock(&aproc->lock);
++
++	/*
++	 * Collect before committing FAILED: an allocation failure leaves the
++	 * previous state intact instead of a terminal FAILED aproc whose
++	 * tasks were never terminated.
++	 */
++	tasks = aok_collect_tasks(aproc, &count);
++	if (IS_ERR(tasks)) {
++		fdput(f);
++		return PTR_ERR(tasks);
++	}
++
++	spin_lock(&aproc->lock);
++	transitioned = false;
++	was_frozen = false;
++	if (aproc->state == AOK_APROC_STATE_FAILED) {
++		spin_unlock(&aproc->lock);
++		aok_put_tasks(tasks, count);
++		fdput(f);
++		return 0;
++	}
++	if (aproc->state != AOK_APROC_STATE_REAPED) {
++		was_frozen = aproc->state == AOK_APROC_STATE_FROZEN;
++		aproc->state = AOK_APROC_STATE_FAILED;
++		aproc->freeze_req = false;
++		aok_emit_locked(aproc, AOK_EVENT_STATE, 0);
++		transitioned = true;
++	}
++	spin_unlock(&aproc->lock);
++
++	if (transitioned) {
++		for (i = 0; i < count; i++) {
++			WRITE_ONCE(tasks[i]->aok_freeze, false);
++			__thaw_task(tasks[i]);
++			send_sig(SIGKILL, tasks[i], 0);
++		}
++	}
++	aok_put_tasks(tasks, count);
++	/* Pairs with the freeze that transitioned into FROZEN. */
++	if (transitioned && was_frozen)
++		aok_freezer_leave();
++	fdput(f);
++	return 0;
++}
++
++SYSCALL_DEFINE1(aok_aproc_reap, int, fd)
++{
++	struct aok_handle *handle;
++	struct aok_aproc *aproc;
++	struct fd f;
++
++	f = fdget(fd);
++	if (fd_empty(f))
++		return -EBADF;
++	if (fd_file(f)->f_op != &aok_aproc_fops) {
++		fdput(f);
++		return -EINVAL;
++	}
++	handle = fd_file(f)->private_data;
++	aproc = handle->aproc;
++	if (!(handle->rights & AOK_RIGHT_DESTROY)) {
++		fdput(f);
++		return -EACCES;
++	}
++	spin_lock(&aproc->lock);
++	switch (aproc->state) {
++	case AOK_APROC_STATE_EXITED:
++	case AOK_APROC_STATE_FAILED:
++		aproc->state = AOK_APROC_STATE_REAPED;
++		aok_emit_locked(aproc, AOK_EVENT_STATE, 0);
++		break;
++	case AOK_APROC_STATE_REAPED:
++		break;
++	default:
++		spin_unlock(&aproc->lock);
++		fdput(f);
++		return -EBUSY;
++	}
++	spin_unlock(&aproc->lock);
++	fdput(f);
++	return 0;
++}
++
++SYSCALL_DEFINE2(aok_aproc_status, int, fd,
++		struct aok_aproc_status __user *, ustatus)
++{
++	struct aok_aproc_status status = {
++		.size = sizeof(status),
++		.recovery = AOK_RESUME_RECOVERY_NONE,
++	};
++	struct aok_handle *handle;
++	struct aok_aproc *aproc;
++	struct fd f;
++
++	f = fdget(fd);
++	if (fd_empty(f))
++		return -EBADF;
++	if (fd_file(f)->f_op != &aok_aproc_fops) {
++		fdput(f);
++		return -EINVAL;
++	}
++	handle = fd_file(f)->private_data;
++	aproc = handle->aproc;
++	if (!(handle->rights & AOK_RIGHT_INSPECT)) {
++		fdput(f);
++		return -EACCES;
++	}
++	spin_lock(&aproc->lock);
++	status.aid = aproc->aid;
++	status.state = aproc->state;
++	status.task_count = aproc->ntasks;
++	status.task_total = aproc->task_total;
++	status.event_seq = aproc->event_seq;
++	status.events_dropped = aproc->events_dropped;
++	status.rights_ceiling = aproc->rights_ceiling;
++	spin_unlock(&aproc->lock);
++	fdput(f);
++	return aok_copy_status(ustatus, &status);
++}
++
+ SYSCALL_DEFINE2(aok_object_inspect, int, fd,
+ 		struct aok_object_info __user *, uinfo)
+ {
+@@ -219,9 +1010,11 @@ SYSCALL_DEFINE2(aok_object_inspect, int, fd,
+ 		return -EACCES;
+ 	}
+ 	aproc = handle->aproc;
++	spin_lock(&aproc->lock);
+ 	info.aid = aproc->aid;
+ 	info.type = AOK_OBJECT_APROC;
+ 	info.state = aproc->state;
++	spin_unlock(&aproc->lock);
+ 	info.rights = handle->rights;
+ 	fdput(f);
+ 	return aok_copy_info(uinfo, &info);
+@@ -251,6 +1044,7 @@ SYSCALL_DEFINE2(aok_handle_duplicate, int, fd, u64, rights)
+ 	}
+ 	handle->aproc = old->aproc;
+ 	handle->rights = rights;
++	handle->type = old->type;
+ 	refcount_inc(&handle->aproc->refs);
+ 	ret = anon_inode_getfd("aok-aproc", &aok_aproc_fops, handle,
+ 			       O_RDWR | O_CLOEXEC);
+diff --git a/kernel/exit.c b/kernel/exit.c
+index a32bc6556..97e574969 100644
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -7,6 +7,7 @@
+ 
+ #include <linux/mm.h>
+ #include <linux/slab.h>
++#include <linux/aok.h>
+ #include <linux/sched/autogroup.h>
+ #include <linux/sched/mm.h>
+ #include <linux/sched/stat.h>
+@@ -925,6 +926,10 @@ void __noreturn do_exit(long code)
+ 
+ 	seccomp_filter_release(tsk);
+ 
++#ifdef CONFIG_AOK_EXPERIMENTAL
++	aok_task_exit(tsk);
++#endif
++
+ 	acct_update_integrals(tsk);
+ 	group_dead = atomic_dec_and_test(&tsk->signal->live);
+ 	if (group_dead) {
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 91f1512a1..961d5d8df 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -84,6 +84,7 @@
+ #include <linux/posix-timers.h>
+ #include <linux/user-return-notifier.h>
+ #include <linux/oom.h>
++#include <linux/aok.h>
+ #include <linux/khugepaged.h>
+ #include <linux/signalfd.h>
+ #include <linux/uprobes.h>
+@@ -2364,6 +2365,18 @@ __latent_entropy struct task_struct *copy_process(
+ 		goto bad_fork_core_free;
+ 	}
+ 
++#ifdef CONFIG_AOK_EXPERIMENTAL
++	/*
++	 * AOK slice: join the child to its aproc before it is published.
++	 * Failure falls into the stock locked-region unwind; the pidfd is
++	 * created by the spawning syscall after the fork, never here, so
++	 * this hook cannot sleep.
++	 */
++	retval = aok_fork_child(p);
++	if (unlikely(retval))
++		goto bad_fork_core_free;
++#endif
++
+ 	/* No more failure paths after this point. */
+ 
+ 	/*
+diff --git a/kernel/freezer.c b/kernel/freezer.c
+index ddc11a8bd..72fb68d4b 100644
+--- a/kernel/freezer.c
++++ b/kernel/freezer.c
+@@ -44,6 +44,12 @@ bool freezing_slow_path(struct task_struct *p)
+ 	if (tsk_is_oom_victim(p))
+ 		return false;
+ 
++#ifdef CONFIG_AOK_EXPERIMENTAL
++	/* AOK aproc freezer request; see kernel/aok.c. */
++	if (READ_ONCE(p->aok_freeze))
++		return true;
++#endif
++
+ 	if (pm_nosig_freezing || cgroup_freezing(p))
+ 		return true;
+ 
+diff --git a/kernel/sys_ni.c b/kernel/sys_ni.c
+index b6055cf4d..a8212b15e 100644
+--- a/kernel/sys_ni.c
++++ b/kernel/sys_ni.c
+@@ -398,3 +398,10 @@ COND_SYSCALL(aok_aproc_create);
+ COND_SYSCALL(aok_object_inspect);
+ COND_SYSCALL(aok_handle_duplicate);
+ COND_SYSCALL(aok_root_cap_claim);
++COND_SYSCALL(aok_aproc_spawn);
++COND_SYSCALL(aok_aproc_attach);
++COND_SYSCALL(aok_aproc_freeze);
++COND_SYSCALL(aok_aproc_resume);
++COND_SYSCALL(aok_aproc_abort);
++COND_SYSCALL(aok_aproc_reap);
++COND_SYSCALL(aok_aproc_status);
+diff --git a/scripts/syscall.tbl b/scripts/syscall.tbl
+index aff9101cb..42ec19ed8 100644
+--- a/scripts/syscall.tbl
++++ b/scripts/syscall.tbl
+@@ -414,3 +414,10 @@
+ 471	common	aok_object_inspect		sys_aok_object_inspect
+ 472	common	aok_handle_duplicate		sys_aok_handle_duplicate
+ 473	common	aok_root_cap_claim		sys_aok_root_cap_claim
++474	common	aok_aproc_spawn			sys_aok_aproc_spawn
++475	common	aok_aproc_attach		sys_aok_aproc_attach
++476	common	aok_aproc_freeze		sys_aok_aproc_freeze
++477	common	aok_aproc_resume		sys_aok_aproc_resume
++478	common	aok_aproc_abort			sys_aok_aproc_abort
++479	common	aok_aproc_reap			sys_aok_aproc_reap
++480	common	aok_aproc_status		sys_aok_aproc_status

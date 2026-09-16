@@ -1,0 +1,327 @@
+package runtime
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+)
+
+// ControlServer is the local supervisor control plane. It deliberately uses a
+// separate listener from the engine protocol: control methods carry principal
+// and audit correlation, while engine sessions carry model turns.
+type ControlServer struct {
+	Supervisor *Supervisor
+	Listener   net.Listener
+}
+
+func (s *ControlServer) Serve(ctx context.Context) error {
+	if s.Supervisor == nil || s.Listener == nil {
+		return errors.New("control server requires supervisor and listener")
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	defer s.Listener.Close()
+	stop := context.AfterFunc(ctx, func() { s.Listener.Close() })
+	defer stop()
+	var workers sync.WaitGroup
+	defer workers.Wait()
+	defer cancel()
+	slots := make(chan struct{}, maxConnections)
+	for {
+		conn, err := s.Listener.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		select {
+		case slots <- struct{}{}:
+			workers.Add(1)
+			go func() { defer workers.Done(); defer func() { <-slots }(); s.serveConnection(ctx, conn) }()
+		default:
+			conn.Close()
+		}
+	}
+}
+
+func (s *ControlServer) serveConnection(ctx context.Context, conn net.Conn) {
+	defer conn.Close()
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stop()
+	principal, err := controlPrincipal(conn)
+	if err != nil {
+		return
+	}
+	decoder := NewDecoder(conn)
+	encoder := NewEncoder(conn)
+	for {
+		var req Message
+		if err := decoder.Read(&req); err != nil {
+			var rpc *RPCError
+			if errors.As(err, &rpc) || errors.Is(err, ErrInvalidMessage) {
+				_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				if encoder.Write(Message{JSONRPC: "2.0", ID: json.RawMessage("null"), Error: &RPCError{Code: -32600, Message: "invalid request"}}) != nil {
+					return
+				}
+				continue
+			}
+			return
+		}
+		if req.Method == "" {
+			return
+		}
+		resp := s.handle(req, principal)
+		if len(req.ID) > 0 {
+			_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			if err := encoder.Write(resp); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func (s *ControlServer) handle(req Message, principal string) Message {
+	resp := Message{JSONRPC: "2.0", ID: req.ID}
+	var p struct {
+		Principal     string          `json:"principal"`
+		ApplicationID string          `json:"application_id"`
+		OwnerAgent    string          `json:"owner_agent"`
+		WakePolicy    string          `json:"wake_policy"`
+		Key           string          `json:"idempotency_key"`
+		Payload       json.RawMessage `json:"payload"`
+		MessageID     string          `json:"message_id"`
+		Object        string          `json:"object"`
+		Action        string          `json:"action"`
+		Path          string          `json:"path"`
+		Token         string          `json:"capability_token"`
+		TokenLimit    uint64          `json:"token_limit"`
+		TimerID       string          `json:"timer_id"`
+		DelayMS       int64           `json:"delay_ms"`
+		IntervalMS    int64           `json:"interval_ms"`
+	}
+	if len(req.Params) > 0 && json.Unmarshal(req.Params, &p) != nil {
+		resp.Error = &RPCError{Code: -32602, Message: "invalid params"}
+		return resp
+	}
+	if p.Principal != "" && p.Principal != principal {
+		resp.Error = &RPCError{Code: -32003, Message: "principal does not match peer identity"}
+		return resp
+	}
+	p.Principal = principal
+	switch req.Method {
+	case "health":
+		resp.Result = json.RawMessage(`{"status":"ok","component":"supervisor"}`)
+	case "application.create":
+		a, err := s.Supervisor.CreateApplication(p.Principal, p.OwnerAgent, p.WakePolicy)
+		if err != nil {
+			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
+		} else {
+			resp.Result, _ = json.Marshal(a)
+		}
+	case "application.inspect":
+		a, err := s.Supervisor.InspectApplication(p.ApplicationID)
+		if err != nil {
+			resp.Error = &RPCError{Code: -32004, Message: err.Error()}
+		} else {
+			resp.Result, _ = json.Marshal(a)
+		}
+	case "application.list":
+		resp.Result, _ = json.Marshal(s.Supervisor.ListApplications())
+	case "application.retire":
+		err := s.Supervisor.RetireApplication(p.Principal, p.ApplicationID)
+		if err != nil {
+			resp.Error = &RPCError{Code: -32004, Message: err.Error()}
+		} else {
+			resp.Result = json.RawMessage(`{"retired":true}`)
+		}
+	case "application.freeze", "application.resume":
+		state := "frozen"
+		if req.Method == "application.resume" {
+			state = "serving"
+		}
+		if err := s.Supervisor.SetApplicationState(p.Principal, p.ApplicationID, state); err != nil {
+			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
+		} else {
+			resp.Result = json.RawMessage(`{"ok":true}`)
+		}
+	case "budget.set":
+		if err := s.Supervisor.SetTokenLimit(p.Principal, p.ApplicationID, p.TokenLimit); err != nil {
+			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
+		} else {
+			resp.Result = json.RawMessage(`{"ok":true}`)
+		}
+	case "event_source.create":
+		if p.DelayMS <= 0 || p.DelayMS > 86400000 || p.IntervalMS < 0 || p.IntervalMS > 86400000 {
+			resp.Error = &RPCError{Code: -32602, Message: "timer duration out of range"}
+			break
+		}
+		if err := s.Supervisor.AddTimer(p.Principal, p.ApplicationID, p.TimerID, time.Duration(p.DelayMS)*time.Millisecond, time.Duration(p.IntervalMS)*time.Millisecond, p.Payload); err != nil {
+			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
+		} else {
+			resp.Result = json.RawMessage(`{"ok":true}`)
+		}
+	case "message.result":
+		r, err := s.Supervisor.Result(p.ApplicationID, p.MessageID)
+		if err != nil {
+			resp.Error = &RPCError{Code: -32004, Message: err.Error()}
+		} else {
+			resp.Result, _ = json.Marshal(r)
+		}
+	case "message.send":
+		m, err := s.Supervisor.Enqueue(p.Principal, p.ApplicationID, p.Key, p.Payload)
+		if err != nil {
+			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
+		} else {
+			resp.Result, _ = json.Marshal(m)
+		}
+	case "message.claim":
+		m, err := s.Supervisor.ClaimMailbox(p.Principal, p.ApplicationID)
+		if err != nil {
+			resp.Error = &RPCError{Code: -32004, Message: err.Error()}
+		} else {
+			resp.Result, _ = json.Marshal(m)
+		}
+	case "mailbox.list":
+		m, err := s.Supervisor.ListMailbox(p.ApplicationID)
+		if err != nil {
+			resp.Error = &RPCError{Code: -32004, Message: err.Error()}
+		} else {
+			resp.Result, _ = json.Marshal(m)
+		}
+	case "event_source.list":
+		timers, err := s.Supervisor.ListTimers(p.ApplicationID)
+		if err != nil {
+			resp.Error = &RPCError{Code: -32004, Message: err.Error()}
+		} else {
+			resp.Result, _ = json.Marshal(timers)
+		}
+	case "message.ack":
+		err := s.Supervisor.AckMailbox(p.Principal, p.ApplicationID, p.MessageID)
+		if err != nil {
+			resp.Error = &RPCError{Code: -32004, Message: err.Error()}
+		} else {
+			resp.Result = json.RawMessage(`{"acked":true}`)
+		}
+	case "capability.check":
+		if p.Path != "" {
+			p.Action = p.Path
+		}
+		var token *CapabilityToken
+		if p.Token != "" {
+			parsed, parseErr := ParseCapabilityToken(p.Token)
+			if parseErr != nil {
+				resp.Result, _ = json.Marshal(map[string]any{"allowed": false, "reason": parseErr.Error()})
+				break
+			}
+			token = &parsed
+		}
+		var ok bool
+		var err error
+		if token == nil {
+			ok, err = s.Supervisor.Check(p.Principal, p.ApplicationID, p.Object, p.Action)
+		} else {
+			ok, err = s.Supervisor.CheckWithToken(p.Principal, p.ApplicationID, p.Object, p.Action, *token)
+		}
+		if err != nil && !errors.Is(err, ErrCapabilityDenied) {
+			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
+		} else if err != nil {
+			resp.Result, _ = json.Marshal(map[string]any{"allowed": false, "reason": err.Error()})
+		} else {
+			resp.Result, _ = json.Marshal(map[string]any{"allowed": ok})
+		}
+	case "audit.list":
+		resp.Result, _ = json.Marshal(s.Supervisor.Audit())
+	default:
+		resp.Error = &RPCError{Code: -32601, Message: "method not found"}
+	}
+	return resp
+}
+
+func NewControlListener(path string) (net.Listener, error) {
+	if path == "" {
+		return nil, errors.New("control socket path is required")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return nil, err
+	}
+	info, err := os.Lstat(filepath.Dir(path))
+	if err != nil || !info.IsDir() || info.Mode().Perm()&0077 != 0 {
+		return nil, errors.New("control socket requires private parent directory")
+	}
+	// Bind must fail on any existing path. Never unlink another server's socket.
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(path, 0600); err != nil {
+		_ = l.Close()
+		return nil, err
+	}
+	return l, nil
+}
+
+// ControlClient is a small local adapter used by tests and the host CLI.
+type ControlClient struct {
+	mu       sync.Mutex
+	sequence uint64
+	Conn     net.Conn
+	Encoder  *Encoder
+	Decoder  *Decoder
+}
+
+func DialControl(path string) (*ControlClient, error) {
+	c, err := net.Dial("unix", path)
+	if err != nil {
+		return nil, err
+	}
+	return &ControlClient{Conn: c, Encoder: NewEncoder(c), Decoder: NewDecoder(c)}, nil
+}
+
+func (c *ControlClient) Call(ctx context.Context, method string, params, result any) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	if d, ok := ctx.Deadline(); ok {
+		deadline = d
+	}
+	if err := c.Conn.SetDeadline(deadline); err != nil {
+		return err
+	}
+	stop := context.AfterFunc(ctx, func() { c.Conn.Close() })
+	defer stop()
+	c.sequence++
+	id := json.RawMessage(fmt.Sprint(c.sequence))
+	p, err := json.Marshal(params)
+	if err != nil {
+		return err
+	}
+	if err = c.Encoder.Write(Message{JSONRPC: "2.0", ID: id, Method: method, Params: p}); err != nil {
+		return err
+	}
+	var response Message
+	if err = c.Decoder.Read(&response); err != nil {
+		return err
+	}
+	if string(response.ID) != string(id) {
+		return errors.New("control response ID mismatch")
+	}
+	if response.Error != nil {
+		return response.Error
+	}
+	if result != nil {
+		return json.Unmarshal(response.Result, result)
+	}
+	return nil
+}
+
+func (c *ControlClient) Close() error { return c.Conn.Close() }

@@ -1,0 +1,479 @@
+diff --git a/kernel/aok.c b/kernel/aok.c
+index 3928fe2..bb89845 100644
+--- a/kernel/aok.c
++++ b/kernel/aok.c
+@@ -15,6 +15,7 @@
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/pid.h>
++#include <linux/poll.h>
+ #include <linux/sched.h>
+ #include <linux/sched/signal.h>
+ #include <linux/sched/task.h>
+@@ -337,9 +338,13 @@ static int aok_root_cap_release(struct inode *inode, struct file *file)
+ 	return 0;
+ }
+ 
++static long aok_core_root_ioctl(struct file *file, unsigned int cmd,
++			       unsigned long arg);
++
+ static const struct file_operations aok_root_fops = {
+ 	.owner = THIS_MODULE,
+ 	.release = aok_root_cap_release,
++	.unlocked_ioctl = aok_core_root_ioctl,
+ };
+ 
+ SYSCALL_DEFINE0(aok_root_cap_claim)
+@@ -1698,3 +1703,399 @@ out:
+ 	fdput(f);
+ 	return ret;
+ }
++
++/* One mutex serializes revocation, reservations, and completion commits. */
++static DEFINE_MUTEX(aok_core_lock);
++static DECLARE_WAIT_QUEUE_HEAD(aok_core_wait);
++
++struct aok_core_capability {
++	refcount_t refs;
++	struct aok_core_capability *parent;
++	struct aok_core_cap policy;
++	u64 used;
++	u64 reserved;
++	u32 depth;
++	bool revoked;
++};
++
++struct aok_core_inference {
++	refcount_t refs;
++	struct aok_core_capability *cap;
++	struct aok_core_io io;
++	u64 reservation;
++};
++
++static const struct file_operations aok_core_cap_fops;
++static const struct file_operations aok_core_client_fops;
++static const struct file_operations aok_core_backend_fops;
++
++static void aok_core_cap_put(struct aok_core_capability *cap)
++{
++	while (cap && refcount_dec_and_test(&cap->refs)) {
++		struct aok_core_capability *parent = cap->parent;
++
++		kfree(cap);
++		cap = parent;
++	}
++}
++
++static int aok_core_cap_release(struct inode *inode, struct file *file)
++{
++	aok_core_cap_put(file->private_data);
++	return 0;
++}
++
++static bool aok_core_valid(struct aok_core_capability *cap, u64 rights)
++{
++	if ((cap->policy.rights & rights) != rights)
++		return false;
++	for (; cap; cap = cap->parent)
++		if (cap->revoked)
++			return false;
++	return true;
++}
++
++static int aok_core_cap_new(struct aok_core_capability *parent,
++			    unsigned long arg)
++{
++	struct aok_core_capability *cap;
++	struct aok_core_cap policy;
++	int fd;
++
++	if (copy_from_user(&policy, (void __user *)arg, sizeof(policy)))
++		return -EFAULT;
++	if (policy.rights & ~AOK_CAP_ALL)
++		return -EINVAL;
++	if (parent) {
++		if (!aok_core_valid(parent, AOK_CAP_DELEGATE) ||
++		    (policy.rights & ~parent->policy.rights) ||
++		    (parent->policy.taint & ~policy.taint) ||
++		    (policy.export_mask & ~parent->policy.export_mask) ||
++		    policy.token_limit > parent->policy.token_limit)
++			return -EACCES;
++		if (parent->depth >= 32)
++			return -ELOOP;
++	}
++	cap = kzalloc(sizeof(*cap), GFP_KERNEL);
++	if (!cap)
++		return -ENOMEM;
++	refcount_set(&cap->refs, 1);
++	cap->parent = parent;
++	cap->policy = policy;
++	if (parent) {
++		cap->depth = parent->depth + 1;
++		refcount_inc(&parent->refs);
++	}
++	fd = anon_inode_getfd("aok-cap", &aok_core_cap_fops, cap,
++			      O_RDWR | O_CLOEXEC);
++	if (fd < 0)
++		aok_core_cap_put(cap);
++	return fd;
++}
++
++static long aok_core_root_ioctl(struct file *file, unsigned int cmd,
++			       unsigned long arg)
++{
++	struct aok_handle *root = file->private_data;
++	int ret;
++
++	if (cmd != AOK_CORE_CAP_CREATE)
++		return -ENOTTY;
++	if (!(root->rights & AOK_RIGHT_MANAGE_CHILD))
++		return -EACCES;
++	mutex_lock(&aok_core_lock);
++	ret = aok_core_cap_new(NULL, arg);
++	mutex_unlock(&aok_core_lock);
++	return ret;
++}
++
++static void aok_core_unreserve(struct aok_core_inference *session, u64 used)
++{
++	struct aok_core_capability *cap;
++
++	for (cap = session->cap; cap; cap = cap->parent) {
++		cap->reserved -= session->reservation;
++		cap->used += used;
++	}
++	session->reservation = 0;
++}
++
++static int aok_core_session_release(struct inode *inode, struct file *file)
++{
++	struct aok_core_inference *session = file->private_data;
++
++	mutex_lock(&aok_core_lock);
++	if (session->io.state == AOK_INFER_PENDING ||
++	    session->io.state == AOK_INFER_RUNNING) {
++		aok_core_unreserve(session, session->io.state == AOK_INFER_RUNNING ?
++				   session->reservation : 0);
++		session->io.state = AOK_INFER_CANCELLED;
++	}
++	mutex_unlock(&aok_core_lock);
++	wake_up_all(&aok_core_wait);
++	if (refcount_dec_and_test(&session->refs)) {
++		aok_core_cap_put(session->cap);
++		kfree(session);
++	}
++	return 0;
++}
++
++static int aok_core_session_new(struct aok_core_capability *cap,
++				unsigned long arg)
++{
++	struct aok_core_session pair;
++	struct aok_core_inference *session;
++	struct file *client, *backend;
++	int ret;
++
++	if (!aok_core_valid(cap, AOK_CAP_INFER | AOK_CAP_SERVE))
++		return -EACCES;
++	session = kzalloc(sizeof(*session), GFP_KERNEL);
++	if (!session)
++		return -ENOMEM;
++	pair.client_fd = get_unused_fd_flags(O_CLOEXEC);
++	if (pair.client_fd < 0) {
++		ret = pair.client_fd;
++		goto free_session;
++	}
++	pair.backend_fd = get_unused_fd_flags(O_CLOEXEC);
++	if (pair.backend_fd < 0) {
++		ret = pair.backend_fd;
++		goto put_client_fd;
++	}
++	client = anon_inode_getfile("aok-ainf-client", &aok_core_client_fops,
++				   session, O_RDWR);
++	if (IS_ERR(client)) {
++		ret = PTR_ERR(client);
++		goto put_backend_fd;
++	}
++	backend = anon_inode_getfile("aok-ainf-backend", &aok_core_backend_fops,
++				    session, O_RDWR);
++	if (IS_ERR(backend)) {
++		ret = PTR_ERR(backend);
++		/* No release callback may observe a half-constructed session. */
++		client->private_data = NULL;
++		goto put_client;
++	}
++	if (copy_to_user((void __user *)arg, &pair, sizeof(pair))) {
++		ret = -EFAULT;
++		backend->private_data = NULL;
++		fput(backend);
++		client->private_data = NULL;
++		goto put_client;
++	}
++	refcount_set(&session->refs, 2);
++	refcount_inc(&cap->refs);
++	session->cap = cap;
++	session->io.taint = cap->policy.taint;
++	fd_install(pair.client_fd, client);
++	fd_install(pair.backend_fd, backend);
++	return 0;
++put_client:
++	fput(client);
++put_backend_fd:
++	put_unused_fd(pair.backend_fd);
++put_client_fd:
++	put_unused_fd(pair.client_fd);
++free_session:
++	kfree(session);
++	return ret;
++}
++
++static long aok_core_cap_ioctl(struct file *file, unsigned int cmd,
++			      unsigned long arg)
++{
++	struct aok_core_capability *cap = file->private_data;
++	int ret;
++
++	mutex_lock(&aok_core_lock);
++	if (!aok_core_valid(cap, 0)) {
++		ret = -EACCES;
++		goto out;
++	}
++	switch (cmd) {
++	case AOK_CORE_CAP_DERIVE:
++		ret = aok_core_cap_new(cap, arg);
++		break;
++	case AOK_CORE_CAP_REVOKE:
++		ret = aok_core_valid(cap, AOK_CAP_REVOKE) ? 0 : -EACCES;
++		if (!ret) {
++			cap->revoked = true;
++			wake_up_all(&aok_core_wait);
++		}
++		break;
++	case AOK_CORE_CAP_CHECK:
++		ret = 0;
++		break;
++	case AOK_CORE_SESSION_CREATE:
++		ret = aok_core_session_new(cap, arg);
++		break;
++	default:
++		ret = -ENOTTY;
++	}
++out:
++	mutex_unlock(&aok_core_lock);
++	return ret;
++}
++
++static long aok_core_session_ioctl(struct file *file, unsigned int cmd,
++				  unsigned long arg)
++{
++	struct aok_core_inference *session = file->private_data;
++	struct aok_core_capability *cap;
++	struct aok_core_io io;
++	bool backend = file->f_op == &aok_core_backend_fops;
++	u64 total;
++	int ret = 0;
++
++	if ((backend && cmd != AOK_CORE_TAKE && cmd != AOK_CORE_COMPLETE) ||
++	    (!backend && cmd != AOK_CORE_SUBMIT && cmd != AOK_CORE_RESULT &&
++	     cmd != AOK_CORE_CANCEL && cmd != AOK_CORE_EXPORT))
++		return -EACCES;
++	if (cmd == AOK_CORE_SUBMIT || cmd == AOK_CORE_COMPLETE) {
++		if (copy_from_user(&io, (void __user *)arg, sizeof(io)))
++			return -EFAULT;
++		if (io.length > AOK_CORE_DATA_MAX || io.tokens_used || io.state)
++			return -EINVAL;
++	}
++	mutex_lock(&aok_core_lock);
++	if (!aok_core_valid(session->cap, AOK_CAP_INFER)) {
++		ret = -EACCES;
++		goto out;
++	}
++	switch (cmd) {
++	case AOK_CORE_SUBMIT:
++		if (session->io.state == AOK_INFER_PENDING ||
++		    session->io.state == AOK_INFER_RUNNING) {
++			ret = -EBUSY;
++			break;
++		}
++		if (session->io.sequence == U64_MAX ||
++		    io.sequence != session->io.sequence + 1) {
++			ret = -ESTALE;
++			break;
++		}
++		if (io.input_tokens > U64_MAX - io.output_tokens) {
++			ret = -EOVERFLOW;
++			break;
++		}
++		total = io.input_tokens + io.output_tokens;
++		for (cap = session->cap; cap; cap = cap->parent)
++			if (total > cap->policy.token_limit - cap->used - cap->reserved) {
++				ret = -EDQUOT;
++				goto out;
++			}
++		for (cap = session->cap; cap; cap = cap->parent)
++			cap->reserved += total;
++		session->reservation = total;
++		io.taint |= session->io.taint;
++		io.state = AOK_INFER_PENDING;
++		memset(io.data + io.length, 0, sizeof(io.data) - io.length);
++		session->io = io;
++		break;
++	case AOK_CORE_TAKE:
++		if (session->io.state != AOK_INFER_PENDING) {
++			ret = -EAGAIN;
++			break;
++		}
++		io = session->io;
++		io.state = AOK_INFER_RUNNING;
++		if (copy_to_user((void __user *)arg, &io, sizeof(io)))
++			ret = -EFAULT;
++		else
++			session->io.state = AOK_INFER_RUNNING;
++		break;
++	case AOK_CORE_COMPLETE:
++		if (io.sequence != session->io.sequence ||
++		    session->io.state != AOK_INFER_RUNNING) {
++			ret = -ESTALE;
++			break;
++		}
++		if (io.input_tokens > session->io.input_tokens ||
++		    io.output_tokens > session->io.output_tokens) {
++			ret = -EDQUOT;
++			break;
++		}
++		total = io.input_tokens + io.output_tokens;
++		aok_core_unreserve(session, total);
++		io.taint |= session->io.taint;
++		io.tokens_used = session->cap->used;
++		io.state = AOK_INFER_DONE;
++		memset(io.data + io.length, 0, sizeof(io.data) - io.length);
++		session->io = io;
++		break;
++	case AOK_CORE_CANCEL:
++		if (session->io.state == AOK_INFER_PENDING ||
++		    session->io.state == AOK_INFER_RUNNING) {
++			/* Backend may already have spent tokens: charge its ceiling. */
++			aok_core_unreserve(session, session->io.state == AOK_INFER_RUNNING ?
++					   session->reservation : 0);
++			session->io.state = AOK_INFER_CANCELLED;
++		}
++		break;
++	case AOK_CORE_EXPORT:
++		if (!aok_core_valid(session->cap, AOK_CAP_EXPORT) ||
++		    (session->io.taint & ~session->cap->policy.export_mask)) {
++			ret = -EACCES;
++			break;
++		}
++		fallthrough;
++	case AOK_CORE_RESULT:
++		if (session->io.state != AOK_INFER_DONE) {
++			ret = -EAGAIN;
++			break;
++		}
++		if (copy_to_user((void __user *)arg, &session->io, sizeof(io)))
++			ret = -EFAULT;
++		break;
++	default:
++		ret = -ENOTTY;
++	}
++out:
++	mutex_unlock(&aok_core_lock);
++	if (!ret)
++		wake_up_all(&aok_core_wait);
++	return ret;
++}
++
++static int aok_core_safe_release(struct inode *inode, struct file *file)
++{
++	return file->private_data ? aok_core_session_release(inode, file) : 0;
++}
++
++static __poll_t aok_core_session_poll(struct file *file, poll_table *wait)
++{
++	struct aok_core_inference *session = file->private_data;
++	__poll_t mask = 0;
++
++	poll_wait(file, &aok_core_wait, wait);
++	mutex_lock(&aok_core_lock);
++	if (!aok_core_valid(session->cap, AOK_CAP_INFER) ||
++	    session->io.state == AOK_INFER_CANCELLED)
++		mask = EPOLLERR | EPOLLHUP;
++	else if ((file->f_op == &aok_core_backend_fops &&
++		  session->io.state == AOK_INFER_PENDING) ||
++		 (file->f_op == &aok_core_client_fops &&
++		  session->io.state == AOK_INFER_DONE))
++		mask = EPOLLIN | EPOLLRDNORM;
++	mutex_unlock(&aok_core_lock);
++	return mask;
++}
++
++static const struct file_operations aok_core_cap_fops = {
++	.owner = THIS_MODULE,
++	.release = aok_core_cap_release,
++	.unlocked_ioctl = aok_core_cap_ioctl,
++};
++static const struct file_operations aok_core_client_fops = {
++	.owner = THIS_MODULE,
++	.release = aok_core_safe_release,
++	.unlocked_ioctl = aok_core_session_ioctl,
++	.poll = aok_core_session_poll,
++};
++static const struct file_operations aok_core_backend_fops = {
++	.owner = THIS_MODULE,
++	.release = aok_core_safe_release,
++	.unlocked_ioctl = aok_core_session_ioctl,
++	.poll = aok_core_session_poll,
++};
+diff --git a/include/uapi/linux/aok.h b/include/uapi/linux/aok.h
+index fec9ec9..4af93e3 100644
+--- a/include/uapi/linux/aok.h
++++ b/include/uapi/linux/aok.h
+@@ -215,4 +215,48 @@ struct aok_event_record {
+ 	__u64 reserved[3];
+ };
+ 
++/* Capability/inference control ABI. All handles are close-on-exec. */
++#define AOK_CAP_INFER (1ULL << 0)
++#define AOK_CAP_EXPORT (1ULL << 1)
++#define AOK_CAP_DELEGATE (1ULL << 2)
++#define AOK_CAP_REVOKE (1ULL << 3)
++#define AOK_CAP_SERVE (1ULL << 4)
++#define AOK_CAP_ALL 31ULL
++#define AOK_CORE_CAP_CREATE 0xa001U
++#define AOK_CORE_CAP_DERIVE 0xa002U
++#define AOK_CORE_CAP_REVOKE 0xa003U
++#define AOK_CORE_CAP_CHECK 0xa004U
++#define AOK_CORE_SESSION_CREATE 0xa010U
++#define AOK_CORE_SUBMIT 0xa011U
++#define AOK_CORE_TAKE 0xa012U
++#define AOK_CORE_COMPLETE 0xa013U
++#define AOK_CORE_RESULT 0xa014U
++#define AOK_CORE_CANCEL 0xa015U
++#define AOK_CORE_EXPORT 0xa016U
++#define AOK_CORE_DATA_MAX 512U
++#define AOK_INFER_IDLE 0U
++#define AOK_INFER_PENDING 1U
++#define AOK_INFER_RUNNING 2U
++#define AOK_INFER_DONE 3U
++#define AOK_INFER_CANCELLED 4U
++struct aok_core_cap {
++	__u64 rights;
++	__u64 taint;
++	__u64 export_mask;
++	__u64 token_limit;
++};
++struct aok_core_session {
++	__s32 client_fd;
++	__s32 backend_fd;
++};
++struct aok_core_io {
++	__u64 sequence;
++	__u64 input_tokens;
++	__u64 output_tokens;
++	__u64 tokens_used;
++	__u64 taint;
++	__u32 state;
++	__u32 length;
++	__u8 data[AOK_CORE_DATA_MAX];
++};
+ #endif /* _UAPI_LINUX_AOK_H */

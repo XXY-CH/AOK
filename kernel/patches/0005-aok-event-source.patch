@@ -1,0 +1,560 @@
+diff --git a/include/linux/aok.h b/include/linux/aok.h
+index b2c38d239..89214b020 100644
+--- a/include/linux/aok.h
++++ b/include/linux/aok.h
+@@ -2,9 +2,11 @@
+ #ifndef _LINUX_AOK_H
+ #define _LINUX_AOK_H
+ 
++#include <linux/hrtimer.h>
+ #include <linux/refcount.h>
+ #include <linux/spinlock_types.h>
+ #include <linux/types.h>
++#include <uapi/linux/aok.h>
+ 
+ struct file;
+ struct pid;
+@@ -56,6 +58,42 @@ struct aok_handle {
+ 	u64 read_seq;			/* per-open event cursor */
+ };
+ 
++/*
++ * Event-source slice. Nodes are preallocated so the hrtimer callback can
++ * enqueue in hardirq context; the pending list is the FIFO of unacked
++ * events and nodes are recycled by ack.
++ */
++struct aok_event_node {
++	struct list_head list;
++	bool used;
++	u64 event_id;
++	u64 event_seq;
++	u32 coalesced;
++};
++
++struct aok_event_source {
++	refcount_t refs;		/* one reference per open handle */
++	spinlock_t lock;		/* guards queue/state */
++	struct list_head pending;	/* unacked events in seq order */
++	struct aok_event_node nodes[AOK_EVENT_SOURCE_DEPTH];
++	unsigned int live;
++	u64 koid;
++	u64 application_id;
++	u32 wake_policy;
++	u64 event_seq;			/* last assigned */
++	u64 event_id;			/* last issued, never reused */
++	unsigned long coalesced;	/* merged expiries awaiting a free slot */
++	struct hrtimer timer;
++	u64 interval_ns;
++	bool periodic;
++};
++
++struct aok_event_file {
++	struct aok_event_source *source;	/* pinned by this open */
++	u64 rights;
++	u64 read_seq;
++};
++
+ /* Handoff between aok syscalls and the copy_process() hook. */
+ struct aok_spawn_req {
+ 	struct aok_aproc *aproc;
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index 85e379f97..82e8a3129 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -900,8 +900,17 @@ __SYSCALL(__NR_aok_budget_get, sys_aok_budget_get)
+ #define __NR_aok_token_usage 483
+ __SYSCALL(__NR_aok_token_usage, sys_aok_token_usage)
+ 
++#define __NR_aok_event_source_create 484
++__SYSCALL(__NR_aok_event_source_create, sys_aok_event_source_create)
++
++#define __NR_aok_event_bind 485
++__SYSCALL(__NR_aok_event_bind, sys_aok_event_bind)
++
++#define __NR_aok_event_ack 486
++__SYSCALL(__NR_aok_event_ack, sys_aok_event_ack)
++
+ #undef __NR_syscalls
+-#define __NR_syscalls 484
++#define __NR_syscalls 487
+ 
+ /*
+  * 32 bit systems traditionally used different
+diff --git a/include/uapi/linux/aok.h b/include/uapi/linux/aok.h
+index e951bbfd0..fec9ec9f2 100644
+--- a/include/uapi/linux/aok.h
++++ b/include/uapi/linux/aok.h
+@@ -21,6 +21,8 @@
+ #define AOK_RIGHT_DESTROY (1ULL << 5)
+ #define AOK_RIGHT_SET_POLICY (1ULL << 6)
+ #define AOK_RIGHT_ACCOUNT (1ULL << 7)
++#define AOK_RIGHT_READ (1ULL << 8)
++#define AOK_RIGHT_WRITE (1ULL << 9)
+ #define AOK_RIGHTS_INITIAL (AOK_RIGHT_INSPECT | AOK_RIGHT_DUPLICATE)
+ #define AOK_RIGHTS_ROOT (AOK_RIGHT_INSPECT | AOK_RIGHT_DUPLICATE | AOK_RIGHT_MANAGE_CHILD)
+ #define AOK_RIGHTS_APROC_INITIAL \
+@@ -137,6 +139,28 @@ struct aok_budget_status {
+ 	__u64 reserved2[2];
+ };
+ 
++/*
++ * Event-source slice. Sources are created under a parent capability and
++ * own a bounded queue of unacked events; read(2) returns one record per
++ * call from a per-open cursor, so an unacked event can be replayed through
++ * a fresh duplicate. When the queue is full a timer source keeps a single
++ * pending instance and counts the merged expiries, flushing them into one
++ * coalesced event as soon as an ack frees a slot.
++ */
++#define AOK_OBJECT_EVENT_SOURCE 3U
++
++#define AOK_EVENT_SOURCE_TIMER 1U
++#define AOK_EVENT_KIND_TIMER 1U
++
++#define AOK_TIMER_ONESHOT 0U
++#define AOK_TIMER_PERIODIC 1U
++
++#define AOK_WAKE_MANUAL 0U
++#define AOK_WAKE_ON_EVENT 1U
++#define AOK_WAKE_ON_QUIESCENT 2U
++
++#define AOK_EVENT_SOURCE_DEPTH 64U
++
+ /*
+  * Token usage report for one aproc. usage_id identifies the report for
+  * idempotent replays; usage_seq must strictly increase across accepted
+@@ -169,4 +193,26 @@ struct aok_object_info {
+ 	__u64 reserved[3];
+ };
+ 
++struct aok_event_source_attr {
++	__u64 size;
++	__s32 parent_job_fd;
++	__u32 kind;
++	__u32 flags;
++	__u32 reserved;
++	__u64 first_ns;
++	__u64 interval_ns;
++	__u64 reserved2[2];
++};
++
++struct aok_event_record {
++	__u64 size;
++	__u64 source_koid;
++	__u64 application_id;
++	__u64 event_id;
++	__u64 event_seq;
++	__u32 kind;
++	__u32 coalesced;
++	__u64 reserved[3];
++};
++
+ #endif /* _UAPI_LINUX_AOK_H */
+diff --git a/kernel/aok.c b/kernel/aok.c
+index 1331d9c99..3928fe2b9 100644
+--- a/kernel/aok.c
++++ b/kernel/aok.c
+@@ -3,6 +3,8 @@
+ #include <linux/aok.h>
+ #include <linux/anon_inodes.h>
+ #include <linux/errno.h>
++#include <linux/hrtimer.h>
++#include <linux/ktime.h>
+ #include <linux/mm.h>
+ #include <linux/sched/mm.h>
+ #include <linux/file.h>
+@@ -1274,6 +1276,335 @@ SYSCALL_DEFINE2(aok_token_usage, int, fd,
+ 	return 0;
+ }
+ 
++/*
++ * Event-source slice: one hrtimer-backed source per fd. The callback runs
++ * in hardirq context, so nodes are preallocated and only list/flag work
++ * happens under the source lock. A full queue coalesces further expiries
++ * into a single pending count, flushed as one event when an ack recycles
++ * a slot.
++ */
++static void aok_source_fire_locked(struct aok_event_source *source)
++{
++	struct aok_event_node *node = NULL;
++	int i;
++
++	if (source->live >= AOK_EVENT_SOURCE_DEPTH) {
++		source->coalesced++;
++		return;
++	}
++	for (i = 0; i < AOK_EVENT_SOURCE_DEPTH; i++) {
++		if (!source->nodes[i].used) {
++			node = &source->nodes[i];
++			break;
++		}
++	}
++	if (WARN_ON_ONCE(!node))
++		return;
++	node->used = true;
++	node->event_id = ++source->event_id;
++	node->event_seq = ++source->event_seq;
++	node->coalesced = 1;
++	list_add_tail(&node->list, &source->pending);
++	source->live++;
++}
++
++static enum hrtimer_restart aok_timer_fn(struct hrtimer *timer)
++{
++	struct aok_event_source *source =
++		container_of(timer, struct aok_event_source, timer);
++	unsigned long flags;
++
++	spin_lock_irqsave(&source->lock, flags);
++	aok_source_fire_locked(source);
++	spin_unlock_irqrestore(&source->lock, flags);
++
++	if (source->periodic) {
++		hrtimer_forward_now(timer, ns_to_ktime(source->interval_ns));
++		return HRTIMER_RESTART;
++	}
++	return HRTIMER_NORESTART;
++}
++
++static void aok_source_flush_locked(struct aok_event_source *source)
++{
++	struct aok_event_node *node = NULL;
++	int i;
++
++	if (!source->coalesced || source->live >= AOK_EVENT_SOURCE_DEPTH)
++		return;
++	for (i = 0; i < AOK_EVENT_SOURCE_DEPTH; i++) {
++		if (!source->nodes[i].used) {
++			node = &source->nodes[i];
++			break;
++		}
++	}
++	if (WARN_ON_ONCE(!node))
++		return;
++	node->used = true;
++	node->event_id = ++source->event_id;
++	node->event_seq = ++source->event_seq;
++	node->coalesced = source->coalesced;
++	list_add_tail(&node->list, &source->pending);
++	source->live++;
++	source->coalesced = 0;
++}
++
++static int aok_event_release(struct inode *inode, struct file *file)
++{
++	struct aok_event_file *handle = file->private_data;
++	struct aok_event_source *source = handle->source;
++
++	if (refcount_dec_and_test(&source->refs)) {
++		hrtimer_cancel(&source->timer);
++		kfree(source);
++	}
++	kfree(handle);
++	return 0;
++}
++
++/*
++ * One record per call from the per-open cursor. Unacked events stay in the
++ * queue, so duplicating the fd yields a fresh cursor and replays them; the
++ * cursor advances before copyout (consume semantics, matching aproc read).
++ */
++static ssize_t aok_event_read(struct file *file, char __user *buf,
++			      size_t count, loff_t *ppos)
++{
++	struct aok_event_file *handle = file->private_data;
++	struct aok_event_source *source = handle->source;
++	struct aok_event_record rec = { .size = sizeof(rec), };
++	struct aok_event_node *node, *iter;
++	unsigned long flags;
++
++	if (!(handle->rights & AOK_RIGHT_READ))
++		return -EACCES;
++	if (count < sizeof(rec))
++		return -EINVAL;
++
++	spin_lock_irqsave(&source->lock, flags);
++	node = NULL;
++	list_for_each_entry(iter, &source->pending, list) {
++		if (iter->event_seq > handle->read_seq) {
++			node = iter;
++			break;
++		}
++	}
++	if (!node) {
++		spin_unlock_irqrestore(&source->lock, flags);
++		return 0;
++	}
++	rec.source_koid = source->koid;
++	rec.application_id = source->application_id;
++	rec.event_id = node->event_id;
++	rec.event_seq = node->event_seq;
++	rec.kind = AOK_EVENT_KIND_TIMER;
++	rec.coalesced = node->coalesced;
++	handle->read_seq = node->event_seq;
++	spin_unlock_irqrestore(&source->lock, flags);
++
++	if (copy_to_user(buf, &rec, sizeof(rec)))
++		return -EFAULT;
++	return sizeof(rec);
++}
++
++static const struct file_operations aok_event_fops = {
++	.owner = THIS_MODULE,
++	.release = aok_event_release,
++	.read = aok_event_read,
++};
++
++static int aok_copy_source_attr(struct aok_event_source_attr *attr,
++				const struct aok_event_source_attr __user *uattr)
++{
++	u64 size;
++	int ret;
++
++	if (get_user(size, &uattr->size))
++		return -EFAULT;
++	if (size < sizeof(*attr) || size > PAGE_SIZE)
++		return -EINVAL;
++	ret = copy_struct_from_user(attr, sizeof(*attr), uattr, size);
++	if (ret)
++		return ret;
++	if (attr->size != size || attr->kind != AOK_EVENT_SOURCE_TIMER ||
++	    attr->reserved || attr->reserved2[0] || attr->reserved2[1])
++		return -EINVAL;
++	switch (attr->flags) {
++	case AOK_TIMER_ONESHOT:
++		if (attr->interval_ns)
++			return -EINVAL;
++		break;
++	case AOK_TIMER_PERIODIC:
++		if (!attr->interval_ns)
++			return -EINVAL;
++		break;
++	default:
++		return -EINVAL;
++	}
++	return 0;
++}
++
++SYSCALL_DEFINE2(aok_event_source_create,
++		const struct aok_event_source_attr __user *, uattr,
++		struct aok_object_info __user *, uinfo)
++{
++	struct aok_event_source_attr attr;
++	struct aok_object_info info = {
++		.size = sizeof(info),
++		.type = AOK_OBJECT_EVENT_SOURCE,
++		.state = 1U,
++	};
++	struct aok_event_file *handle;
++	struct aok_event_source *source;
++	struct fd parent;
++	struct file *file;
++	int fd, ret, i;
++
++	ret = aok_copy_source_attr(&attr, uattr);
++	if (ret)
++		return ret;
++	parent = fdget(attr.parent_job_fd);
++	if (fd_empty(parent))
++		return -EBADF;
++	if (fd_file(parent)->f_op != &aok_root_fops &&
++	    fd_file(parent)->f_op != &aok_aproc_fops) {
++		fdput(parent);
++		return -EINVAL;
++	}
++	if (!(fd_file(parent)->private_data &&
++	      ((struct aok_handle *)fd_file(parent)->private_data)->rights &
++	      AOK_RIGHT_MANAGE_CHILD)) {
++		fdput(parent);
++		return -EACCES;
++	}
++	fdput(parent);
++
++	source = kzalloc(sizeof(*source), GFP_KERNEL);
++	if (!source)
++		return -ENOMEM;
++	handle = kzalloc(sizeof(*handle), GFP_KERNEL);
++	if (!handle) {
++		kfree(source);
++		return -ENOMEM;
++	}
++	ret = aok_alloc_id(&aok_next_koid, &source->koid);
++	if (ret)
++		goto err_free;
++	refcount_set(&source->refs, 1);
++	spin_lock_init(&source->lock);
++	INIT_LIST_HEAD(&source->pending);
++	for (i = 0; i < AOK_EVENT_SOURCE_DEPTH; i++)
++		INIT_LIST_HEAD(&source->nodes[i].list);
++	hrtimer_setup(&source->timer, aok_timer_fn, CLOCK_MONOTONIC,
++		      HRTIMER_MODE_REL);
++	source->interval_ns = attr.interval_ns;
++	source->periodic = attr.flags == AOK_TIMER_PERIODIC;
++	handle->source = source;
++	handle->rights = AOK_RIGHT_INSPECT | AOK_RIGHT_DUPLICATE |
++			 AOK_RIGHT_READ | AOK_RIGHT_WRITE;
++	info.aid = source->koid;
++	info.rights = handle->rights;
++	fd = get_unused_fd_flags(O_CLOEXEC);
++	if (fd < 0) {
++		ret = fd;
++		goto err_free;
++	}
++	file = anon_inode_getfile("aok-event-source", &aok_event_fops,
++				  handle, O_RDWR);
++	if (IS_ERR(file)) {
++		ret = PTR_ERR(file);
++		goto err_put_fd;
++	}
++	/* Publish only after the copyout succeeds; no installed fd on failure. */
++	ret = aok_copy_info(uinfo, &info);
++	if (ret)
++		goto err_put_file;
++	if (attr.first_ns)
++		hrtimer_start(&source->timer, ns_to_ktime(attr.first_ns),
++			      HRTIMER_MODE_REL);
++	fd_install(fd, file);
++	return fd;
++
++err_put_file:
++	fput(file);
++	return ret;
++err_put_fd:
++	put_unused_fd(fd);
++err_free:
++	kfree(handle);
++	kfree(source);
++	return ret;
++}
++
++SYSCALL_DEFINE3(aok_event_bind, int, fd, u64, application_id, u64, wake_policy)
++{
++	struct aok_event_file *handle;
++	struct aok_event_source *source;
++	struct fd f;
++
++	if (wake_policy > AOK_WAKE_ON_QUIESCENT)
++		return -EINVAL;
++	f = fdget(fd);
++	if (fd_empty(f))
++		return -EBADF;
++	if (fd_file(f)->f_op != &aok_event_fops) {
++		fdput(f);
++		return -EINVAL;
++	}
++	handle = fd_file(f)->private_data;
++	source = handle->source;
++	if (!(handle->rights & AOK_RIGHT_WRITE)) {
++		fdput(f);
++		return -EACCES;
++	}
++	spin_lock_irq(&source->lock);
++	source->application_id = application_id;
++	source->wake_policy = wake_policy;
++	spin_unlock_irq(&source->lock);
++	fdput(f);
++	return 0;
++}
++
++SYSCALL_DEFINE2(aok_event_ack, int, fd, u64, event_id)
++{
++	struct aok_event_file *handle;
++	struct aok_event_source *source;
++	struct aok_event_node *node;
++	struct fd f;
++
++	f = fdget(fd);
++	if (fd_empty(f))
++		return -EBADF;
++	if (fd_file(f)->f_op != &aok_event_fops) {
++		fdput(f);
++		return -EINVAL;
++	}
++	handle = fd_file(f)->private_data;
++	source = handle->source;
++	if (!(handle->rights & AOK_RIGHT_WRITE)) {
++		fdput(f);
++		return -EACCES;
++	}
++	spin_lock_irq(&source->lock);
++	if (event_id > source->event_id) {
++		spin_unlock_irq(&source->lock);
++		fdput(f);
++		return -EINVAL;
++	}
++	list_for_each_entry(node, &source->pending, list) {
++		if (node->event_id != event_id)
++			continue;
++		list_del_init(&node->list);
++		node->used = false;
++		source->live--;
++		aok_source_flush_locked(source);
++		break;
++	}
++	spin_unlock_irq(&source->lock);
++	fdput(f);
++	return 0;
++}
++
+ SYSCALL_DEFINE2(aok_object_inspect, int, fd,
+ 		struct aok_object_info __user *, uinfo)
+ {
+@@ -1308,10 +1639,37 @@ SYSCALL_DEFINE2(aok_handle_duplicate, int, fd, u64, rights)
+ {
+ 	struct fd f = fdget(fd);
+ 	struct aok_handle *old, *handle;
++	struct aok_event_file *ev_old, *ev_handle;
+ 	int ret;
+ 
+ 	if (fd_empty(f))
+ 		return -EBADF;
++	if (fd_file(f)->f_op == &aok_event_fops) {
++		ev_old = fd_file(f)->private_data;
++		if (!(ev_old->rights & AOK_RIGHT_DUPLICATE) ||
++		    (rights & ~ev_old->rights)) {
++			fdput(f);
++			return -EACCES;
++		}
++		ev_handle = kmalloc(sizeof(*ev_handle), GFP_KERNEL);
++		if (!ev_handle) {
++			fdput(f);
++			return -ENOMEM;
++		}
++		/* A duplicate opens a fresh cursor: unacked events replay. */
++		ev_handle->source = ev_old->source;
++		ev_handle->rights = rights;
++		ev_handle->read_seq = 0;
++		refcount_inc(&ev_handle->source->refs);
++		ret = anon_inode_getfd("aok-event-source", &aok_event_fops,
++				       ev_handle, O_RDWR | O_CLOEXEC);
++		if (ret < 0) {
++			refcount_dec(&ev_handle->source->refs);
++			kfree(ev_handle);
++		}
++		fdput(f);
++		return ret;
++	}
+ 	if (fd_file(f)->f_op != &aok_aproc_fops) {
+ 		ret = -EINVAL;
+ 		goto out;
+diff --git a/kernel/sys_ni.c b/kernel/sys_ni.c
+index febf55e31..817d5bcc7 100644
+--- a/kernel/sys_ni.c
++++ b/kernel/sys_ni.c
+@@ -408,3 +408,6 @@ COND_SYSCALL(aok_aproc_status);
+ COND_SYSCALL(aok_budget_set);
+ COND_SYSCALL(aok_budget_get);
+ COND_SYSCALL(aok_token_usage);
++COND_SYSCALL(aok_event_source_create);
++COND_SYSCALL(aok_event_bind);
++COND_SYSCALL(aok_event_ack);
+diff --git a/scripts/syscall.tbl b/scripts/syscall.tbl
+index acdfc2c80..42b58348e 100644
+--- a/scripts/syscall.tbl
++++ b/scripts/syscall.tbl
+@@ -424,3 +424,6 @@
+ 481	common	aok_budget_set			sys_aok_budget_set
+ 482	common	aok_budget_get			sys_aok_budget_get
+ 483	common	aok_token_usage		sys_aok_token_usage
++484	common	aok_event_source_create		sys_aok_event_source_create
++485	common	aok_event_bind			sys_aok_event_bind
++486	common	aok_event_ack			sys_aok_event_ack

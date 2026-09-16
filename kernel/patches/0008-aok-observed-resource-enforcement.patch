@@ -1,0 +1,46 @@
+From aok-0008 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] aok: freeze domains observed over cpu or memory limits
+
+Convert observed CPU and RSS values to the public units and trigger the same
+fail-closed freeze path used by token hard limits when a budget snapshot sees
+an exceeded limit.
+
+---
+ kernel/aok.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/kernel/aok.c b/kernel/aok.c
+index d0a1863..aok0008 100644
+--- a/kernel/aok.c
++++ b/kernel/aok.c
+@@ -1160,6 +1160,6 @@ static void aok_observe_usage(struct aok_aproc *aproc, u64 *cpu_ns, u64 *bytes)
+ 	aok_put_tasks(tasks, count);
+ 	*cpu_ns = ns;
+-	*bytes = rss;
++	*bytes = rss > (U64_MAX >> PAGE_SHIFT) ? U64_MAX : rss << PAGE_SHIFT;
+ }
+ 
+ SYSCALL_DEFINE2(aok_budget_set, int, fd,
+@@ -1212,4 +1212,5 @@ SYSCALL_DEFINE2(aok_budget_get, int, fd,
+ 	struct fd f;
+ 	u64 cpu_ns = 0, bytes = 0;
++	bool over = false;
+ 
+ 	f = fdget(fd);
+@@ -1235,6 +1235,14 @@ SYSCALL_DEFINE2(aok_budget_get, int, fd,
+ 	status.tokens_cached = aproc->tokens_cached;
+ 	status.res_state = aproc->res_state;
++	over = (status.cpu_usec_limit != U64_MAX &&
++		status.cpu_usec_used >= status.cpu_usec_limit) ||
++		(status.memory_bytes_limit != U64_MAX &&
++		 status.memory_bytes_used >= status.memory_bytes_limit);
++	if (over)
++		status.res_state = AOK_RES_STATE_OVER;
+ 	spin_unlock(&aproc->lock);
+ 	fdput(f);
++	if (over)
++		aok_force_freeze(aproc);
+ 	return aok_copy_status_out(ustatus, &status);
+ }
+-- 
+2.45.2

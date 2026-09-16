@@ -1,0 +1,12 @@
+# Agent 能力清单（capability manifest）
+# 内核在 Phase 3 会将其编译为 Landlock + seccomp 强制执行。
+engine: echo            # 可插拔引擎: echo | claude | ...
+capabilities:
+  fs:
+    read:  [/mnt/project/in/**]
+    write: [/mnt/project/out/**]
+  net: false            # 是否允许网络
+  tools: [search]       # 允许的工具白名单
+resources:
+  mem_mib: 512
+  cpus: 1
