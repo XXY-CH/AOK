@@ -32,7 +32,9 @@ child with restart-rate, timeout and sandbox limits.
 ## Process and transport
 
 The supervisor must create a Unix stream socket in a private directory, restrict
-socket permissions, and pass its listening fd to the engine:
+socket permissions, and pass its listening fd to the engine. Linux guests may
+use the equivalent AF_VSOCK listener from `ListenVsock`/`DialVsock`; the CID and
+port remain supervisor-owned:
 
 ```sh
 go build -o /tmp/aok-engine-echo ./cmd/aok-engine-echo

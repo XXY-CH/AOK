@@ -18,12 +18,12 @@ const (
 	writeTimeout      = 10 * time.Second
 )
 
-// Serve takes ownership of a supervisor-created Unix listener. Each connection
+// Serve takes ownership of a supervisor-created Unix or vsock listener. Each connection
 // gets a fresh provider and Engine; IDs confer no authority across connections.
 // Providers must honor cancellation, including during shutdown.
 func Serve(ctx context.Context, listener net.Listener, newProvider func() Provider) error {
-	if listener.Addr().Network() != "unix" {
-		return fmt.Errorf("engine requires a Unix stream listener")
+	if network := listener.Addr().Network(); network != "unix" && network != "vsock" {
+		return fmt.Errorf("engine requires a Unix or vsock stream listener")
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -172,7 +172,7 @@ func serveConnection(parent context.Context, conn net.Conn, provider Provider) {
 			response := engine.Handle(request)
 			var fields map[string]any
 			_ = json.Unmarshal(response.Result, &fields)
-			fields["address"] = "unix://" + conn.LocalAddr().String()
+			fields["address"] = conn.LocalAddr().Network() + "://" + conn.LocalAddr().String()
 			response.Result, _ = json.Marshal(fields)
 			send(response)
 			initialized = true
