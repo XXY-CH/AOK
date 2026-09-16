@@ -147,3 +147,37 @@ func TestLlamaDeadline(t *testing.T) {
 		t.Fatalf("expected deadline error, got %v", err)
 	}
 }
+
+func TestLlamaKVSaveRestore(t *testing.T) {
+	var actions []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		actions = append(actions, r.URL.Path+"?"+r.URL.RawQuery)
+		var input struct {
+			Filename string `json:"filename"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil || input.Filename != "turn-1.kv" {
+			t.Fatalf("bad KV request: %v %+v", err, input)
+		}
+		_, _ = w.Write([]byte(`{"filename":"turn-1.kv"}`))
+	}))
+	defer server.Close()
+	p, err := NewLlamaProvider(LlamaConfig{Endpoint: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := p.SaveKV(context.Background(), 3, "turn-1.kv")
+	if err != nil || snapshot != (KVSnapshot{Slot: 3, Filename: "turn-1.kv"}) {
+		t.Fatalf("snapshot=%+v err=%v", snapshot, err)
+	}
+	if err = p.RestoreKV(context.Background(), snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 2 || actions[0] != "/slots/3?action=save" || actions[1] != "/slots/3?action=restore" {
+		t.Fatalf("actions=%v", actions)
+	}
+	for _, name := range []string{"", "../escape", "/absolute", "a/b"} {
+		if _, err = p.SaveKV(context.Background(), 3, name); err == nil {
+			t.Errorf("accepted KV filename %q", name)
+		}
+	}
+}
