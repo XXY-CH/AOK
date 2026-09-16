@@ -5,8 +5,7 @@
 
 ## 已冻结
 
-- **AOS** 是运行 AOK 的 SubOS 产品和 VM 环境名称；**AOK** 是 Agent-native kernel 和
-  原生控制 CLI 的名称。Swift 可执行文件统一为 `aok`。
+- **AOK** 是 Agent-native kernel、SubOS 产品和 VM 环境的统一名称，Swift 可执行文件统一为 `aok`。
 - `kernel/linux` 是上游 `linux-6.18.y` 的 detached shallow checkout，提交历史不与
   AOK 合并。macOS 使用大小写敏感卷承载它，根目录只保留 patch/config/kselftest。
 - Agent 的产品 ABI 是 AOK fd/handle ABI。CLI、GUI、ACP、MCP、A2A 和 Linux/POSIX 用户态

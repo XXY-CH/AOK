@@ -81,7 +81,7 @@ within budget -> throttle -> freeze -> supervisor event
 
 ## 外部迁移适配器（可选）
 
-默认 AOK 镜像不依赖 `/run/aos/syscall.sock`。需要迁移现有 agentd 或 Linux 用户态工具时，
+默认 AOK 镜像不依赖 `/run/aok/syscall.sock`。需要迁移现有 agentd 或 Linux 用户态工具时，
 可以在用户态运行一个 JSON-RPC 适配器，将旧请求映射到 AOK 对象；该适配器不增加内核权限，
 也不能把 POSIX 身份当作 Agent 身份：
 

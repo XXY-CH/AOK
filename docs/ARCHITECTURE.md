@@ -1,21 +1,21 @@
-# AOS — Agent-native SubOS 架构
+# AOK — Agent-native SubOS 架构
 
 ## 定位
 
-AOS 是运行在宿主 OS（macOS 27, arm64）之上的真正 SubOS：
+AOK 是运行在宿主 OS（macOS 27, arm64）之上的真正 SubOS：
 
 - **真隔离**：每个 SubOS 实例 = 一个轻量 Linux microVM（独立内核，基于 Apple Containerization framework）。
 - **Agent-native 内核**：内核抽象（进程、调度、上下文、IPC、能力）直接面向 LLM Agent；Linux task、POSIX 和桌面交互都只是实现或外部适配细节。
 - **可插拔引擎**：SubAgent 引擎（模型 runtime）只是内核里的一种"进程"，内核不关心里面跑什么模型。
 - **Agent 生长环境**：Application 是 Agent 可组合的能力与状态单元，按需求创建、升级、休眠和退役；人类界面只是可选控制面。
 
-与现有方案的区别：E2B/Daytona 有真隔离但只是沙箱服务（无 Agent 抽象）；AIOS/Letta 有 Agent 抽象但是纯用户态 harness（无隔离）。AOS = 两者结合。
+与现有方案的区别：E2B/Daytona 有真隔离但只是沙箱服务（无 Agent 抽象）；AIOS/Letta 有 Agent 抽象但是纯用户态 harness（无隔离）。AOK = 两者结合。
 
 ## 分层
 
 ```
 macOS 27 宿主
-└─ H  aos-host (Swift, Containerization framework)
+└─ H  aok-host (Swift, Containerization framework)
    · VM 生命周期 / 资源配额 / pause-resume（VZ 无 snapshot API）
    · VM 后端接口可插拔（当前 Apple Containers；未来 Linux 宿主可加 libkrun/Firecracker）
    · hostfs bridge（virtiofs live mount、artifact import/export）与外部消息 connector
@@ -36,7 +36,7 @@ Application 不属于某一个 Linux task。它由 Agent 的 durable identity、
 重启后重建，而 Application identity、未确认消息和 checkpoint 持续存在。Application 的创建、
 生长、迭代和退役由 Agent 需求触发，由 supervisor 和 AOK capability/resource policy 约束。
 
-这里的 `L0/L1/L2` 是目标架构编号。早期文档把 `aos-host` 标为 L0、VM 内 `agentd` 标为
+这里的 `L0/L1/L2` 是目标架构编号。早期文档把 `aok-host` 标为 L0、VM 内 `agentd` 标为
 L1；那套编号只保留为迁移历史，不用于新 ABI 或 ACP 边界。ACP 位于 L1 runtime 的对外
 adapter，AOK syscall 位于 L0，engine protocol 位于 L1 到 L2 的内部边界。
 
@@ -62,7 +62,7 @@ P0 的内核接口是 AOK fd ABI：对象通过 capability handle 引用，事�
 传递，上下文通过 `ctx.*` 管理，推理通过 `ainf` 设备提交。AOK 不以启动通用 Linux 用户态、
 实现 POSIX 或复刻人类桌面工作流为目标。
 
-旧 Go runtime 和 `/run/aos/syscall.sock` 已从工作树清除。未来如需迁移旧用户态，适配器必须
+旧 Go runtime 和 `/run/aok/syscall.sock` 已从工作树清除。未来如需迁移旧用户态，适配器必须
 放在明确命名的 `adapters/legacy/`，并通过 AOK control API 获取受限 capability；它不能成为
 PID1、内核 ABI 或 Agent 间 IPC。
 
@@ -90,7 +90,7 @@ resources:
 
 ## 路线
 
-1. 底座打通（aos vm up + Agent runtime handshake）
+1. 底座打通（aok vm up + Agent runtime handshake）
 2. Agent-native 内核原语（aproc、amem、ainf、IPC、event source）
 3. 能力模型（Landlock/seccomp/acap）
 4. 多开并行调研（MVP 验收）
