@@ -26,8 +26,6 @@ P1 预定顺序：
 
 GLM 返回的候选补丁先用 `make aok-candidate-check PATCH=kernel/patches/0003-...patch` 验收。
 它会接在当前序列之后应用、拒绝越出 Linux 内核目录的路径、运行 `checkpatch`，但不会自动
-加入 `series`。
-
-资源域实现交接规格见 [GLM-HANDOFF-P3-RESOURCE-DOMAIN.md](../../docs/GLM-HANDOFF-P3-RESOURCE-DOMAIN.md)。
-候选 `0004` 必须先通过 `make aok-candidate-check PATCH=kernel/patches/0004-aok-resource-domain.patch`，
+加入 `series`。候选补丁必须先通过
+`make aok-candidate-check PATCH=kernel/patches/0004-aok-resource-domain.patch`，
 再执行完整 series 构建和 QEMU 回归后才能加入本文件的 series。
