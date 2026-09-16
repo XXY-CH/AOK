@@ -34,6 +34,7 @@ type Supervisor struct {
 	lock         *os.File
 	committed    []byte
 	contexts     *ContextStore
+	authorizer   CapabilityAuthorizer
 }
 
 type supervisorState struct {
@@ -124,7 +125,7 @@ func NewSupervisor(root string, policy CapabilitySet) (*Supervisor, error) {
 	policy.FSRead = append([]string(nil), policy.FSRead...)
 	policy.FSWrite = append([]string(nil), policy.FSWrite...)
 	policy.Tools = append([]string(nil), policy.Tools...)
-	s := &Supervisor{root: root, policy: policy, state: supervisorState{Applications: map[string]*Application{}, Mailbox: map[string][]MailboxMessage{}}}
+	s := &Supervisor{root: root, policy: policy, state: supervisorState{Applications: map[string]*Application{}, Mailbox: map[string][]MailboxMessage{}}, authorizer: CapabilityAuthorizer{Policy: cedarPolicyFromCapabilitySet(policy)}}
 	s.lock = lock
 	if err := s.load(); err != nil {
 		s.Close()
@@ -475,24 +476,19 @@ func (s *Supervisor) AckMailbox(principal, id, messageID string) error {
 }
 
 func (s *Supervisor) Check(principal, applicationID, object, action string) (bool, error) {
+	return s.checkToken(principal, applicationID, object, action, nil)
+}
+
+func (s *Supervisor) CheckWithToken(principal, applicationID, object, action string, token CapabilityToken) (bool, error) {
+	return s.checkToken(principal, applicationID, object, action, &token)
+}
+
+func (s *Supervisor) checkToken(principal, applicationID, object, action string, token *CapabilityToken) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	allowed := false
+	allowed := s.authorizer.Evaluate(principal, object, action, token) == nil
 	reason := "policy"
-	switch object {
-	case "net":
-		allowed = s.policy.Net
-	case "tool":
-		for _, v := range s.policy.Tools {
-			if v == action {
-				allowed = true
-			}
-		}
-	case "fs.read":
-		allowed = allowedPath(s.policy.FSRead, action)
-	case "fs.write":
-		allowed = allowedPath(s.policy.FSWrite, action)
-	default:
+	if object != "net" && object != "tool" && object != "fs.read" && object != "fs.write" {
 		reason = "unknown object"
 	}
 	if a, ok := s.state.Applications[applicationID]; !ok || a.State == "tombstoned" {
@@ -514,6 +510,23 @@ func (s *Supervisor) Check(principal, applicationID, object, action string) (boo
 		return false, ErrCapabilityDenied
 	}
 	return true, nil
+}
+
+func cedarPolicyFromCapabilitySet(policy CapabilitySet) CedarPolicy {
+	rules := []CedarRule{}
+	if policy.Net {
+		rules = append(rules, CedarRule{Effect: "allow", Principal: "*", Object: "net", Action: "*"})
+	}
+	for _, tool := range policy.Tools {
+		rules = append(rules, CedarRule{Effect: "allow", Principal: "*", Object: "tool", Action: tool})
+	}
+	for _, path := range policy.FSRead {
+		rules = append(rules, CedarRule{Effect: "allow", Principal: "*", Object: "fs.read", Action: path})
+	}
+	for _, path := range policy.FSWrite {
+		rules = append(rules, CedarRule{Effect: "allow", Principal: "*", Object: "fs.write", Action: path})
+	}
+	return CedarPolicy{Rules: rules}
 }
 
 func (s *Supervisor) Audit() []AuditRecord {

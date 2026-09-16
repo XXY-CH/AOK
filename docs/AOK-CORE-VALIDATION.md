@@ -19,8 +19,8 @@ python3 runtime/scripts/core-smoke.py
 
 这些项目仍不能宣称已完成：
 
-- supervisor 当前默认在自身进程内直接调用 Provider；`ProcessProvider` 是可用的受监督路径，但尚未成为 aok-supervisor 的默认 PID1/worker 编排，也没有 guest↔host vsock 心跳。
-- 内核 capability 的 export gate 不是全系统 Linux I/O/污点 LSM；尚无 Biscuit/Cedar、unotify 人工确认和外部 witness 联签。
-- 尚无 amem/LSFS 内核实现、sched_ext/MLFQ 强制调度、llama slot save/restore、Metal 后端或 Anthropic 后端。当前机器没有 `ANTHROPIC_API_KEY`，因此真实 Anthropic 验证被明确阻塞。
-- kernel probe 的 backend adapter 与 PID1 同进程；尚未证明独立 backend 的长期监督、vsock 传输或 VM 重启后的真实模型 KV 恢复。
+- `aok-init` 已成为可运行的 guest PID1 基础入口，负责 supervisor 子进程的信号转发、退出回收和 restart intensity；默认 supervisor 仍可在自身进程内调用 Provider，独立 `ProcessProvider` 路径已有测试。
+- runtime 已提供签名可收窄 capability token、Cedar 风格 deny-overrides 和 manifest → Landlock/seccomp 强制；内核 capability export gate 仍不是全系统污点 LSM，unotify 和 external witness 尚未实现。
+- runtime 已提供 llama slot save/restore、loopback Metal adapter、Anthropic Messages adapter、router/fallback、vsock API 和 cgroup v2 CPU/RSS enforcement。当前机器没有 `ANTHROPIC_API_KEY`，因此 Anthropic 真实服务验证被阻塞；当前 QEMU 也没有可用 virtio-vsock device model。
+- kernel probe 的 backend adapter 与 PID1 同进程；尚未证明独立 backend 的长期 guest↔host vsock 心跳或 VM 重启后的真实模型 KV 恢复。
 - QEMU arm64 的 PID1 probe 通过 46/46 新断言，并回归 object 44/44、task 64/64、resource 50/50、event-source 37/37。证据在 `kernel/.build/qemu-arm64-core/probe-serial.log` 和 `kernel/kselftest/CORE-VALIDATION.md`。

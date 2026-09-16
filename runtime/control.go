@@ -100,6 +100,7 @@ func (s *ControlServer) handle(req Message, principal string) Message {
 		Object        string          `json:"object"`
 		Action        string          `json:"action"`
 		Path          string          `json:"path"`
+		Token         string          `json:"capability_token"`
 		TokenLimit    uint64          `json:"token_limit"`
 		TimerID       string          `json:"timer_id"`
 		DelayMS       int64           `json:"delay_ms"`
@@ -212,7 +213,22 @@ func (s *ControlServer) handle(req Message, principal string) Message {
 		if p.Path != "" {
 			p.Action = p.Path
 		}
-		ok, err := s.Supervisor.Check(p.Principal, p.ApplicationID, p.Object, p.Action)
+		var token *CapabilityToken
+		if p.Token != "" {
+			parsed, parseErr := ParseCapabilityToken(p.Token)
+			if parseErr != nil {
+				resp.Result, _ = json.Marshal(map[string]any{"allowed": false, "reason": parseErr.Error()})
+				break
+			}
+			token = &parsed
+		}
+		var ok bool
+		var err error
+		if token == nil {
+			ok, err = s.Supervisor.Check(p.Principal, p.ApplicationID, p.Object, p.Action)
+		} else {
+			ok, err = s.Supervisor.CheckWithToken(p.Principal, p.ApplicationID, p.Object, p.Action, *token)
+		}
 		if err != nil && !errors.Is(err, ErrCapabilityDenied) {
 			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
 		} else if err != nil {

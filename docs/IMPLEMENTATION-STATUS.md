@@ -32,9 +32,10 @@
 - `0004` 已实现资源预算收窄、CPU/RSS 观测、token 台账和资源状态事件；`0007` 补充
   token hard limit 超限后的保守记账和冻结，`0008` 补充 budget snapshot 观察到 CPU/RSS
   超限后的 fail-closed 冻结。P8 资源测试记录 53 项启用通过；此前 disabled 8 项及
-  object 44、task 64、event-source 37、core 46 回归保持通过。**CPU/RSS 仍不是实时
-  调度器 throttle 或 memcg reclaim**。证据见 [KERNEL-P7-VALIDATION.md](KERNEL-P7-VALIDATION.md)
-  和 [KERNEL-P8-VALIDATION.md](KERNEL-P8-VALIDATION.md)。
+  object 44、task 64、event-source 37、core 46 回归保持通过。runtime 现在在 Linux
+  cgroup v2 写入 `cpu.max`/`memory.max`，并由 `memory.current` 监控器触发 `memory.reclaim`；
+  AOK 内核 patch 本身仍未提供专用 sched_ext quota 或独立 memcg。证据见
+  [KERNEL-P7-VALIDATION.md](KERNEL-P7-VALIDATION.md) 和 [KERNEL-P8-VALIDATION.md](KERNEL-P8-VALIDATION.md)。
 - `0005` 已实现 timer 事件源、ack、句柄内存 replay、满队列 coalesce 与权限检查；
   报告记录 37 项启用 + 6 项禁用测试，以及五枚 series 重建和八组回归通过。
   **尚无 durable replay、port/LSFS 源、poll 通知或实际 wake 动作**；
@@ -55,10 +56,9 @@
 
 ## 当前未实现
 
-- 完整资源强制执行、持久事件源与唤醒、sched_ext Agent 调度、amem、ainf 设备化运行、完整 acap
-  强制、AOK supervisor PID1/initfs、LSFS、router、Web capability、HostFS bridge 和消息 gateway
-  尚未实现。QEMU kernel probe 已以 PID1 验证 capability/真实推理，但它仍是验证程序，不能视作完整
-  AOK supervisor。
+- amem/LSFS、持久事件源与唤醒、sched_ext Agent 调度、ainf 内核设备化、Web capability、HostFS bridge
+  和消息 gateway 尚未实现。`runtime/cmd/aok-init` 与 `kernel/initramfs/build-aok.sh` 已提供 supervisor
+  PID1/initfs 基础闭环；QEMU kernel probe 仍是独立验证程序，不能替代完整 guest 服务编排。
 - `kernel/linux` 保持干净的上游基线；AOK 代码位于外层 patch，构建时应用到独立源码目录。
 - 本机 QEMU 构建没有 virtio-vsock device model，当前只完成内核配置检查，未完成 guest↔host
   vsock 心跳；该项转移到 Apple Container 或支持 vsock 的 Linux/QEMU runner。
