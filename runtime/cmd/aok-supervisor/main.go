@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	aok "aok/runtime"
 )
@@ -28,6 +29,7 @@ func run() error {
 	root := flag.String("state", "", "private durable state directory")
 	manifest := flag.String("manifest", "", "capability manifest")
 	endpoint := flag.String("llama-endpoint", "", "supervisor-owned llama.cpp service")
+	metalEndpoint := flag.String("metal-endpoint", "", "supervisor-owned local Metal llama.cpp service")
 	anthropicEndpoint := flag.String("anthropic-endpoint", "", "Anthropic Messages API endpoint")
 	anthropicModel := flag.String("anthropic-model", "", "Anthropic model name")
 	routerEngines := stringListFlag{}
@@ -74,10 +76,12 @@ func run() error {
 			provider = aok.EchoProvider{}
 		case "llama":
 			provider, err = aok.NewLlamaProvider(aok.LlamaConfig{Endpoint: *endpoint, MaxTokens: *maxTokens, CachePrompt: true})
+		case "metal":
+			provider, err = aok.NewMetalProvider(aok.MetalConfig{Endpoint: *metalEndpoint, MaxTokens: *maxTokens})
 		case "anthropic":
 			provider, err = aok.NewAnthropicProvider(aok.AnthropicConfig{Endpoint: *anthropicEndpoint, Model: *anthropicModel, MaxTokens: *maxTokens})
 		case "router":
-			provider, err = newRouter(*endpoint, *anthropicEndpoint, *anthropicModel, *maxTokens, routerEngines)
+			provider, err = newRouter(*endpoint, *metalEndpoint, *anthropicEndpoint, *anthropicModel, *maxTokens, routerEngines)
 		default:
 			return fmt.Errorf("unsupported engine %q", policy.Engine)
 		}
@@ -112,6 +116,11 @@ func run() error {
 	defer stop()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	if resources != nil {
+		go func() {
+			_ = resources.Monitor(ctx, aok.ResourceLimits{CPUs: uint64(policy.CPUs), MemoryBytes: uint64(policy.MemMiB) << 20}, 100*time.Millisecond, nil)
+		}()
+	}
 	done := make(chan error, 2)
 	go func() { done <- (&aok.ControlServer{Supervisor: s, Listener: l}).Serve(ctx) }()
 	go func() { done <- s.Run(ctx, provider) }()
@@ -125,7 +134,7 @@ func run() error {
 	return other
 }
 
-func newRouter(llamaEndpoint, anthropicEndpoint, anthropicModel string, maxTokens int, order []string) (aok.Provider, error) {
+func newRouter(llamaEndpoint, metalEndpoint, anthropicEndpoint, anthropicModel string, maxTokens int, order []string) (aok.Provider, error) {
 	if len(order) == 0 {
 		order = []string{"llama", "anthropic"}
 	}
@@ -143,6 +152,12 @@ func newRouter(llamaEndpoint, anthropicEndpoint, anthropicModel string, maxToken
 			providers = append(providers, p)
 		case "anthropic":
 			p, err := aok.NewAnthropicProvider(aok.AnthropicConfig{Endpoint: anthropicEndpoint, Model: anthropicModel, MaxTokens: maxTokens})
+			if err != nil {
+				return nil, err
+			}
+			providers = append(providers, p)
+		case "metal":
+			p, err := aok.NewMetalProvider(aok.MetalConfig{Endpoint: metalEndpoint, MaxTokens: maxTokens})
 			if err != nil {
 				return nil, err
 			}

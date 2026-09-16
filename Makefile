@@ -4,7 +4,7 @@ LINUX_URL := https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
 LINUX_BRANCH := linux-6.18.y
 LINUX_DIR := kernel/linux
 
-.PHONY: linux-mount linux-fetch linux-status kernel-config-probe qemu-initramfs qemu-boot linux-clean-prep aok-object-build aok-object-test aok-object-test-disabled aok-patch-check aok-candidate-check aok-task-test aok-task-test-disabled aok-resource-test aok-resource-test-disabled aok-eventsrc-test aok-eventsrc-test-disabled
+.PHONY: linux-mount linux-fetch linux-status kernel-config-probe qemu-initramfs aok-initramfs qemu-boot linux-clean-prep aok-object-build aok-object-test aok-object-test-disabled aok-patch-check aok-candidate-check aok-task-test aok-task-test-disabled aok-resource-test aok-resource-test-disabled aok-eventsrc-test aok-eventsrc-test-disabled
 
 linux-mount:
 	@if [ -d "$(LINUX_DIR)/.git" ]; then \
@@ -46,6 +46,9 @@ kernel-config-probe:
 
 qemu-initramfs:
 	@kernel/initramfs/build-qemu.sh
+
+aok-initramfs:
+	@kernel/initramfs/build-aok.sh
 
 qemu-boot:
 	@kernel/configs/boot-qemu-arm64.sh
