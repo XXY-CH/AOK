@@ -1,4 +1,4 @@
-# AOS L0 计划 — Agent-native 内核（AOK 设计）
+# AOK L0 计划 — Agent-native 内核（AOK 设计）
 
 > 状态：历史设计计划。准备阶段已完成，当前执行状态见 [IMPLEMENTATION-STATUS.md](IMPLEMENTATION-STATUS.md)；本文件回答一个真正的
 > Agent-First SubOS 内核（AOK, Agent OS Kernel）应该长什么样、怎么分阶段落地。
@@ -43,9 +43,9 @@ L1  libOS 层 每个 Agent 的引擎运行时（exokernel 教训：harness=每�
 L2  用户层   系统 Agent（shell=ash、fsd 存储代理、auditd）+ 用户 Agent
 ```
 
-本计划采用的目标分层与现有文档中的旧编号不同。旧架构里的 `aos-host=L0`、VM 内
+本计划采用的目标分层与现有文档中的旧编号不同。旧架构里的 `aok-host=L0`、VM 内
 `agentd=L1`、引擎 `L2` 保留为迁移参考；目标架构把 Linux kernel 扩展和 AOK kernel
-objects 视为 L0，AOK runtime/libOS 视为用户态控制层。`aos-host` 仍负责 VM 生命周期，
+objects 视为 L0，AOK runtime/libOS 视为用户态控制层。`aok-host` 仍负责 VM 生命周期，
 但不持有 Agent 的 root capability。
 
 这与业界两个失败阵营的区别：**隐喻 OS**（AIOS/OpenFang/Letta：有 agent 语义、无隔离、

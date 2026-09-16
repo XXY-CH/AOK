@@ -254,7 +254,7 @@ enum Interactive {
             case "3":
                 applications(config)
             case "4":
-                let name = prompt("实例名称", default: "aos-0")
+                let name = prompt("实例名称", default: "aok-0")
                 print("启动 \(name)…")
                 _ = ContainerBackend.run(["run", "-d", "--name", name, config.image])
                 pause()

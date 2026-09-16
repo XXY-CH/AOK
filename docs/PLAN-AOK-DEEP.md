@@ -133,7 +133,7 @@ AOK Linux kernel（C/Rust）──▶ AOK runtime/libOS（Go）──每次工�
 
 - **Linux kernel fork 保持上游语言边界**：AOK 内核对象、调度、freezer、LSM 和 syscall patch 用 C（必要处使用上游允许的 Rust），不能把 Go runtime 当作 Linux kernel 实现。Go 用于用户态 AOK runtime/libOS、fsd 和协议实现；现有 `kernel/` Go 代码是迁移期 reference implementation。
 - **acapd 用 Rust**（Biscuit/Cedar 参考实现同语言），作为内核的沙箱化策略模块。
-- aos 宿主保持 Swift（Containerization framework 是 Swift API）；引擎任意语言。
+- AOK 宿主保持 Swift（Containerization framework 是 Swift API）；引擎任意语言。
 - ABI 全程语言中立（fd/JSON-RPC + Zircon 式对象语义），P6 若需 Rust 内核子系统（形式化验证诉求）不改变 wire 语义。
 
 ## 10. 决议 D10：Application 为 Agent 生存而存在

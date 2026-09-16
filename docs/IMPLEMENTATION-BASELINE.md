@@ -22,7 +22,7 @@ Landlock、virtiofs、AF_VSOCK 和 arm64 KVM/QEMU 支持。实际配置能力以
 ## 旧运行时的处置
 
 迁移期 Go `agentd` 原型不再是产品运行路径，清理范围包括：Go `ProcTable`、旧 engine
-registry、agentd PID1、aos-ctl、`/run/aos/syscall.sock` JSON-RPC server/client、依赖它们
+registry、agentd PID1、aok-ctl、`/run/aok/syscall.sock` JSON-RPC server/client、依赖它们
 的旧 OCI rootfs、交叉编译二进制和生成报告，以及 host CLI 中直接 `spawn/ps` 旧 agentd 的
 路径。对应语义仍保留在架构和 ABI 文档中，仅作为迁移参考。
 

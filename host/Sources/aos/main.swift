@@ -1,4 +1,4 @@
-// aos — AOS host adapter. During kernel preparation this only manages the
+// aok — AOK host adapter. During kernel preparation this only manages the
 // development VM and does not expose the retired agentd syscall surface.
 //
 // Phase 1 uses the `container` CLI as the VM backend. The backend
@@ -75,7 +75,7 @@ func args(_ argv: [String]) -> (name: String, flags: [String: String]) {
             i += 1
         }
     }
-    return (positional.first ?? "aos-0", flags)
+    return (positional.first ?? "aok-0", flags)
 }
 
 let argv = Array(CommandLine.arguments.dropFirst())
@@ -95,7 +95,7 @@ case "settings":
 case "up":
     let (name, flags) = args(rest)
     let image = flags["image"] ?? defaultImage
-    print("aos: booting development SubOS \(name) (\(image))")
+    print("aok: booting development SubOS \(name) (\(image))")
     let status = ContainerBackend.run([
         "run", "-d", "--name", name,
         image,

@@ -1,4 +1,4 @@
-# AOS — Agent-native SubOS
+# AOK — Agent-native SubOS
 
 运行在 macOS（Apple Silicon）之上的 SubOS：每个 SubOS 实例是一个独立内核的 Linux microVM
 （Apple Containers）。目标是通过 Linux AOK kernel fork 提供面向 LLM Agent 的资源域、上下文和
@@ -18,7 +18,7 @@ make linux-mount
 make linux-status
 ```
 
-旧的 Go `agentd`、OCI rootfs 和 `/run/aos/syscall.sock` 已清除，不再提供旧的 spawn/ps
+旧的 Go `agentd`、OCI rootfs 和 `/run/aok/syscall.sock` 已清除，不再提供旧的 spawn/ps
 路径。stock 内核已启动成功，第一枚 AOK 对象补丁已通过 QEMU arm64 验证。
 
 ```sh
