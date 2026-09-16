@@ -1,37 +1,139 @@
-# AOK - Agent-native SubOS
+# AOK — An OS That Truly Belongs to Agents
 
-**中文**
+**English** | [简体中文](README.zh-CN.md)
 
-AOK 是运行在 macOS Apple Silicon 之上的 Agent-native SubOS。每个 SubOS 实例运行在独立的 Linux microVM 中，提供面向 Agent runtime 的资源域、上下文管理、推理后端和 capability 边界。AOK 的原生用户是 Agent runtime；CLI、TUI、GUI、ACP 和 Linux/POSIX 用户态属于外部控制或迁移适配层。
+> **Mission.** Today's agents are forced to operate computers the way humans do —
+> screenshots, mouse clicks, and on-screen pixels. AOK exists to let agents abandon
+> the clumsy Computer Use paradigm and embrace an OS that truly belongs to them:
+> agent-native processes, capability-scoped resources, first-class context, and
+> inference as a kernel device.
+>
+> **Stage.** AOK is currently in the **prototype-validation stage**: every claim in
+> this repository is backed by reproducible tests or explicitly listed as
+> environment-blocked. A fully independent, standalone OS release is being planned.
 
-**English**
+AOK is an agent-native SubOS for macOS on Apple Silicon. Each SubOS instance runs
+in an isolated Linux microVM and provides resource domains, context management,
+inference backends, and capability boundaries for agent runtimes. The native AOK
+client is an agent runtime; the CLI, TUI, GUI, ACP, and Linux/POSIX layers are
+external control or migration adapters.
 
-AOK is an agent-native SubOS for macOS on Apple Silicon. Each SubOS instance runs in an isolated Linux microVM and provides resource domains, context management, inference backends, and capability boundaries for agent runtimes. The native AOK client is an agent runtime; the CLI, TUI, GUI, ACP, and Linux/POSIX layers are external control or migration adapters.
+Architecture and syscall specifications: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
-架构与 syscall 规范 / Architecture and syscall specifications: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+## Why not Computer Use?
 
-## 核心能力 / Core capabilities
+Computer Use asks an agent to drive a human desktop through screenshots and
+synthesized input. It is slow, expensive, unreliable, and unauditable — a
+human-computer interface bolted onto a non-human user. AOK inverts the
+relationship:
 
-- AOK Linux kernel patch series：object handles、root capability、aproc/task/pidfd、resource accounting、event sources 和 inference capability。
-- Durable Go supervisor：SQLite WAL state、application lifecycle、mailbox replay、timer、checkpoint、context CAS 和 audit hash chain。
-- Inference backends：llama.cpp、Anthropic Messages API、loopback Metal llama.cpp adapter，以及 supervisor-owned router/fallback。
-- Runtime enforcement：Linux cgroup v2 `cpu.max`/`memory.max`、RSS 超限 `memory.reclaim`、signed attenuable capability tokens、Cedar-style deny-overrides、Landlock/seccomp sandbox。
-- Guest bootstrap：`aok-init` PID1 基础入口、restart intensity、signal forwarding，以及可打包的 AOK initfs。
-- Host interaction：Swift `aok` onboarding、TUI、settings 和 supervisor control API。
+| | Computer Use | AOK |
+| --- | --- | --- |
+| Interface | pixels, screenshots, mouse/keyboard | typed fd/handle ABI |
+| Process identity | a browser tab or GUI session | `aproc` with durable AID |
+| Resources | invisible, unaccounted | CPU/memory/token budgets per agent |
+| Context | scraped from the screen | context address space, KV snapshots |
+| Inference | an API call from application code | `ainf` inference device with routing |
+| Security | trust the whole desktop | signed, attenuable capabilities |
+| Auditability | screen recordings | event ring, usage ledger, hash chain |
 
-## 当前状态 / Current status
+## Positioning
 
-当前已验证的核心闭环包括：QEMU arm64 AOK kernel tests、real llama.cpp CPU probe、durable supervisor、独立 engine process、runtime resource enforcement、KV save/restore、Metal adapter、Anthropic adapter、router、vsock API、PID1/initfs 和 capability sandbox。
+Existing efforts fall into two camps. Metaphor OSes (AIOS, Letta, OpenFang) model
+agents in a userspace harness with no isolation and no kernel enforcement point.
+Sandbox providers (E2B, Daytona, microsandbox, K8s agent sandboxes) offer real
+isolation but treat the agent as untrusted code with no agent semantics. AOK
+occupies the intersection:
 
-The validated core currently includes QEMU arm64 AOK kernel tests, a real llama.cpp CPU probe, the durable supervisor, supervised engine processes, runtime resource enforcement, KV save/restore, a Metal adapter, an Anthropic adapter, routing, the vsock API, PID1/initfs, and capability sandboxing.
+- **True isolation**: each SubOS instance is a lightweight Linux microVM with its
+  own kernel, based on the Apple Containerization framework.
+- **Agent-native kernel**: kernel abstractions (process, scheduling, context,
+  IPC, capability) target LLM agents directly; Linux tasks, POSIX, and desktop
+  interaction are implementation or external-adapter details.
+- **Pluggable engines**: a sub-agent engine (model runtime) is just another kind
+  of process inside the kernel; the kernel does not care which model it runs.
+- **A growth environment for agents**: an Application is a composable unit of
+  capability and state, created, upgraded, hibernated, and retired on demand;
+  human interfaces are an optional control plane, not a survival condition.
 
-仍有明确环境或内核边界：本机未配置 `ANTHROPIC_API_KEY`，因此没有真实 Anthropic service verification；当前 QEMU 没有可用 virtio-vsock device model；AOK 内核原生 sched_ext/memcg、amem/LSFS、全系统污点/unotify/witness 仍未完成。
+## Layering
 
-Known boundaries remain explicit: `ANTHROPIC_API_KEY` is not configured on the development machine, so live Anthropic service verification is blocked; the current QEMU setup has no usable virtio-vsock device model; native AOK sched_ext/memcg enforcement, amem/LSFS, and system-wide taint/unotify/witness integration are still pending.
+```
+macOS 27 host
+└─ H   aok-host (Swift, Containerization framework)
+       · VM lifecycle, resource quotas, pause/resume, hostfs bridge, connectors
+└─ L0  AOK Linux kernel fork + in-VM PID 1 supervisor
+       · aproc/AID, CPU/memory/token resource domains, sched_ext, freezer,
+         capability enforcement, AOK syscall surface (agent-native fd objects)
+└─ L1  AOK runtime/libOS (Go, userspace)
+       · agent session, turn, context/KV snapshot, supervision policy,
+         router system agent, web capability stack, message gateway
+└─ L2  Agent worker / engine
+       · engine trait, echo-engine, llama.cpp / Metal / Anthropic backends,
+         manifest-compiled Landlock + seccomp sandbox
+```
 
-详细边界 / Detailed status: [docs/IMPLEMENTATION-STATUS.md](docs/IMPLEMENTATION-STATUS.md) 和 [docs/AOK-CORE-VALIDATION.md](docs/AOK-CORE-VALIDATION.md)
+An Application does not belong to a single Linux task. It consists of durable
+identity, a versioned contract, memory, and tool bindings, executed by one or
+more `aproc` incarnations. Workers can crash, freeze, or be replaced while
+Application identity, unconfirmed messages, and checkpoints persist. Dynamic
+model routing is performed by the L1 router system agent; the kernel enforces
+capability, resource domains, cache compatibility, and usage reconciliation.
 
-## 快速开始 / Quick start
+## Core capabilities
+
+- **AOK Linux kernel patch series** (`0001`–`0008`, on top of `linux-6.18.y`):
+  object handles, PID1 root capability bootstrap, aproc/task/pidfd lifecycle,
+  resource budget narrowing with CPU/RSS observation and token accounting,
+  timer event sources with ack/replay, and the inference capability.
+- **Durable Go supervisor**: SQLite WAL state, application lifecycle, mailbox
+  replay, timers, checkpoints, context CAS, and an audit hash chain.
+- **Inference backends**: llama.cpp, the Anthropic Messages API, a loopback
+  Metal llama.cpp adapter, and a supervisor-owned router/fallback chain.
+- **Runtime enforcement**: Linux cgroup v2 `cpu.max`/`memory.max`, RSS-triggered
+  `memory.reclaim`, signed attenuable capability tokens, Cedar-style
+  deny-overrides, Landlock/seccomp sandboxing.
+- **Guest bootstrap**: `aok-init` PID1 entry, restart intensity, signal
+  forwarding, and a packageable AOK initfs.
+- **Host interaction**: Swift `aok` onboarding, TUI, settings, and the
+  supervisor control API. CLI/GUI never holds the kernel root capability.
+
+## Current status — prototype validation
+
+The validated core loop includes: QEMU arm64 AOK kernel tests, a real llama.cpp
+CPU probe through the kernel inference ABI, the durable supervisor with crash
+replay, supervised engine processes, runtime resource enforcement, KV
+save/restore, the Metal adapter, the Anthropic adapter, routing, the vsock API,
+PID1/initfs, and the capability sandbox.
+
+Kernel-side validation totals: object 44, task 64, event-source 37, resource
+53, and core 46 kselftests passing across enabled and disabled kernel builds,
+plus reproducible patch-series rebuilds.
+
+Known boundaries remain explicit: `ANTHROPIC_API_KEY` is not configured on the
+development machine, so live Anthropic service verification is blocked; the
+current QEMU setup has no usable virtio-vsock device model; native AOK
+sched_ext/memcg enforcement, amem/LSFS, and system-wide taint/unotify/witness
+integration are still pending.
+
+Detailed status: [docs/IMPLEMENTATION-STATUS.md](docs/IMPLEMENTATION-STATUS.md)
+and [docs/AOK-CORE-VALIDATION.md](docs/AOK-CORE-VALIDATION.md)
+
+## Roadmap
+
+1. **Prototype validation** *(current stage)* — agent-native kernel primitives
+   (`aproc`, resource domains, event sources, inference capability) proven in
+   QEMU arm64, with a durable supervised runtime loop.
+2. **Capability model completion** — manifest-compiled Landlock/seccomp/acap
+   enforcement across engines and applications.
+3. **Persistent context** — amem context virtual memory and LSFS memory storage
+   (git semantics over a single SQLite store), durable event sources and wake.
+4. **Agent scheduling and inference devices** — sched_ext turn-level preemptive
+   scheduling with token fairness; `ainf` kernel device with pluggable backends.
+5. **Standalone OS** *(planning)* — an independent, self-contained OS release
+   that no longer depends on a host-adapted Linux baseline.
+
+## Quick start
 
 ### Linux baseline
 
@@ -59,7 +161,7 @@ make aok-eventsrc-test
 make aok-core-test
 ```
 
-完整 Linux builder/QEMU 步骤 / Full Linux builder and QEMU instructions: [kernel/kselftest/README.md](kernel/kselftest/README.md)
+Full Linux builder and QEMU instructions: [kernel/kselftest/README.md](kernel/kselftest/README.md)
 
 ### Host TUI
 
@@ -70,7 +172,8 @@ swift run aok settings show
 swift run aok settings set engine echo
 ```
 
-The TUI uses `aokctl` and the supervisor control API. It does not hold the kernel root capability.
+The TUI uses `aokctl` and the supervisor control API. It does not hold the
+kernel root capability.
 
 ### PID1 initfs
 
@@ -80,24 +183,36 @@ The TUI uses `aokctl` and the supervisor control API. It does not hold the kerne
 make aok-initramfs
 ```
 
-The generated archive contains `/init`, `/sbin/aok-supervisor`, `/etc/aok/manifest.yaml`, and `/var/lib/aok`.
+The generated archive contains `/init`, `/sbin/aok-supervisor`,
+`/etc/aok/manifest.yaml`, and `/var/lib/aok`.
 
 ## Repository layout
 
-| Path | 中文 | English |
-| --- | --- | --- |
-| `host/` | Swift CLI、TUI 和 VM/control adapter | Swift CLI, TUI, and VM/control adapters |
-| `kernel/` | Linux baseline、AOK patches、configs、kselftests | Linux baseline, AOK patches, configs, and kselftests |
-| `runtime/` | Go supervisor、engine protocol、providers 和 sandbox | Go supervisor, engine protocol, providers, and sandbox |
-| `manifests/` | capability manifest 示例 | capability manifest examples |
-| `docs/` | 架构、ABI、验证和实现边界 | architecture, ABI, validation, and implementation boundaries |
+| Path | Contents |
+| --- | --- |
+| `host/` | Swift CLI, TUI, and VM/control adapters |
+| `kernel/` | Linux baseline, AOK patches, configs, kselftests |
+| `runtime/` | Go supervisor, engine protocol, providers, sandbox |
+| `manifests/` | capability manifest examples |
+| `docs/` | architecture, ABI, validation, and implementation boundaries |
+
+## Documentation
+
+| Document | Contents |
+| --- | --- |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | layering, application model, ABI boundaries |
+| [docs/IMPLEMENTATION-STATUS.md](docs/IMPLEMENTATION-STATUS.md) | frozen decisions and current boundaries |
+| [docs/PLAN-L0-AGENT-KERNEL.md](docs/PLAN-L0-AGENT-KERNEL.md) | L0 agent-kernel design plan |
+| [docs/PLAN-AOK-DEEP.md](docs/PLAN-AOK-DEEP.md) | deep design decisions with research sources |
+| [docs/abi/](docs/abi/) | fd ABI, engine protocol, control API, application/context models |
+| `docs/*-VALIDATION.md` | per-phase QEMU and runtime validation evidence |
 
 ## Contributing
 
-请先阅读 [AGENTS.md](AGENTS.md)（如在项目工作区可见）以及相关 ABI 和验证文档。提交改动前运行与影响范围相称的测试，并在文档中区分已实现、已验证和环境阻塞项。
-
-Read the relevant ABI and validation documents before changing the project. Run tests appropriate to the affected area and keep implemented, verified, and environment-blocked behavior clearly separated in documentation.
+Read the relevant ABI and validation documents before changing the project.
+Run tests appropriate to the affected area and keep implemented, verified, and
+environment-blocked behavior clearly separated in documentation.
 
 ## License
 
-AOK is licensed under the [GNU General Public License v3.0](LICENSE). See the full text in [LICENSE](LICENSE).
+AOK is licensed under the [GNU General Public License v3.0](LICENSE).
