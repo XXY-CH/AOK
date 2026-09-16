@@ -15,8 +15,9 @@ artifact 进入 Application 域，获取、写入和执行各自携带独立 cap
 3. **最小授权**：下载、写入、执行是三个独立 capability，缺一不可组合成"安装"。
 4. **污点默认**：外部下载默认携带 `external-content` taint；进入构建产物链必须经过
    策略判定。
-5. **构建期与运行期分离**：root 只存在于镜像/initfs 构建期（人类审计）。Agent 运行期
-   不存在提权路径。
+5. **安装权与使用权分离**：root 与系统镜像只在构建期变更；工具链可在运行期进入共享
+   域，但安装由受监督的 installer 执行、信任来源独立于请求方。Application 对共享域
+   永远只读。Agent 运行期不存在提权路径。
 
 ## 对象模型
 
@@ -103,15 +104,45 @@ lockfile -> resolver -> fetch plan -> fetch (taint) -> verify -> install -> exec
   计费，但记录 `cache_hit_kind`。
 - 下载流量计入 Application budget（对齐 resource-domain 记账）；module cache 与
   `install_root` 大小受资源域约束，超限走 throttle/quiesce，不得静默删除。
-- 工具链缓存（LSFS 层）与项目依赖（mount 层）分离：工具链属于 supervisor 域，
-  Application 只拿 execute 授权，不能写。
+- 工具链缓存（LSFS 层）与项目依赖（mount 层）分离：工具链属于 supervisor 域的共享
+  存储，Application 只拿 execute 授权，不能写。共享域支持运行期扩展，见下一节。
+
+## 运行期工具链获取（toolchain.request）
+
+纯构建期预置与"Application 按需生长"矛盾：Agent 遇到镜像中没有的工具链时不应等待
+人类重建镜像。共享工具链域因此支持运行期扩展，但安装权与使用权分离：
+
+1. Application 通过 control API 发起
+   `toolchain.request(name, version_spec, triple, linkage)`；`version_spec` 必须是精确
+   版本或可复核范围，不得是裸浮动标签（如 `latest`）。
+2. 安装由 supervisor 域的受监督 installer 进程执行（gofer 模式：不信请求方，同
+   fsd/ainf backend 的既有拓扑）。installer 持有 registry 下载 capability，独立于
+   任何 Application 的 net 前缀。
+3. **信任来源独立**：预期 hash 与签名取自官方 release 的 checksum/签名文件，验证
+   密钥预置于 toolchain-bundle manifest。请求方提供的 hash 只作交叉校验，不是信任
+   依据。验证失败拒绝安装并写审计事件；installer 不可用时 request 挂起或拒绝，
+   不得 fail open，也不得由 Application 自行替代安装。
+4. 安装成功后发布 descriptor 与 `toolchain.ready` 事件；请求方获得 `toolchain.use`
+   capability（读 + entry execute）。共享域对 Application 仍然只读。
+5. 预算归属：下载流量记入请求方 Application 的 budget（谁申请谁付费）；共享域存储
+   由全局配额约束；回收采用引用计数 + LRU，被活跃 `toolchain.use` 引用的条目不可
+   回收。
+6. 宿主缓存层（可选加速）：aok-host 维护内容寻址 store。VM 内 installer cache miss
+   时先经 vsock 向宿主取，宿主未命中才出网。网络出口集中在宿主，跨 VM 去重并提供
+   单一审计点。
+
+Application 也可以用自身 web capability 把工具链下载到自己域内私用（带
+`external-content` taint，execute 仍需授权）；该副本永不进入共享域、不能被其他
+Application 引用。私用自由，共享验证。
 
 ## 系统级依赖与 legacy 栈
 
 需要 C 库、apt 包或完整 Debian 用户态的场景只有三条显式出路：
 
 1. **预置镜像**：常用 dev stack 在构建期进入 VM 镜像/initfs，`toolchain-bundle`
-   manifest 记录全部预置项与 hash，写入 boot 审计。运行期只有读和执行。
+   manifest 记录全部预置项、hash 与验证密钥，写入 boot 审计。运行期只有读和执行。
+   预置是冷启动优化，不是获取工具链的唯一入口；缺失的工具链经
+   `toolchain.request` 在运行期补齐。
 2. **静态链接优先**：musl/静态 toolchain 优先于动态系统依赖；sandbox 对动态可执行
    文件要求显式授予每个运行时库的读权。
 3. **`adapters/legacy/`**：需要真实 apt 的域在镜像构建期完成安装（apt 不存在于运行期）；
@@ -140,6 +171,8 @@ lockfile -> resolver -> fetch plan -> fetch (taint) -> verify -> install -> exec
 
 本文件为设计草案，全部未实现。已有可复用件：sandbox `Policy.Args` 的 `--execute`
 与路径收窄、manifest→Landlock/seccomp 编译、LSFS 设计（SQLite/git 语义）。缺口：
-URL 前缀网络 capability、`artifact.import`、toolchain-bundle 构建协议、缓存与
-budget 记账接线。第一实现切片建议：静态 Python toolchain 进 initfs + 预置依赖 +
-execute 授权闭环（零网络），打通最小依赖工作负载后再开 fetch 层。
+URL 前缀网络 capability、`artifact.import`、`toolchain.request` 与受监督 installer
+（含签名验证信任锚）、toolchain-bundle 构建协议、缓存与 budget 记账接线。第一实现
+切片建议：静态 Python toolchain 进 initfs + 预置依赖 + execute 授权闭环（零网络），
+打通最小依赖工作负载后再开 fetch 层；installer 可作为第二切片，复用 vsock 与
+ProcessProvider 监督原语。
