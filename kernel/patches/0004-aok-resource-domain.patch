@@ -1,0 +1,542 @@
+diff --git a/include/linux/aok.h b/include/linux/aok.h
+index 0d1e4f9b5..b2c38d239 100644
+--- a/include/linux/aok.h
++++ b/include/linux/aok.h
+@@ -37,6 +37,16 @@ struct aok_aproc {
+ 	u64 event_seq;			/* last assigned, monotonic */
+ 	unsigned long events_dropped;
+ 	struct aok_event_slot events[AOK_EVENT_QUEUE_LEN];
++	/* Resource-domain slice: limits can only narrow; unset is U64_MAX. */
++	u64 res_cpu_limit;
++	u64 res_mem_limit;
++	u64 res_token_reserve;
++	u64 res_token_hard;
++	u64 tokens_used;		/* saturating input+output ledger */
++	u64 tokens_cached;		/* saturating cached-token ledger */
++	u64 last_usage_id;		/* idempotency key of last report */
++	u64 last_usage_seq;		/* strictly increasing sequence */
++	u32 res_state;			/* AOK_RES_STATE_* aggregate */
+ };
+ 
+ struct aok_handle {
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index d40cf5e97..85e379f97 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -891,8 +891,17 @@ __SYSCALL(__NR_aok_aproc_reap, sys_aok_aproc_reap)
+ #define __NR_aok_aproc_status 480
+ __SYSCALL(__NR_aok_aproc_status, sys_aok_aproc_status)
+ 
++#define __NR_aok_budget_set 481
++__SYSCALL(__NR_aok_budget_set, sys_aok_budget_set)
++
++#define __NR_aok_budget_get 482
++__SYSCALL(__NR_aok_budget_get, sys_aok_budget_get)
++
++#define __NR_aok_token_usage 483
++__SYSCALL(__NR_aok_token_usage, sys_aok_token_usage)
++
+ #undef __NR_syscalls
+-#define __NR_syscalls 481
++#define __NR_syscalls 484
+ 
+ /*
+  * 32 bit systems traditionally used different
+diff --git a/include/uapi/linux/aok.h b/include/uapi/linux/aok.h
+index ac6e67dec..e951bbfd0 100644
+--- a/include/uapi/linux/aok.h
++++ b/include/uapi/linux/aok.h
+@@ -19,11 +19,14 @@
+ #define AOK_RIGHT_SIGNAL (1ULL << 3)
+ #define AOK_RIGHT_ATTACH (1ULL << 4)
+ #define AOK_RIGHT_DESTROY (1ULL << 5)
++#define AOK_RIGHT_SET_POLICY (1ULL << 6)
++#define AOK_RIGHT_ACCOUNT (1ULL << 7)
+ #define AOK_RIGHTS_INITIAL (AOK_RIGHT_INSPECT | AOK_RIGHT_DUPLICATE)
+ #define AOK_RIGHTS_ROOT (AOK_RIGHT_INSPECT | AOK_RIGHT_DUPLICATE | AOK_RIGHT_MANAGE_CHILD)
+ #define AOK_RIGHTS_APROC_INITIAL \
+ 	(AOK_RIGHT_INSPECT | AOK_RIGHT_DUPLICATE | AOK_RIGHT_MANAGE_CHILD | \
+-	 AOK_RIGHT_SIGNAL | AOK_RIGHT_ATTACH | AOK_RIGHT_DESTROY)
++	 AOK_RIGHT_SIGNAL | AOK_RIGHT_ATTACH | AOK_RIGHT_DESTROY | \
++	 AOK_RIGHT_SET_POLICY | AOK_RIGHT_ACCOUNT)
+ 
+ /* Experimental object-only bootstrap, restricted to the initial PID 1. */
+ #define AOK_PARENT_BOOTSTRAP (-1)
+@@ -43,6 +46,16 @@
+ #define AOK_EVENT_TASK_JOINED 1U
+ #define AOK_EVENT_TASK_EXITED 2U
+ #define AOK_EVENT_STATE 3U
++#define AOK_EVENT_BUDGET 4U
++
++/*
++ * Aggregate resource state of an aproc. This slice only performs observable
++ * accounting: pressure and over events describe the recorded token ledger,
++ * CPU and memory are reported as observed values without enforcement.
++ */
++#define AOK_RES_STATE_OK 0U
++#define AOK_RES_STATE_PRESSURE 1U
++#define AOK_RES_STATE_OVER 2U
+ 
+ /*
+  * Minimal first-task ABI of this slice: the first task of aok_aproc_create()
+@@ -89,6 +102,57 @@ struct aok_aproc_event {
+ 	__u64 reserved[3];
+ };
+ 
++/*
++ * Resource-domain slice. Limits use U64_MAX for "unset"; aok_budget_set()
++ * can only narrow each limit below its current value. flags is reserved
++ * and must be zero.
++ */
++struct aok_budget {
++	__u64 size;
++	__u64 cpu_usec_limit;
++	__u64 memory_bytes_limit;
++	__u64 token_reserve;
++	__u64 token_hard_limit;
++	__u64 flags;
++	__u64 reserved[2];
++};
++
++/*
++ * Read-side snapshot. cpu_usec_used and memory_bytes_used are observed at
++ * call time from the bound tasks; tokens_used and tokens_cached are the
++ * settled ledger maintained by aok_token_usage().
++ */
++struct aok_budget_status {
++	__u64 size;
++	__u64 cpu_usec_limit;
++	__u64 cpu_usec_used;
++	__u64 memory_bytes_limit;
++	__u64 memory_bytes_used;
++	__u64 token_reserve;
++	__u64 token_hard_limit;
++	__u64 tokens_used;
++	__u64 tokens_cached;
++	__u32 res_state;
++	__u32 reserved;
++	__u64 reserved2[2];
++};
++
++/*
++ * Token usage report for one aproc. usage_id identifies the report for
++ * idempotent replays; usage_seq must strictly increase across accepted
++ * reports. Billing is the saturating sum of input and output tokens;
++ * cached tokens are accounted separately.
++ */
++struct aok_token_usage {
++	__u64 size;
++	__u64 usage_id;
++	__u64 usage_seq;
++	__u64 input_tokens;
++	__u64 output_tokens;
++	__u64 cached_tokens;
++	__u64 reserved[2];
++};
++
+ struct aok_aproc_create_args {
+ 	__u64 size;
+ 	__s32 parent_job_fd;
+diff --git a/kernel/aok.c b/kernel/aok.c
+index 3ae47286e..1331d9c99 100644
+--- a/kernel/aok.c
++++ b/kernel/aok.c
+@@ -3,6 +3,8 @@
+ #include <linux/aok.h>
+ #include <linux/anon_inodes.h>
+ #include <linux/errno.h>
++#include <linux/mm.h>
++#include <linux/sched/mm.h>
+ #include <linux/file.h>
+ #include <linux/freezer.h>
+ #include <linux/fs.h>
+@@ -58,7 +60,8 @@ static void aok_freezer_leave(void)
+ }
+ 
+ /* Callers hold aproc->lock. */
+-static void aok_emit_locked(struct aok_aproc *aproc, u32 kind, u64 task_koid)
++static void aok_emit_locked(struct aok_aproc *aproc, u32 kind, u64 task_koid,
++			    u32 state)
+ {
+ 	struct aok_event_slot *slot;
+ 
+@@ -70,7 +73,40 @@ static void aok_emit_locked(struct aok_aproc *aproc, u32 kind, u64 task_koid)
+ 	slot->task_koid = task_koid;
+ 	slot->event_seq = aproc->event_seq;
+ 	slot->kind = kind;
+-	slot->state = aproc->state;
++	slot->state = state;
++}
++
++static u64 aok_sat_add(u64 a, u64 b)
++{
++	u64 sum = a + b;
++
++	if (sum < a)
++		return U64_MAX;
++	return sum;
++}
++
++/*
++ * Recompute the aggregate resource state from the token ledger and emit a
++ * budget event on a transition. Observable accounting only: this slice
++ * neither throttles nor freezes on its own, see aok_budget_get().
++ */
++static void aok_res_eval_locked(struct aok_aproc *aproc)
++{
++	u64 limit = aproc->res_token_hard;
++	u32 state = AOK_RES_STATE_OK;
++
++	if (limit != U64_MAX) {
++		u64 pressure = limit - div64_u64(limit, 5);
++
++		if (aproc->tokens_used >= limit)
++			state = AOK_RES_STATE_OVER;
++		else if (aproc->tokens_used >= pressure)
++			state = AOK_RES_STATE_PRESSURE;
++	}
++	if (state != aproc->res_state) {
++		aproc->res_state = state;
++		aok_emit_locked(aproc, AOK_EVENT_BUDGET, 0, state);
++	}
+ }
+ 
+ /* Callers hold aproc->lock; p must not be a member of another aproc. */
+@@ -100,7 +136,7 @@ static int aok_join_locked(struct aok_aproc *aproc, struct task_struct *p)
+ 	aproc->task_total++;
+ 	get_task_struct(p);
+ 	refcount_inc(&aproc->refs);
+-	aok_emit_locked(aproc, AOK_EVENT_TASK_JOINED, koid);
++	aok_emit_locked(aproc, AOK_EVENT_TASK_JOINED, koid, aproc->state);
+ 	return 0;
+ }
+ 
+@@ -180,7 +216,7 @@ void aok_task_exit(struct task_struct *tsk)
+ 	aproc->ntasks--;
+ 	if (!aproc->ntasks && aproc->state == AOK_APROC_STATE_RUNNING)
+ 		aproc->state = AOK_APROC_STATE_EXITED;
+-	aok_emit_locked(aproc, AOK_EVENT_TASK_EXITED, koid);
++	aok_emit_locked(aproc, AOK_EVENT_TASK_EXITED, koid, aproc->state);
+ 	spin_unlock(&aproc->lock);
+ 	task_unlock(tsk);
+ 
+@@ -452,6 +488,10 @@ SYSCALL_DEFINE3(aok_aproc_create,
+ 	INIT_LIST_HEAD(&aproc->tasks);
+ 	aproc->state = AOK_APROC_STATE_RUNNING;
+ 	aproc->rights_ceiling = info.rights;
++	aproc->res_cpu_limit = U64_MAX;
++	aproc->res_mem_limit = U64_MAX;
++	aproc->res_token_reserve = U64_MAX;
++	aproc->res_token_hard = U64_MAX;
+ 	handle->aproc = aproc;
+ 	handle->rights = info.rights;
+ 	info.aid = aproc->aid;
+@@ -741,7 +781,7 @@ SYSCALL_DEFINE1(aok_aproc_freeze, int, fd)
+ 	if (aproc->state == AOK_APROC_STATE_RUNNING) {
+ 		aproc->state = AOK_APROC_STATE_FROZEN;
+ 		aproc->freeze_req = true;
+-		aok_emit_locked(aproc, AOK_EVENT_STATE, 0);
++		aok_emit_locked(aproc, AOK_EVENT_STATE, 0, aproc->state);
+ 		transitioned = true;
+ 	} else if (aproc->state != AOK_APROC_STATE_FROZEN) {
+ 		/* Lost a race with abort/reap; touch nothing. */
+@@ -815,7 +855,7 @@ SYSCALL_DEFINE1(aok_aproc_resume, int, fd)
+ 	if (state_after == AOK_APROC_STATE_FROZEN) {
+ 		aproc->state = AOK_APROC_STATE_RUNNING;
+ 		aproc->freeze_req = false;
+-		aok_emit_locked(aproc, AOK_EVENT_STATE, 0);
++		aok_emit_locked(aproc, AOK_EVENT_STATE, 0, aproc->state);
+ 		transitioned = true;
+ 		state_after = AOK_APROC_STATE_RUNNING;
+ 	}
+@@ -895,7 +935,7 @@ SYSCALL_DEFINE1(aok_aproc_abort, int, fd)
+ 		was_frozen = aproc->state == AOK_APROC_STATE_FROZEN;
+ 		aproc->state = AOK_APROC_STATE_FAILED;
+ 		aproc->freeze_req = false;
+-		aok_emit_locked(aproc, AOK_EVENT_STATE, 0);
++		aok_emit_locked(aproc, AOK_EVENT_STATE, 0, aproc->state);
+ 		transitioned = true;
+ 	}
+ 	spin_unlock(&aproc->lock);
+@@ -939,7 +979,7 @@ SYSCALL_DEFINE1(aok_aproc_reap, int, fd)
+ 	case AOK_APROC_STATE_EXITED:
+ 	case AOK_APROC_STATE_FAILED:
+ 		aproc->state = AOK_APROC_STATE_REAPED;
+-		aok_emit_locked(aproc, AOK_EVENT_STATE, 0);
++		aok_emit_locked(aproc, AOK_EVENT_STATE, 0, aproc->state);
+ 		break;
+ 	case AOK_APROC_STATE_REAPED:
+ 		break;
+@@ -990,6 +1030,250 @@ SYSCALL_DEFINE2(aok_aproc_status, int, fd,
+ 	return aok_copy_status(ustatus, &status);
+ }
+ 
++static int aok_copy_budget_in(struct aok_budget *budget,
++			      const struct aok_budget __user *ubudget)
++{
++	u64 size;
++	int ret;
++
++	if (get_user(size, &ubudget->size))
++		return -EFAULT;
++	if (size < sizeof(*budget) || size > PAGE_SIZE)
++		return -EINVAL;
++	ret = copy_struct_from_user(budget, sizeof(*budget), ubudget, size);
++	if (ret)
++		return ret;
++	if (budget->size != size || budget->flags ||
++	    budget->reserved[0] || budget->reserved[1])
++		return -EINVAL;
++	return 0;
++}
++
++static int aok_copy_usage_in(struct aok_token_usage *usage,
++			     const struct aok_token_usage __user *uusage)
++{
++	u64 size;
++	int ret;
++
++	if (get_user(size, &uusage->size))
++		return -EFAULT;
++	if (size < sizeof(*usage) || size > PAGE_SIZE)
++		return -EINVAL;
++	ret = copy_struct_from_user(usage, sizeof(*usage), uusage, size);
++	if (ret)
++		return ret;
++	if (usage->size != size || usage->reserved[0] || usage->reserved[1] ||
++	    !usage->usage_id || !usage->usage_seq)
++		return -EINVAL;
++	return 0;
++}
++
++static int aok_copy_status_out(struct aok_budget_status __user *ustatus,
++			       const struct aok_budget_status *status)
++{
++	u64 size;
++
++	if (get_user(size, &ustatus->size))
++		return -EFAULT;
++	if (size < sizeof(*status) || size > PAGE_SIZE)
++		return -EINVAL;
++	return copy_struct_to_user(ustatus, size, status, sizeof(*status), NULL);
++}
++
++/*
++ * Observe CPU time and RSS of the current members. Neither value feeds an
++ * enforcement path in this slice; racy reads approximate per-task counters
++ * without perturbing the scheduler or reclaim.
++ */
++static void aok_observe_usage(struct aok_aproc *aproc, u64 *cpu_ns, u64 *bytes)
++{
++	struct task_struct **tasks;
++	unsigned int count, i;
++	u64 ns = 0, rss = 0;
++
++	tasks = aok_collect_tasks(aproc, &count);
++	if (IS_ERR(tasks))
++		return;
++	for (i = 0; i < count; i++) {
++		struct mm_struct *mm;
++
++		ns = aok_sat_add(ns, READ_ONCE(tasks[i]->se.sum_exec_runtime));
++		mm = get_task_mm(tasks[i]);
++		if (mm) {
++			rss = aok_sat_add(rss,
++					  (u64)get_mm_counter(mm, MM_FILEPAGES));
++			rss = aok_sat_add(rss,
++					  (u64)get_mm_counter(mm, MM_ANONPAGES));
++			rss = aok_sat_add(rss,
++					  (u64)get_mm_counter(mm, MM_SHMEMPAGES));
++			mmput(mm);
++		}
++	}
++	aok_put_tasks(tasks, count);
++	*cpu_ns = ns;
++	*bytes = rss;
++}
++
++SYSCALL_DEFINE2(aok_budget_set, int, fd,
++		const struct aok_budget __user *, ubudget)
++{
++	struct aok_budget budget;
++	struct aok_handle *handle;
++	struct aok_aproc *aproc;
++	struct fd f;
++	int ret;
++
++	ret = aok_copy_budget_in(&budget, ubudget);
++	if (ret)
++		return ret;
++	if (budget.token_reserve > budget.token_hard_limit)
++		return -EINVAL;
++	f = fdget(fd);
++	if (fd_empty(f))
++		return -EBADF;
++	if (fd_file(f)->f_op != &aok_aproc_fops) {
++		fdput(f);
++		return -EINVAL;
++	}
++	handle = fd_file(f)->private_data;
++	aproc = handle->aproc;
++	if (!(handle->rights & AOK_RIGHT_SET_POLICY)) {
++		fdput(f);
++		return -EACCES;
++	}
++	spin_lock(&aproc->lock);
++	switch (aproc->state) {
++	case AOK_APROC_STATE_RUNNING:
++	case AOK_APROC_STATE_FROZEN:
++		break;
++	default:
++		spin_unlock(&aproc->lock);
++		fdput(f);
++		return -EINVAL;
++	}
++	/* Limits are monotonic: a set can only narrow each dimension. */
++	if (budget.cpu_usec_limit > aproc->res_cpu_limit ||
++	    budget.memory_bytes_limit > aproc->res_mem_limit ||
++	    budget.token_reserve > aproc->res_token_reserve ||
++	    budget.token_hard_limit > aproc->res_token_hard) {
++		spin_unlock(&aproc->lock);
++		fdput(f);
++		return -EPERM;
++	}
++	aproc->res_cpu_limit = budget.cpu_usec_limit;
++	aproc->res_mem_limit = budget.memory_bytes_limit;
++	aproc->res_token_reserve = budget.token_reserve;
++	aproc->res_token_hard = budget.token_hard_limit;
++	aok_res_eval_locked(aproc);
++	spin_unlock(&aproc->lock);
++	fdput(f);
++	return 0;
++}
++
++SYSCALL_DEFINE2(aok_budget_get, int, fd,
++		struct aok_budget_status __user *, ustatus)
++{
++	struct aok_budget_status status = { .size = sizeof(status), };
++	struct aok_handle *handle;
++	struct aok_aproc *aproc;
++	struct fd f;
++	u64 cpu_ns = 0, bytes = 0;
++
++	f = fdget(fd);
++	if (fd_empty(f))
++		return -EBADF;
++	if (fd_file(f)->f_op != &aok_aproc_fops) {
++		fdput(f);
++		return -EINVAL;
++	}
++	handle = fd_file(f)->private_data;
++	aproc = handle->aproc;
++	if (!(handle->rights & AOK_RIGHT_INSPECT)) {
++		fdput(f);
++		return -EACCES;
++	}
++	aok_observe_usage(aproc, &cpu_ns, &bytes);
++	spin_lock(&aproc->lock);
++	status.cpu_usec_limit = aproc->res_cpu_limit;
++	status.cpu_usec_used = div64_u64(cpu_ns, 1000);
++	status.memory_bytes_limit = aproc->res_mem_limit;
++	status.memory_bytes_used = bytes;
++	status.token_reserve = aproc->res_token_reserve;
++	status.token_hard_limit = aproc->res_token_hard;
++	status.tokens_used = aproc->tokens_used;
++	status.tokens_cached = aproc->tokens_cached;
++	status.res_state = aproc->res_state;
++	spin_unlock(&aproc->lock);
++	fdput(f);
++	return aok_copy_status_out(ustatus, &status);
++}
++
++SYSCALL_DEFINE2(aok_token_usage, int, fd,
++		const struct aok_token_usage __user *, uusage)
++{
++	struct aok_token_usage usage;
++	struct aok_handle *handle;
++	struct aok_aproc *aproc;
++	struct fd f;
++	u64 delta, settled;
++	int ret;
++
++	ret = aok_copy_usage_in(&usage, uusage);
++	if (ret)
++		return ret;
++	f = fdget(fd);
++	if (fd_empty(f))
++		return -EBADF;
++	if (fd_file(f)->f_op != &aok_aproc_fops) {
++		fdput(f);
++		return -EINVAL;
++	}
++	handle = fd_file(f)->private_data;
++	aproc = handle->aproc;
++	if (!(handle->rights & AOK_RIGHT_ACCOUNT)) {
++		fdput(f);
++		return -EACCES;
++	}
++	spin_lock(&aproc->lock);
++	switch (aproc->state) {
++	case AOK_APROC_STATE_RUNNING:
++	case AOK_APROC_STATE_FROZEN:
++		break;
++	default:
++		spin_unlock(&aproc->lock);
++		fdput(f);
++		return -EINVAL;
++	}
++	/* Replaying the last accepted report settles identically. */
++	if (usage.usage_id == aproc->last_usage_id) {
++		spin_unlock(&aproc->lock);
++		fdput(f);
++		return 0;
++	}
++	if (usage.usage_seq <= aproc->last_usage_seq) {
++		spin_unlock(&aproc->lock);
++		fdput(f);
++		return -EINVAL;
++	}
++	delta = aok_sat_add(usage.input_tokens, usage.output_tokens);
++	settled = aok_sat_add(aproc->tokens_used, delta);
++	if (aproc->res_token_hard != U64_MAX &&
++	    settled > aproc->res_token_hard) {
++		spin_unlock(&aproc->lock);
++		fdput(f);
++		return -EDQUOT;
++	}
++	aproc->tokens_used = settled;
++	aproc->tokens_cached = aok_sat_add(aproc->tokens_cached,
++					   usage.cached_tokens);
++	aproc->last_usage_id = usage.usage_id;
++	aproc->last_usage_seq = usage.usage_seq;
++	aok_res_eval_locked(aproc);
++	spin_unlock(&aproc->lock);
++	fdput(f);
++	return 0;
++}
++
+ SYSCALL_DEFINE2(aok_object_inspect, int, fd,
+ 		struct aok_object_info __user *, uinfo)
+ {
+diff --git a/kernel/sys_ni.c b/kernel/sys_ni.c
+index a8212b15e..febf55e31 100644
+--- a/kernel/sys_ni.c
++++ b/kernel/sys_ni.c
+@@ -405,3 +405,6 @@ COND_SYSCALL(aok_aproc_resume);
+ COND_SYSCALL(aok_aproc_abort);
+ COND_SYSCALL(aok_aproc_reap);
+ COND_SYSCALL(aok_aproc_status);
++COND_SYSCALL(aok_budget_set);
++COND_SYSCALL(aok_budget_get);
++COND_SYSCALL(aok_token_usage);
+diff --git a/scripts/syscall.tbl b/scripts/syscall.tbl
+index 42ec19ed8..acdfc2c80 100644
+--- a/scripts/syscall.tbl
++++ b/scripts/syscall.tbl
+@@ -421,3 +421,6 @@
+ 478	common	aok_aproc_abort			sys_aok_aproc_abort
+ 479	common	aok_aproc_reap			sys_aok_aproc_reap
+ 480	common	aok_aproc_status		sys_aok_aproc_status
++481	common	aok_budget_set			sys_aok_budget_set
++482	common	aok_budget_get			sys_aok_budget_get
++483	common	aok_token_usage		sys_aok_token_usage

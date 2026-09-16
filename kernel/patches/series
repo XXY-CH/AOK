@@ -1,0 +1,10 @@
+# AOK validated patch series for Linux 6.18.51.
+# Keep each patch independently reviewable and testable against kernel/linux.
+0001-aok-object-handle-core.patch
+0002-aok-root-capability-bootstrap.patch
+0003-aok-aproc-task-pidfd.patch
+0004-aok-resource-domain.patch
+0005-aok-event-source.patch
+0006-aok-inference-capability.patch
+0007-aok-token-budget-enforcement.patch
+0008-aok-observed-resource-enforcement.patch

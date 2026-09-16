@@ -1,0 +1,176 @@
+diff --git a/include/linux/aok.h b/include/linux/aok.h
+index f989a297d..3615f21d9 100644
+--- a/include/linux/aok.h
++++ b/include/linux/aok.h
+@@ -14,6 +14,7 @@ struct aok_aproc {
+ struct aok_handle {
+ 	struct aok_aproc *aproc;
+ 	u64 rights;
++	u32 type;
+ };
+ 
+ #endif /* _LINUX_AOK_H */
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index 1577731a7..510e70eb2 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -867,8 +867,11 @@ __SYSCALL(__NR_aok_object_inspect, sys_aok_object_inspect)
+ #define __NR_aok_handle_duplicate 472
+ __SYSCALL(__NR_aok_handle_duplicate, sys_aok_handle_duplicate)
+ 
++#define __NR_aok_root_cap_claim 473
++__SYSCALL(__NR_aok_root_cap_claim, sys_aok_root_cap_claim)
++
+ #undef __NR_syscalls
+-#define __NR_syscalls 473
++#define __NR_syscalls 474
+ 
+ /*
+  * 32 bit systems traditionally used different
+diff --git a/include/uapi/linux/aok.h b/include/uapi/linux/aok.h
+index 3a35db99e..b2d11069c 100644
+--- a/include/uapi/linux/aok.h
++++ b/include/uapi/linux/aok.h
+@@ -9,11 +9,15 @@
+ 
+ #define AOK_RIGHT_INSPECT (1ULL << 0)
+ #define AOK_RIGHT_DUPLICATE (1ULL << 1)
++#define AOK_RIGHT_MANAGE_CHILD (1ULL << 2)
+ #define AOK_RIGHTS_INITIAL (AOK_RIGHT_INSPECT | AOK_RIGHT_DUPLICATE)
++#define AOK_RIGHTS_ROOT (AOK_RIGHT_INSPECT | AOK_RIGHT_DUPLICATE | AOK_RIGHT_MANAGE_CHILD)
+ 
+ /* Experimental object-only bootstrap, restricted to the initial PID 1. */
+ #define AOK_PARENT_BOOTSTRAP (-1)
+ 
++#define AOK_OBJECT_ROOT_JOB 2U
++
+ struct aok_aproc_create_args {
+ 	__u64 size;
+ 	__s32 parent_job_fd;
+diff --git a/kernel/aok.c b/kernel/aok.c
+index 84661c97f..12a10970c 100644
+--- a/kernel/aok.c
++++ b/kernel/aok.c
+@@ -14,6 +14,8 @@
+ #include <uapi/linux/aok.h>
+ 
+ static atomic64_t aok_next_aid = ATOMIC64_INIT(0);
++static bool aok_root_claimed;
++static DEFINE_MUTEX(aok_root_lock);
+ 
+ static int aok_alloc_aid(u64 *aid)
+ {
+@@ -33,7 +35,7 @@ static int aok_aproc_release(struct inode *inode, struct file *file)
+ 	struct aok_handle *handle = file->private_data;
+ 	struct aok_aproc *aproc = handle->aproc;
+ 
+-	if (refcount_dec_and_test(&aproc->refs))
++	if (aproc && refcount_dec_and_test(&aproc->refs))
+ 		kfree(aproc);
+ 	kfree(handle);
+ 	return 0;
+@@ -58,13 +60,54 @@ static int aok_copy_create_args(struct aok_aproc_create_args *args,
+ 	if (ret)
+ 		return ret;
+ 	if (args->size != size ||
+-	    args->parent_job_fd != AOK_PARENT_BOOTSTRAP ||
+ 	    args->flags || args->reserved[0] ||
+ 	    args->reserved[1] || args->reserved[2])
+ 		return -EINVAL;
+ 	return 0;
+ }
+ 
++static int aok_root_cap_release(struct inode *inode, struct file *file)
++{
++	kfree(file->private_data);
++	return 0;
++}
++
++static const struct file_operations aok_root_fops = {
++	.owner = THIS_MODULE,
++	.release = aok_root_cap_release,
++};
++
++SYSCALL_DEFINE0(aok_root_cap_claim)
++{
++	struct aok_handle *handle;
++	int fd;
++
++	if (task_pid_nr(current) != 1)
++		return -EPERM;
++	handle = kzalloc(sizeof(*handle), GFP_KERNEL);
++	if (!handle)
++		return -ENOMEM;
++	mutex_lock(&aok_root_lock);
++	if (aok_root_claimed) {
++		mutex_unlock(&aok_root_lock);
++		kfree(handle);
++		return -EALREADY;
++	}
++	aok_root_claimed = true;
++	mutex_unlock(&aok_root_lock);
++	handle->rights = AOK_RIGHTS_ROOT;
++	handle->type = AOK_OBJECT_ROOT_JOB;
++	fd = anon_inode_getfd("aok-root-job", &aok_root_fops, handle, O_RDWR | O_CLOEXEC);
++	if (fd < 0) {
++		kfree(handle);
++		mutex_lock(&aok_root_lock);
++		aok_root_claimed = false;
++		mutex_unlock(&aok_root_lock);
++		return fd;
++	}
++	return fd;
++}
++
+ static int aok_copy_info(struct aok_object_info __user *uinfo,
+ 			 const struct aok_object_info *info)
+ {
+@@ -93,12 +136,27 @@ SYSCALL_DEFINE2(aok_aproc_create,
+ 	struct file *file;
+ 	int fd, ret;
+ 
+-	/* Removed when root/job capability bootstrap replaces this prototype. */
+-	if (task_pid_nr(current) != 1)
+-		return -EPERM;
+ 	ret = aok_copy_create_args(&args, uargs);
+ 	if (ret)
+ 		return ret;
++	{
++		struct fd parent = fdget(args.parent_job_fd);
++		struct aok_handle *parent_handle;
++
++		if (fd_empty(parent))
++			return -EBADF;
++		if (fd_file(parent)->f_op != &aok_root_fops &&
++		    fd_file(parent)->f_op != &aok_aproc_fops) {
++			fdput(parent);
++			return -EINVAL;
++		}
++		parent_handle = fd_file(parent)->private_data;
++		if (!(parent_handle->rights & AOK_RIGHT_MANAGE_CHILD)) {
++			fdput(parent);
++			return -EACCES;
++		}
++		fdput(parent);
++	}
+ 	aproc = kzalloc(sizeof(*aproc), GFP_KERNEL);
+ 	if (!aproc)
+ 		return -ENOMEM;
+diff --git a/kernel/sys_ni.c b/kernel/sys_ni.c
+index f443ba8bf..b6055cf4d 100644
+--- a/kernel/sys_ni.c
++++ b/kernel/sys_ni.c
+@@ -397,3 +397,4 @@ COND_SYSCALL(uprobe);
+ COND_SYSCALL(aok_aproc_create);
+ COND_SYSCALL(aok_object_inspect);
+ COND_SYSCALL(aok_handle_duplicate);
++COND_SYSCALL(aok_root_cap_claim);
+diff --git a/scripts/syscall.tbl b/scripts/syscall.tbl
+index b27d53614..aff9101cb 100644
+--- a/scripts/syscall.tbl
++++ b/scripts/syscall.tbl
+@@ -413,3 +413,4 @@
+ 470	common	aok_aproc_create		sys_aok_aproc_create
+ 471	common	aok_object_inspect		sys_aok_object_inspect
+ 472	common	aok_handle_duplicate		sys_aok_handle_duplicate
++473	common	aok_root_cap_claim		sys_aok_root_cap_claim

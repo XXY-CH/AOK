@@ -1,0 +1,72 @@
+From aok-0007 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] aok: freeze aproc when token hard budget is exceeded
+
+Record the conservative usage report before returning EDQUOT and transition
+the domain to FROZEN. Freezer operations run after dropping aproc->lock.
+
+---
+ kernel/aok.c | 40 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 40 insertions(+)
+
+diff --git a/kernel/aok.c b/kernel/aok.c
+index 3928fe2b9..d0a1863 100644
+--- a/kernel/aok.c
++++ b/kernel/aok.c
+@@ -1076,7 +1076,7 @@ static int aok_copy_usage_in(struct aok_token_usage *usage,
+ }
+ 
+ static int aok_copy_status_out(struct aok_budget_status __user *ustatus,
+-			       const struct aok_budget_status *status)
++				       const struct aok_budget_status *status)
+ {
+ 	u64 size;
+ 
+@@ -1087,6 +1087,32 @@ static int aok_copy_status_out(struct aok_budget_status __user *ustatus,
+ 	return copy_struct_to_user(ustatus, size, status, sizeof(*status), NULL);
+ }
+ 
++static void aok_force_freeze(struct aok_aproc *aproc)
++{
++	struct task_struct **tasks;
++	unsigned int count, i;
++	bool transitioned = false;
++
++	tasks = aok_collect_tasks(aproc, &count);
++	if (IS_ERR(tasks))
++		return;
++	spin_lock(&aproc->lock);
++	if (aproc->state == AOK_APROC_STATE_RUNNING) {
++		aproc->state = AOK_APROC_STATE_FROZEN;
++		aproc->freeze_req = true;
++		aok_emit_locked(aproc, AOK_EVENT_STATE, 0, aproc->state);
++		transitioned = true;
++	}
++	spin_unlock(&aproc->lock);
++	if (transitioned)
++		aok_freezer_enter();
++	for (i = 0; transitioned && i < count; i++) {
++		WRITE_ONCE(tasks[i]->aok_freeze, true);
++		freeze_task(tasks[i]);
++	}
++	aok_put_tasks(tasks, count);
++}
++
+ /*
+  * Observe CPU time and RSS of the current members. Neither value feeds an
+  * enforcement path in this slice; racy reads approximate per-task counters
+@@ -1266,8 +1266,15 @@ SYSCALL_DEFINE2(aok_token_usage, int, fd,
+ 	settled = aok_sat_add(aproc->tokens_used, delta);
+ 	if (aproc->res_token_hard != U64_MAX &&
+ 	    settled > aproc->res_token_hard) {
++		aproc->tokens_used = settled;
++		aproc->tokens_cached = aok_sat_add(aproc->tokens_cached,
++						   usage.cached_tokens);
++		aproc->last_usage_id = usage.usage_id;
++		aproc->last_usage_seq = usage.usage_seq;
++		aok_res_eval_locked(aproc);
+ 		spin_unlock(&aproc->lock);
+ 		fdput(f);
++		aok_force_freeze(aproc);
+ 		return -EDQUOT;
+ 	}
+ 	aproc->tokens_used = settled;
