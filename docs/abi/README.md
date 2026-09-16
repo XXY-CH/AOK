@@ -57,6 +57,7 @@ slot save/restore、后端是否能回报 usage、SQLite 构建是否提供 FTS5
 - [route-model.md](route-model.md)：动态模型路由、资源预留、fallback 和 KV 兼容性。
 - [web-application.md](web-application.md)：分层 Web capability、session、browser 和证据产物。
 - [hostfs-model.md](hostfs-model.md)：virtiofs live mount、artifact 双向交换和冲突语义。
+- [toolchain-artifact.md](toolchain-artifact.md)：工具链与语言依赖的内容寻址 artifact 流水线。
 - [message-gateway.md](message-gateway.md)：人类消息 channel、durable inbox/outbox 和投递语义。
 - [p0-freeze.md](p0-freeze.md)：错误、pidfd 绑定、事件背压、资源压力和 token 对账的冻结决议。
 - [p1-object-prototype.md](p1-object-prototype.md)：第一枚实验补丁的实际 ABI、测试和未实现边界。
