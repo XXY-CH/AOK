@@ -17,14 +17,15 @@ import (
 var ErrRestartIntensity = errors.New("engine restart intensity exceeded")
 
 type ProcessProviderConfig struct {
-	Command         string
-	Args            []string
-	StartupTimeout  time.Duration
-	RequestTimeout  time.Duration
-	ShutdownTimeout time.Duration
-	MaxStarts       int
-	SandboxLauncher string
-	SandboxPolicy   sandbox.Policy
+	Command            string
+	Args               []string
+	StartupTimeout     time.Duration
+	RequestTimeout     time.Duration
+	ShutdownTimeout    time.Duration
+	MaxStarts          int
+	ResourceController interface{ AttachPID(int) error }
+	SandboxLauncher    string
+	SandboxPolicy      sandbox.Policy
 }
 type processChild struct {
 	dir      string
@@ -144,6 +145,13 @@ func (p *ProcessProvider) startLocked(ctx context.Context) error {
 		l.Close()
 		os.RemoveAll(dir)
 		return err
+	}
+	if p.config.ResourceController != nil {
+		if err = p.config.ResourceController.AttachPID(cmd.Process.Pid); err != nil {
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+			return err
+		}
 	}
 	lf.Close()
 	done := make(chan struct{})
