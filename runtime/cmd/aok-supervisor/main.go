@@ -11,6 +11,7 @@ import (
 	"time"
 
 	aok "aok/runtime"
+	"aok/runtime/sandbox"
 )
 
 type stringListFlag []string
@@ -35,6 +36,7 @@ func run() error {
 	routerEngines := stringListFlag{}
 	flag.Var(&routerEngines, "router-engine", "router provider in fallback order (llama or anthropic; repeatable)")
 	engineCommand := flag.String("engine-command", "", "optional supervised engine executable")
+	sandboxLauncher := flag.String("sandbox-launcher", "", "optional absolute AOK Landlock/seccomp launcher")
 	engineArgs := stringListFlag{}
 	flag.Var(&engineArgs, "engine-arg", "argument passed to --engine-command (repeatable)")
 	maxTokens := flag.Int("max-tokens", 128, "maximum model output tokens per turn")
@@ -64,7 +66,8 @@ func run() error {
 		}
 	}
 	if *engineCommand != "" {
-		p, processErr := aok.NewProcessProvider(aok.ProcessProviderConfig{Command: *engineCommand, Args: engineArgs, ResourceController: resources})
+		sandboxPolicy := sandbox.Policy{Read: policy.FSRead, Write: policy.FSWrite, Network: policy.Net}
+		p, processErr := aok.NewProcessProvider(aok.ProcessProviderConfig{Command: *engineCommand, Args: engineArgs, ResourceController: resources, SandboxLauncher: *sandboxLauncher, SandboxPolicy: sandboxPolicy})
 		if processErr != nil {
 			return processErr
 		}
