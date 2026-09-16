@@ -29,6 +29,9 @@ func main() {
 		fmt.Fprintln(os.Stderr, "supervisor must be an absolute path")
 		os.Exit(2)
 	}
+	if len(args) == 0 {
+		args = stringList{"--state", "/var/lib/aok", "--manifest", "/etc/aok/manifest.yaml"}
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	if err := aok.RunInit(ctx, aok.InitConfig{Supervisor: *supervisor, SupervisorArgs: args, Restart: *restart, MaxRestarts: *maxRestarts}); err != nil && !errors.Is(err, context.Canceled) {
