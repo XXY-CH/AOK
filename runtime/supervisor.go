@@ -74,6 +74,8 @@ type MailboxMessage struct {
 
 type CapabilitySet struct {
 	Engine  string   `json:"engine"`
+	MemMiB  int      `json:"mem_mib,omitempty"`
+	CPUs    int      `json:"cpus,omitempty"`
 	FSRead  []string `json:"fs_read,omitempty"`
 	FSWrite []string `json:"fs_write,omitempty"`
 	Net     bool     `json:"net"`
@@ -546,9 +548,12 @@ func LoadCapabilitySet(path string) (CapabilitySet, error) {
 	if err = d.Decode(&m); err != nil {
 		return CapabilitySet{}, err
 	}
-	c := CapabilitySet{Engine: m.Engine, FSRead: m.Capabilities.FS.Read, FSWrite: m.Capabilities.FS.Write, Net: m.Capabilities.Net, Tools: m.Capabilities.Tools}
+	c := CapabilitySet{Engine: m.Engine, MemMiB: m.Resources.MemMiB, CPUs: m.Resources.CPUs, FSRead: m.Capabilities.FS.Read, FSWrite: m.Capabilities.FS.Write, Net: m.Capabilities.Net, Tools: m.Capabilities.Tools}
 	if c.Engine == "" {
 		return c, errors.New("manifest engine is required")
+	}
+	if c.MemMiB < 0 || c.MemMiB > 1<<20 || c.CPUs < 0 || c.CPUs > 1024 {
+		return c, errors.New("manifest resource limits are out of range")
 	}
 	for _, p := range append(append([]string(nil), c.FSRead...), c.FSWrite...) {
 		base := strings.TrimSuffix(p, "/**")
