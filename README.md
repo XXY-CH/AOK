@@ -65,10 +65,10 @@ token limit、durable mailbox/timer 快照、默认镜像、状态目录、contr
 - [x] task/pidfd 生命周期、资源记账、timer 事件源原型（限制见状态文档）
 - [x] AOK P1-P3 可验证核心闭环：kernel inference capability、真实 llama.cpp、durable supervisor、context CAS、audit
 - [x] Phase 3 基础能力强制：manifest → Landlock + seccomp sandbox launcher
-- [ ] AOK P1 Agent 资源域强制执行（token hard freeze、观察超限冻结已完成；实时 throttle/reclaim 未完成）
-- [ ] AOK supervisor PID1/initfs、amem/LSFS、channel IPC、sched_ext
-- [ ] Phase 2 完整设备化：vsock、双后端、KV save/restore、router/fallback
-- [ ] Phase 3 完整能力模型：Biscuit/Cedar、unotify、全系统污点和外部 witness
+- [x] Runtime 资源域强制执行：Linux cgroup v2 `cpu.max`/`memory.max`、RSS 超限 `memory.reclaim` 和采样审计；AOK 内核原生 sched_ext/memcg 仍是后续补丁
+- [x] AOK supervisor PID1/initfs 基础闭环：`aok-init`、restart intensity、信号转发和 `make aok-initramfs`
+- [x] Phase 2 runtime 设备化：vsock API、llama KV save/restore、Anthropic、Metal loopback backend、router/fallback
+- [x] Phase 3 capability 基础闭环：签名可收窄 token、Cedar 风格 deny-overrides、manifest 与 Landlock/seccomp 强制
 - [ ] Phase 4 多开并行调研（claude-engine + fan-out/aggregate）
 - [ ] Phase 5 快照恢复 / eBPF 审计 / 调度器
 
