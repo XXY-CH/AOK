@@ -29,6 +29,7 @@ type ProcessProviderConfig struct {
 }
 type processChild struct {
 	dir      string
+	addr     string
 	cmd      *exec.Cmd
 	done     chan struct{}
 	listener *net.UnixListener
@@ -102,9 +103,11 @@ func (p *ProcessProvider) startLocked(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// Abstract Unix sockets remain addressable after the parent closes its copy;
-	// this avoids treating the parent's unused listener as child readiness.
-	addr := "@aok-" + filepath.Base(dir)
+	// On Linux an abstract socket remains addressable after the parent closes its
+	// copy, which avoids treating the parent's unused listener as child readiness.
+	// Other platforms have no abstract namespace, so engineAddr binds a real
+	// socket inside dir, which reapLocked removes.
+	addr := engineAddr(dir)
 	l, err := net.ListenUnix("unix", &net.UnixAddr{Name: addr, Net: "unix"})
 	if err != nil {
 		os.RemoveAll(dir)
@@ -155,9 +158,13 @@ func (p *ProcessProvider) startLocked(ctx context.Context) error {
 	}
 	lf.Close()
 	done := make(chan struct{})
-	ch := &processChild{dir: dir, cmd: cmd, done: done, listener: l}
+	ch := &processChild{dir: dir, addr: addr, cmd: cmd, done: done, listener: l}
 	p.child = ch
 	go func() { _ = cmd.Wait(); close(done) }()
+	// The child owns the inherited listener fd. Closing the parent's copy must not
+	// unlink a filesystem socket, or the child would keep serving an address no
+	// caller can reach. reapLocked removes the directory that holds it.
+	l.SetUnlinkOnClose(false)
 	_ = l.Close()
 	timer := time.NewTimer(p.config.StartupTimeout)
 	defer timer.Stop()
@@ -224,8 +231,7 @@ func (p *ProcessProvider) Complete(ctx context.Context, prompt string) (string, 
 	}
 	rctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	addr := "@aok-" + filepath.Base(ch.dir)
-	conn, err := (&net.Dialer{}).DialContext(rctx, "unix", addr)
+	conn, err := (&net.Dialer{}).DialContext(rctx, "unix", ch.addr)
 	if err != nil {
 		p.reapLocked(ch)
 		return "", Usage{}, err

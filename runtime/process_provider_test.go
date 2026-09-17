@@ -87,6 +87,57 @@ func TestProcessProviderEchoAndReap(t *testing.T) {
 	}
 }
 
+// The engine listener must live inside the child's private 0700 directory so
+// that reaping removes it. An abstract-namespace name is not portable: Darwin
+// has no abstract sockets and Go never unlinks a path beginning with "@", so
+// such a name leaks a socket file into the working directory on every start.
+func TestProcessProviderSocketStaysInPrivateDir(t *testing.T) {
+	before := workDirEntries(t)
+	p := testProcessProvider(t, "echo", 3)
+	if _, _, err := p.Complete(context.Background(), "hello"); err != nil {
+		t.Fatal(err)
+	}
+	child := p.child
+	if child == nil {
+		t.Fatal("no child after successful turn")
+	}
+	if filepath.Dir(child.addr) != child.dir {
+		t.Fatalf("listener outside private dir: addr=%q dir=%q", child.addr, child.dir)
+	}
+	socket, err := os.Stat(child.addr)
+	if err != nil || socket.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("listener path is not a socket: mode=%v err=%v", socket, err)
+	}
+	dir, err := os.Stat(child.dir)
+	if err != nil || dir.Mode().Perm() != 0o700 {
+		t.Fatalf("private dir permissions: mode=%v err=%v", dir, err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(child.dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("private dir remains: %v", err)
+	}
+	for name := range workDirEntries(t) {
+		if !before[name] {
+			t.Fatalf("engine start leaked %q into the working directory", name)
+		}
+	}
+}
+
+func workDirEntries(t *testing.T) map[string]bool {
+	t.Helper()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		names[entry.Name()] = true
+	}
+	return names
+}
+
 func TestProcessProviderCancellation(t *testing.T) {
 	p := testProcessProvider(t, "slow", 3)
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
