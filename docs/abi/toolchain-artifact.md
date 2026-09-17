@@ -10,8 +10,9 @@ artifact 进入 Application 域，获取、写入和执行各自携带独立 cap
 
 1. **无全局状态**：工具链和依赖不是系统对象，是 Application 域内的 artifact。不存在
    `pip install` 到全局 site-packages 或 `npm install -g` 的等价操作。
-2. **内容寻址**：artifact 由内容 hash 标识，可复现、可缓存、可审计。依赖集是
-   lockfile hash 的纯函数。
+2. **内容寻址**：artifact 由内容 hash 标识，可复现、可缓存、可审计。依赖集由
+   规范化解析计划确定；lockfile、目标平台、工具链、features/extras 和 resolver
+   版本都是输入。
 3. **最小授权**：下载、写入、执行是三个独立 capability，缺一不可组合成"安装"。
 4. **污点默认**：外部下载默认携带 `external-content` taint；进入构建产物链必须经过
    策略判定。
@@ -25,8 +26,8 @@ artifact 进入 Application 域，获取、写入和执行各自携带独立 cap
 
 - **toolchain artifact**：自包含目录树（解释器、编译器、构建工具），如官方 Python
   发行版、rustup 工具链、Node tarball。解压即用，零系统状态。
-- **dependency artifact**：包管理器产物（wheel、tarball、git tree），由 lockfile 行的
-  URL 与 hash 唯一确定。
+- **dependency artifact**：包管理器产物（优先为 wheel、预编译 tarball 或 git tree），由
+  规范化解析计划中的 URL 与 hash 唯一确定。
 - **build artifact**：构建输出，提交进 LSFS，参与 Application checkpoint。
 
 toolchain descriptor：
@@ -71,13 +72,17 @@ net:
 ```
 
 - `toolchain.use` 编译为 entry 路径的 execute 授权与目录树读授权；toolchain 目录本身
-  对 Application 只读。
+  对 Application 只读。这里的 execute 是 Landlock 的 OS 文件执行权，不等于批准目录
+  内所有解释型代码；允许执行 Python 仍需通过读权决定哪些脚本和模块可被解释器加载。
 - `dependencies.fetch.url_prefixes` 与 `net.prefixes` 必须一致或为其子集；fetch 层
   拒绝前缀外的重定向。
 - `execute` 编译为 sandbox launcher 的 `--execute PATH` 规则；`/**` 只允许出现在
   终端段（与 `Policy.Args` 现有约束一致）。
-- 包管理器进程（pip/npm/cargo）以普通 tool 身份在 Application 沙箱内运行，继承同一
-  manifest，不持有任何附加特权。不存在 setuid、postinst 脚本或全局注册表写入。
+- 第一版只接受明确支持的预编译 artifact；包管理器进程以普通 tool 身份在 Application
+  沙箱内运行，继承同一 manifest，不持有任何附加特权。不存在 setuid、postinst 脚本或
+  全局注册表写入。需要执行 build backend、npm lifecycle script、Cargo `build.rs` 或
+  其他源码构建时返回 `AOK_ENOTSUP`；后续必须使用单独的 build worker，并为其声明输入、
+  网络和预算。
 - 当前原型 `net` 是布尔开关；URL 前缀是本草案引入的目标形态，前缀级 capability 未实现。
 
 ## 解析与获取流水线
@@ -86,17 +91,20 @@ net:
 lockfile -> resolver -> fetch plan -> fetch (taint) -> verify -> install -> execute grant
 ```
 
-1. **lockfile 是规范输入**：`uv.lock`、`package-lock.json`、`Cargo.lock`、`go.sum`。
+1. **规范化解析输入**：输入包括 `uv.lock`、`package-lock.json`、`Cargo.lock` 或
+   `go.sum`（`go.sum` 必须与 `go.mod` 一起使用），目标 triple、语言 ABI、features/
+   extras 和 resolver 版本。resolver 输出的规范化 fetch plan 才是依赖集的身份。
    没有 lockfile 的解析（`pip install pkg` 浮动版本）产生 `unresolved` 状态的临时
    依赖集，checkpoint 必须如实标记，不得当作已解析。
 2. **resolver** 是 tool 进程：读 lockfile，产出 fetch plan（URL、预期 hash、大小的
    列表）。fetch plan 必须完整后才允许任何网络动作。
 3. **fetch** 按计划逐项下载到临时对象；hash 与 lockfile 预期不符即整批失败，不得
    部分采纳。全部 artifact 带 `external-content` taint。
-4. **install** 解包到 `install_root`，产出新增可执行路径清单；supervisor 将清单编译
-   为 execute 授权（收窄：只授予清单内路径）。
-5. **幂等键** = `sha256(lockfile || toolchain descriptors)`。重复安装不得重复副作用；
-   同键请求返回缓存结果。
+4. **install** 仅解包已验证的预编译 artifact 到 `install_root`，拒绝安装脚本和源码
+   构建，产出新增可执行路径清单；supervisor 将清单编译为 execute 授权（收窄：只授予
+   清单内路径）。授权作用于随后创建的 worker；已进入 Landlock 域的进程不能事后放宽权限。
+5. **幂等键** = `sha256(canonical fetch plan || toolchain descriptors)`。解析器、目标
+   平台和 features 等差异必须反映在 plan 中。重复安装不得重复副作用；同键请求返回缓存结果。
 
 ## 缓存与共享
 
@@ -106,6 +114,8 @@ lockfile -> resolver -> fetch plan -> fetch (taint) -> verify -> install -> exec
   `install_root` 大小受资源域约束，超限走 throttle/quiesce，不得静默删除。
 - 工具链缓存（LSFS 层）与项目依赖（mount 层）分离：工具链属于 supervisor 域的共享
   存储，Application 只拿 execute 授权，不能写。共享域支持运行期扩展，见下一节。
+  checkpoint、休眠 Application 和审计记录中的引用同样阻止回收；不能只保护当前活跃的
+  `toolchain.use`。
 
 ## 运行期工具链获取（toolchain.request）
 
@@ -151,11 +161,12 @@ Application 引用。私用自由，共享验证。
 
 ## 检查点与恢复
 
-- Application checkpoint 提交：lockfile hash、已导入依赖 artifact 集合、toolchain
-  descriptor 集合、execute 授权版本号。四者缺一不可宣称"依赖已恢复"。
-- 恢复报告三态：`toolchain_exact`（全部命中）/ `deps_replayed`（缓存或重新获取后
-  逐项 hash 相同）/ `refetch_required`（hash 不符或缓存不可用）。丢失状态的安装不得
-  伪装成功。
+- Application checkpoint 至少提交 canonical fetch plan hash、已导入依赖 artifact 集合、
+  toolchain descriptor 集合和 execute 授权版本号。若声明 `install_tree_exact`，还必须
+  提交保存了内容、权限和链接的不可变安装树引用。
+- 恢复分为两种明确语义：`install_tree_exact` 直接引用保存了内容、权限和链接的不可变
+  安装树；`deps_replayed` 从相同 fetch plan 重新解包并逐项校验 hash。只有计划或 artifact
+  不可用时才是 `refetch_required`，重新安装不得伪装成原样恢复。
 - hostfs mount 上未显式导入的写入不能计入可恢复状态（对齐 hostfs-model）。
 
 ## 审计与 taint

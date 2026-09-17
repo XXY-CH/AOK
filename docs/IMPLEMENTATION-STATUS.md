@@ -45,7 +45,8 @@
   2026-09-16 本轮验证 `go test -race ./...` 与 `go vet ./...` 通过；
   新增独立 `aok-engine-echo` 与 Unix socket transport，接收父进程创建的 listener fd，
   实现握手、异步 prompt/abort、事件投递、连接隔离与断连取消；独立进程 smoke test
-  通过。仍没有真实模型、内核 ainf 连接或完整的 v1 suspend/resume 背压。
+  通过。出站队列溢出已改为暂停 session 并可 `session/resume` 补发，Engine 另有
+  跨 session 的历史总量上限；仍没有真实模型、内核 ainf 连接，背压也未反向传播到 provider。
   本轮证据与限制见 [RUNTIME-TRANSPORT-VALIDATION.md](RUNTIME-TRANSPORT-VALIDATION.md)。
 - `make aok-object-build` 在 Linux arm64 上从固定上游提交导出独立源码并应用 patch；
   `make aok-object-test` / `make aok-object-test-disabled` 在 QEMU 中验证启用/禁用两种内核。
@@ -53,6 +54,13 @@
   `runtime/kernelbridge` typed ioctl binding、真实 llama.cpp QEMU probe、SQLite durable supervisor、
   context CAS/checkpoint、ProcessProvider 子进程监督和 sandbox launcher。runtime 的 `go test -race ./...`
   与 `go vet ./...` 已通过。
+- supervisor 当前在重启时递增 Application `generation` 并恢复旧 incarnation 的 pending mailbox；engine
+  transport 支持有界 `session/suspend`/`session/resume`。`make aok-initramfs` 已验证 initfs archive 内容，
+  但本机没有 kernel Image，完整 guest PID1 boot 仍待 Linux/QEMU runner。
+- `ProcessProvider` 子进程 listener 地址已按平台分离：Linux 抽象命名空间，其他平台绑定到子进程
+  私有 0700 目录。此前在 macOS 上每次 engine 启动泄漏一个 socket 文件（累积 253 个），现由
+  `TestProcessProviderSocketStaysInPrivateDir` 以 red/green 方式守护，证据见
+  [RUNTIME-TRANSPORT-VALIDATION.md](RUNTIME-TRANSPORT-VALIDATION.md)。
 
 ## 当前未实现
 

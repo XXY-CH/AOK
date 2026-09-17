@@ -102,7 +102,9 @@ vsock API、PID1/initfs 和 capability sandbox。
 
 已知边界保持显式：本机未配置 `ANTHROPIC_API_KEY`，因此没有真实 Anthropic
 service verification；当前 QEMU 没有可用 virtio-vsock device model；AOK 内核
-原生 sched_ext/memcg 强制、amem/LSFS 和全系统污点/unotify/witness 仍未完成。
+原生 sched_ext/memcg 强制、amem/LSFS、全系统污点/unotify/witness 和跨进程
+engine session replay 仍未完成。runtime 已提供有界的进程内 session
+suspend/resume，以及持久 Application generation/checkpoint/mailbox 恢复。
 
 详细状态：[docs/IMPLEMENTATION-STATUS.md](docs/IMPLEMENTATION-STATUS.md) 和
 [docs/AOK-CORE-VALIDATION.md](docs/AOK-CORE-VALIDATION.md)

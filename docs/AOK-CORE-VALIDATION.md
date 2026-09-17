@@ -6,7 +6,12 @@
 - 最新独立 P8 资源测试在同一 patch series 上通过 53/53，disabled 配置通过 8/8；独立回归重新通过 object 44/44、task 64/64、event-source 37/37、core 46/46。
 - 同一个 kernel fd ABI 已由 `runtime/kernelbridge` 提供 typed Go binding。QEMU 通过 slirp 连接真实 llama.cpp CPU 服务，实测 input=11、output=32、used=43；预算超限返回 `EDQUOT`，祖先 revoke 后 descendant client/result 被拒绝。
 - supervisor 使用 SQLite WAL/FULL 保存 application、durable mailbox、prepared result、checkpoint、timer、audit hash chain 和 context CAS。`python3 runtime/scripts/core-smoke.py` 通过 crash replay、headless timer 和预算冻结。
+- runner 在 provider 取消或结果提交失败时会把 `claimed` 消息原子地 requeue 为 `pending`，因此同一 supervisor 进程停止后也能继续处理；`TestRunnerRequeuesClaimOnStop` 覆盖该路径。
+- supervisor 重启时为每个未退役 Application 递增持久 `generation`，把旧 incarnation 的 `claimed` mailbox 重新置为 `pending`，并写入 `application.recover` 审计事件；worker 可在新 incarnation 继续处理同一 identity、context 和 checkpoint。
+- engine protocol 已支持 `session/suspend`/`session/resume`：暂停期间保留有界事件尾部，恢复时按原 `event_seq` 补发；无法从保留尾部恢复时显式返回 `event history expired`。
+- `aok-init`、`aok-supervisor` 和 manifest 已由 `make aok-initramfs` 打入可启动的 `newc` gzip archive，档案包含 `/init`、`/sbin/aok-supervisor`、`/etc/aok/manifest.yaml` 和 `/var/lib/aok`；当前缺少 kernel Image，因此尚未做 guest boot 验证。
 - engine 可由 `ProcessProvider` 以独立子进程运行，继承 listener fd，限制启动/请求时限、重启强度、输出大小，并支持 Linux sandbox launcher。崩溃、取消、启动超时、并发调用和真实 echo binary 均有测试覆盖。
+- 子进程 listener 地址按平台分离：Linux 用抽象命名空间，其他平台绑定子进程私有 0700 目录内的 `engine.sock`，parent 关闭前设置 `SetUnlinkOnClose(false)`，socket 只随 `reapLocked` 删除目录而消失。此前统一的 `@` 前缀在 macOS 上每次启动泄漏一个 socket 文件（实测累积 253 个），现由 `TestProcessProviderSocketStaysInPrivateDir` 守护。
 
 验证命令：
 

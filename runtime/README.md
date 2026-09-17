@@ -53,10 +53,15 @@ Closing the connection cancels its work; it does not retire an AOK Application.
 SIGINT/SIGTERM close the listener and cancel active connections.
 
 Transport bounds are 32 connections, 16 pending prompts per connection, 256
-outbound messages, 4 MiB input frames and a 10-second write deadline. An outbound
-queue overflow closes the connection and cancels work. This is a prototype
-failure policy, **not** v1 suspend/resume or durable delivery. A provider that
-ignores cancellation can stall its own request until the supervisor timeout.
+outbound messages, 4 MiB input frames and a 10-second write deadline. Sessions
+support bounded in-process `session/suspend` and `session/resume` event replay.
+An outbound overflow suspends the session instead of dropping the connection:
+refused events stay retained and `session/resume` replays them in `event_seq`
+order. Responses carry no sequence number and cannot be replayed, so a response
+overflow still closes the connection. Per-session history caps multiply, so the
+engine also bounds their sum and reclaims from the largest holder. Delivery is
+still not durable across processes, and a provider that ignores cancellation can
+stall its own request until the supervisor timeout.
 
 A development supervisor/client probe creates a private socket, passes its fd
 to the compiled engine, exercises two turns and cleans up the child and files:

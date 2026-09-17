@@ -25,7 +25,8 @@ socket 必须由 supervisor 创建并限制权限。引擎不能通过环境变�
 ## Methods
 
 必选方法：`initialize`、`session/new`、`session/prompt`、`session/abort`、`session/close`、
-`health`。可选方法：`session/suspend`、`session/resume`、`session/usage`。
+`health`。可选方法包括 `session/suspend`、`session/resume`、`session/usage`。
+当前实现支持前两者；`session/usage` 目前仅作为 notification 发送，尚无同名查询方法。
 
 `session/prompt` 是单个 turn。响应或终态 event 必须包含 `stop_reason`：`completed`、
 `cancelled`、`failed`、`budget_exhausted` 或 `backend_unavailable`。
@@ -47,9 +48,18 @@ session/started -> session/chunk* -> session/usage? -> session/done|session/fail
 再发送 `done(stop_reason=cancelled)`。不可中断的 backend 必须声明能力，runtime 只能在
 turn 边界结束。
 
-v1 不把隐式 socket backpressure 当作协议语义。事件队列达到上限时 runtime 发送
-`session/suspend`；引擎必须停止产生新 chunk，恢复后继续同一 event sequence。崩溃后
-supervisor 运行协议外 `cleanup`，runtime 通过 `health` 和 session replay 决定是否恢复。
+v1 的目标契约不把隐式 socket backpressure 当作协议语义：事件队列达到上限时，runtime
+发送 `session/suspend`，引擎应停止产生新 chunk，恢复后继续同一 event sequence。
+
+当前实现把出站队列溢出当作背压而非致命错误：事件投递返回是否被接收，被拒的事件保留在
+进程内的有界尾部并把该 session 置为 suspended，`session/resume` 按原 `event_seq` 补发，
+尾部过期时返回明确错误。响应没有 `event_seq`、无法补发，溢出仍然关闭连接。
+
+因此队列上限已具备暂停与恢复语义，但 runtime 只停止投递，provider 仍可能继续生成，
+背压尚未反向传播到 backend，也不提供跨进程崩溃的持久事件恢复。
+
+崩溃后的协议外 `cleanup`、`health` 检查与持久 session replay 属于恢复目标；进程内
+`session/resume` 的测试不能作为这条恢复链路已完成的证据。
 
 ## Evolution
 

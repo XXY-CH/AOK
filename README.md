@@ -113,8 +113,10 @@ plus reproducible patch-series rebuilds.
 Known boundaries remain explicit: `ANTHROPIC_API_KEY` is not configured on the
 development machine, so live Anthropic service verification is blocked; the
 current QEMU setup has no usable virtio-vsock device model; native AOK
-sched_ext/memcg enforcement, amem/LSFS, and system-wide taint/unotify/witness
-integration are still pending.
+sched_ext/memcg enforcement, amem/LSFS, system-wide taint/unotify/witness
+integration, and cross-process engine session replay are still pending. The
+runtime does provide bounded in-process session suspend/resume and durable
+Application generation/checkpoint/mailbox recovery.
 
 Detailed status: [docs/IMPLEMENTATION-STATUS.md](docs/IMPLEMENTATION-STATUS.md)
 and [docs/AOK-CORE-VALIDATION.md](docs/AOK-CORE-VALIDATION.md)
