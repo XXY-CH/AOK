@@ -127,6 +127,45 @@ func TestHistoryCountBytesAndExpiredCursor(t *testing.T) {
 		}
 	}
 }
+// Per-session caps multiply: maxSessions sessions each retaining maxHistoryBytes
+// let one connection pin 128 MiB, and maxConnections of them 4 GiB. The engine
+// budget has to bound the sum, and closing a session has to return its share.
+func TestHistoryRespectsAggregateEngineBudget(t *testing.T) {
+	e := NewEngine()
+	text := strings.Repeat("x", maxTextBytes)
+	for i := 0; i < maxSessions; i++ {
+		if r := invoke(e, "1", "session/new", "{}"); r.Error != nil {
+			t.Fatal(r.Error)
+		}
+	}
+	for i := 0; i < maxSessions; i++ {
+		session := fmt.Sprintf("session-%d", i+1)
+		for n := 0; n < 4; n++ {
+			if r := invoke(e, "2", "session/prompt", promptParams(session, "", text)); r.Error != nil {
+				t.Fatal(r.Error)
+			}
+		}
+		sum := 0
+		for _, s := range e.sessions {
+			sum += s.historyBytes
+		}
+		if sum != e.historyBytes {
+			t.Fatalf("engine accounting drifted: sessions=%d engine=%d", sum, e.historyBytes)
+		}
+		if e.historyBytes > maxEngineHistoryBytes {
+			t.Fatalf("aggregate history over budget: %d > %d", e.historyBytes, maxEngineHistoryBytes)
+		}
+	}
+	for i := 0; i < maxSessions; i++ {
+		if r := invoke(e, "3", "session/close", promptParams(fmt.Sprintf("session-%d", i+1), "", "")); r.Error != nil {
+			t.Fatal(r.Error)
+		}
+	}
+	if e.historyBytes != 0 {
+		t.Fatalf("closed sessions leaked budget: %d", e.historyBytes)
+	}
+}
+
 func TestRequestAndProviderOutputLimits(t *testing.T) {
 	p := &countingProvider{text: strings.Repeat("x", maxTextBytes+1)}
 	e := NewEngineWithProvider(p)

@@ -26,18 +26,25 @@ type RPCError struct {
 }
 
 type Engine struct {
-	mu          sync.Mutex
-	sessions    map[string]*engineSession
-	events      map[string][]Message
-	provider    Provider
-	nextSession uint64
-	onEvent     func(Message)
-	closed      bool
+	mu       sync.Mutex
+	sessions map[string]*engineSession
+	events   map[string][]Message
+	provider Provider
+	// historyBytes is the sum of the sessions' retained event bytes, bounded by
+	// maxEngineHistoryBytes so per-session caps cannot multiply.
+	historyBytes int
+	nextSession  uint64
+	// onEvent reports whether the transport accepted the event. A refusal is
+	// backpressure, not an error: the event stays retained for session/resume.
+	onEvent func(Message) bool
+	closed  bool
 }
 type engineSession struct {
 	cancel          context.CancelFunc
 	running, closed bool
+	suspended       bool
 	turn, eventSeq  uint64
+	deliveredSeq    uint64
 	requests        map[string]Message
 	ledger          Ledger
 	historyBytes    int
@@ -58,21 +65,57 @@ func (e *Engine) emit(id string, s *engineSession, method string, fields map[str
 	fields["session_id"], fields["turn_id"], fields["event_seq"] = id, s.turn, s.eventSeq
 	params, _ := json.Marshal(fields)
 	event := Message{JSONRPC: "2.0", Method: method, Params: params}
-	if e.onEvent != nil {
-		e.onEvent(event)
-		s.historyFloor = s.eventSeq
-	} else {
-		history := e.events[id]
-		s.historyBytes += len(params)
-		history = append(history, event)
-		for len(history) > maxHistoryEvents || s.historyBytes > maxHistoryBytes {
-			s.historyBytes -= len(history[0].Params)
-			s.historyFloor++
-			history[0] = Message{}
-			history = history[1:]
-		}
-		e.events[id] = history
+	s.historyBytes += len(params)
+	e.historyBytes += len(params)
+	e.events[id] = append(e.events[id], event)
+	for len(e.events[id]) > 0 && (len(e.events[id]) > maxHistoryEvents || s.historyBytes > maxHistoryBytes) {
+		e.evictOldest(id, s)
 	}
+	// The per-session caps multiply across sessions, so the aggregate needs its own
+	// budget: reclaim from the largest holder, which may well be this session.
+	for e.historyBytes > maxEngineHistoryBytes && e.evictLargest() {
+	}
+	if e.onEvent != nil && !s.suspended {
+		if e.onEvent(event) {
+			s.deliveredSeq = s.eventSeq
+			return
+		}
+		// Transport backpressure. The event stays retained, and the client recovers
+		// with session/resume once it has drained, instead of losing the connection.
+		s.suspended = true
+	}
+}
+
+func eventSequence(event Message) uint64 {
+	var fields struct {
+		Seq uint64 `json:"event_seq"`
+	}
+	_ = json.Unmarshal(event.Params, &fields)
+	return fields.Seq
+}
+
+// flushSession replays retained events that were produced while delivery was
+// suspended. It must run with e.mu held.
+func (e *Engine) flushSession(id string, s *engineSession) error {
+	if e.onEvent == nil || s.deliveredSeq == s.eventSeq {
+		return nil
+	}
+	if s.deliveredSeq < s.historyFloor {
+		return ErrEventHistoryExpired
+	}
+	for _, event := range e.events[id] {
+		seq := eventSequence(event)
+		if seq <= s.deliveredSeq {
+			continue
+		}
+		if !e.onEvent(event) {
+			// Partial replay is safe: deliveredSeq records how far the peer got, so a
+			// later resume continues from there rather than repeating or skipping.
+			return errDeliveryRefused
+		}
+		s.deliveredSeq = seq
+	}
+	return nil
 }
 func (e *Engine) Handle(m Message) Message {
 	return e.handle(m, func() {})
@@ -85,7 +128,7 @@ func (e *Engine) handle(m Message, ready func()) Message {
 	resp := Message{JSONRPC: "2.0", ID: m.ID}
 	switch m.Method {
 	case "initialize":
-		resp.Result, _ = json.Marshal(map[string]any{"aok_version": 1, "engine": e.provider.Name(), "capabilities": []string{"cancel", "usage"}, "limits": map[string]int{
+		resp.Result, _ = json.Marshal(map[string]any{"aok_version": 1, "engine": e.provider.Name(), "capabilities": []string{"cancel", "usage", "suspend", "resume"}, "limits": map[string]int{
 			"sessions": maxSessions, "replay_requests_per_session": maxReplayRequests,
 			"request_id_bytes": maxRequestIDBytes, "text_bytes": maxTextBytes,
 		}})
@@ -110,7 +153,7 @@ func (e *Engine) handle(m Message, ready func()) Message {
 		e.mu.Unlock()
 		resp.Result, _ = json.Marshal(map[string]string{"session_id": id})
 		return resp
-	case "session/prompt", "session/abort", "session/close":
+	case "session/prompt", "session/abort", "session/close", "session/suspend", "session/resume":
 	default:
 		resp.Error = &RPCError{Code: -32601, Message: "method not found"}
 		return resp
@@ -151,6 +194,21 @@ func (e *Engine) handle(m Message, ready func()) Message {
 			return prior
 		}
 	}
+	if m.Method == "session/suspend" {
+		s.suspended = true
+		resp.Result = json.RawMessage(`{"status":"suspended"}`)
+		return resp
+	}
+	if m.Method == "session/resume" {
+		s.suspended = false
+		if err := e.flushSession(p.SessionID, s); err != nil {
+			s.suspended = true
+			resp.Error = &RPCError{Code: -32004, Message: err.Error()}
+			return resp
+		}
+		resp.Result = json.RawMessage(`{"status":"resumed"}`)
+		return resp
+	}
 	if m.Method == "session/abort" || m.Method == "session/close" {
 		if s.running {
 			s.cancel()
@@ -166,6 +224,10 @@ func (e *Engine) handle(m Message, ready func()) Message {
 	}
 	if s.closed {
 		resp.Error = &RPCError{Code: -32602, Message: "session closed"}
+		return resp
+	}
+	if s.suspended {
+		resp.Error = &RPCError{Code: -32004, Message: "session suspended"}
 		return resp
 	}
 	if s.running {

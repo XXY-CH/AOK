@@ -70,30 +70,39 @@ func serveConnection(parent context.Context, conn net.Conn, provider Provider) {
 	outgoing := make(chan []byte, outboundQueueSize)
 	var queueMu sync.Mutex
 	queuedBytes := 0
-	// Never block with Engine.mu held. Queue overflow terminates this connection;
-	// this prototype does not claim suspend/resume or resumable event delivery.
-	send := func(m Message) {
+	// Never block with Engine.mu held. Overflow is reported, not fatal: the engine
+	// retains refused events and suspends the session, so a slow peer recovers with
+	// session/resume. Marshal failure is a bug in our own message, so it still ends
+	// the connection rather than pretending backpressure.
+	enqueue := func(m Message) bool {
 		select {
 		case <-ctx.Done():
-			return
+			return false
 		default:
 		}
 		data, err := json.Marshal(m)
 		if err != nil {
 			cancel()
-			return
+			return false
 		}
 		data = append(data, '\n')
 		queueMu.Lock()
 		defer queueMu.Unlock()
 		if len(data) > maxOutboundBytes-queuedBytes {
-			cancel()
-			return
+			return false
 		}
 		select {
 		case outgoing <- data:
 			queuedBytes += len(data)
+			return true
 		default:
+			return false
+		}
+	}
+	// A response carries no sequence number and cannot be replayed, so dropping one
+	// would silently break request/response pairing: overflow ends the connection.
+	send := func(m Message) {
+		if !enqueue(m) {
 			cancel()
 		}
 	}
@@ -124,7 +133,9 @@ func serveConnection(parent context.Context, conn net.Conn, provider Provider) {
 		}
 	}()
 	engine := NewEngineWithProvider(provider)
-	engine.onEvent = send
+	// Events are sequenced and retained, so a refusal suspends the session instead
+	// of dropping the connection.
+	engine.onEvent = enqueue
 	var prompts sync.WaitGroup
 	defer func() { cancel(); engine.Close(); prompts.Wait(); <-writerDone }()
 	slots := make(chan struct{}, maxPendingPrompts)
