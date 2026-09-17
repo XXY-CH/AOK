@@ -55,8 +55,17 @@ func TestSupervisorRestartMailbox(t *testing.T) {
 	}
 	s = supervisorForTest(t, root)
 	recovered, err := s.InspectApplication(a.ApplicationID)
-	if err != nil || recovered != a {
+	if err != nil || recovered.ApplicationID != a.ApplicationID || recovered.ContextID != a.ContextID || recovered.Generation != a.Generation+1 {
 		t.Fatalf("identity changed: %v %v", recovered, err)
+	}
+	var recoveredAudit bool
+	for _, record := range s.Audit() {
+		if record.ApplicationID == a.ApplicationID && record.Action == "application.recover" {
+			recoveredAudit = true
+		}
+	}
+	if !recoveredAudit {
+		t.Fatal("missing recovery audit")
 	}
 	claimed, err = s.ClaimMailbox("worker", a.ApplicationID)
 	if err != nil || len(claimed) != 1 || !json.Valid(claimed[0].Payload) {

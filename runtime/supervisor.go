@@ -196,6 +196,22 @@ func (s *Supervisor) load() error {
 			}
 		}
 	}
+	for id, a := range s.state.Applications {
+		if a == nil || a.State == "tombstoned" {
+			continue
+		}
+		if a.Generation == ^uint64(0) {
+			return errors.New("application generation exhausted")
+		}
+		if a.Generation == 0 {
+			a.Generation = 1
+		} else {
+			a.Generation++
+		}
+		if err := s.auditLocked("supervisor", id, "application.recover", id, "allow", "new worker incarnation"); err != nil {
+			return err
+		}
+	}
 	return s.persistLocked(nil)
 }
 

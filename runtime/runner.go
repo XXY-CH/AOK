@@ -241,6 +241,28 @@ func (s *Supervisor) finishTurn(id string, m MailboxMessage, text string, usage 
 	return s.persistLocked(nil)
 }
 
+// requeueClaim returns an in-flight delivery to the durable mailbox when the
+// runner is stopped before it can commit a terminal result. The message ID is
+// the transaction identity, so a later attempt can safely resume a prepared
+// result or execute the provider again.
+func (s *Supervisor) requeueClaim(applicationID, messageID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.state.Mailbox[applicationID] {
+		m := &s.state.Mailbox[applicationID][i]
+		if m.MessageID != messageID {
+			continue
+		}
+		if m.Status != "claimed" {
+			return nil
+		}
+		m.Status = "pending"
+		_ = s.auditLocked("supervisor", applicationID, "turn.requeue", messageID, "allow", "runner stopped before commit")
+		return s.persistLocked(nil)
+	}
+	return errors.New("claimed message not found")
+}
+
 func (s *Supervisor) Result(id, messageID string) (TurnResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -291,9 +313,15 @@ func (s *Supervisor) Run(ctx context.Context, provider Provider) error {
 			}
 		}
 		if ctx.Err() != nil {
+			if requeueErr := s.requeueClaim(id, m.MessageID); requeueErr != nil {
+				return requeueErr
+			}
 			return nil
 		} // Recovery requeues the unacknowledged claim.
 		if err = s.finishTurn(id, m, text, usage, err); err != nil {
+			if requeueErr := s.requeueClaim(id, m.MessageID); requeueErr != nil {
+				return fmt.Errorf("%w (requeue failed: %v)", err, requeueErr)
+			}
 			return err
 		}
 	}
