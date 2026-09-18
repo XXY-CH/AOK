@@ -109,6 +109,12 @@ CREATE TABLE application_wake_bindings (
 );
 ```
 
+当前用户态 v0 使用 `state.db` 的 supervisor JSON snapshot 保存 LSFS artifact binding
+及 scan cursor，尚未实现上述关系表。源 commit 位于 `contexts/contexts.db`；扫描只读该
+commit log，mailbox 记录与对应 cursor 一次写入 supervisor state。两个数据库不需要
+联合写事务，崩溃时未扫描 commit 保留，已扫描事件通过持久幂等键去重。实际契约和限制见
+[control-api.md](control-api.md#当前用户态-lsfs-wake-v0)。
+
 ## Route、HostFS 与消息网关
 
 路由决策、宿主挂载授权、artifact 传输和外部消息投递必须持久化，才能在 worker、VM 或

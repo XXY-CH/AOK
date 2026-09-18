@@ -105,6 +105,10 @@ func (s *ControlServer) handle(req Message, principal string) Message {
 		TimerID       string          `json:"timer_id"`
 		DelayMS       int64           `json:"delay_ms"`
 		IntervalMS    int64           `json:"interval_ms"`
+		SourceKind    string          `json:"source_kind"`
+		SourceRef     string          `json:"source_ref"`
+		BindingID     string          `json:"binding_id"`
+		AfterCursor   int64           `json:"after_cursor"`
 	}
 	if len(req.Params) > 0 && json.Unmarshal(req.Params, &p) != nil {
 		resp.Error = &RPCError{Code: -32602, Message: "invalid params"}
@@ -158,6 +162,18 @@ func (s *ControlServer) handle(req Message, principal string) Message {
 			resp.Result = json.RawMessage(`{"ok":true}`)
 		}
 	case "event_source.create":
+		if p.SourceKind == "lsfs" {
+			if err := s.Supervisor.AddLSFSBinding(p.Principal, p.ApplicationID, p.BindingID, p.SourceRef, p.AfterCursor); err != nil {
+				resp.Error = &RPCError{Code: -32000, Message: err.Error()}
+			} else {
+				resp.Result = json.RawMessage(`{"ok":true}`)
+			}
+			break
+		}
+		if p.SourceKind != "" && p.SourceKind != "timer" {
+			resp.Error = &RPCError{Code: -32602, Message: "unsupported source kind"}
+			break
+		}
 		if p.DelayMS <= 0 || p.DelayMS > 86400000 || p.IntervalMS < 0 || p.IntervalMS > 86400000 {
 			resp.Error = &RPCError{Code: -32602, Message: "timer duration out of range"}
 			break
@@ -178,6 +194,9 @@ func (s *ControlServer) handle(req Message, principal string) Message {
 		m, err := s.Supervisor.Enqueue(p.Principal, p.ApplicationID, p.Key, p.Payload)
 		if err != nil {
 			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
+			if errors.Is(err, ErrMailboxFull) {
+				resp.Error.Code = -32005
+			}
 		} else {
 			resp.Result, _ = json.Marshal(m)
 		}
@@ -188,6 +207,13 @@ func (s *ControlServer) handle(req Message, principal string) Message {
 		} else {
 			resp.Result, _ = json.Marshal(m)
 		}
+	case "mailbox.capacity":
+		capacity, err := s.Supervisor.InspectMailboxCapacity(p.ApplicationID)
+		if err != nil {
+			resp.Error = &RPCError{Code: -32004, Message: err.Error()}
+		} else {
+			resp.Result, _ = json.Marshal(capacity)
+		}
 	case "mailbox.list":
 		m, err := s.Supervisor.ListMailbox(p.ApplicationID)
 		if err != nil {
@@ -196,11 +222,39 @@ func (s *ControlServer) handle(req Message, principal string) Message {
 			resp.Result, _ = json.Marshal(m)
 		}
 	case "event_source.list":
+		if p.SourceKind == "lsfs" {
+			bindings, err := s.Supervisor.ListLSFSBindings(p.ApplicationID)
+			if err != nil {
+				resp.Error = &RPCError{Code: -32004, Message: err.Error()}
+			} else {
+				resp.Result, _ = json.Marshal(bindings)
+			}
+			break
+		}
+		if p.SourceKind != "" && p.SourceKind != "timer" {
+			resp.Error = &RPCError{Code: -32602, Message: "unsupported source kind"}
+			break
+		}
 		timers, err := s.Supervisor.ListTimers(p.ApplicationID)
 		if err != nil {
 			resp.Error = &RPCError{Code: -32004, Message: err.Error()}
 		} else {
 			resp.Result, _ = json.Marshal(timers)
+		}
+	case "event_source.bind", "event_source.disable":
+		if p.SourceKind != "lsfs" {
+			resp.Error = &RPCError{Code: -32602, Message: "bind/disable requires lsfs source kind"}
+		} else if err := s.Supervisor.SetLSFSBindingEnabled(p.Principal, p.ApplicationID, p.BindingID, req.Method == "event_source.bind"); err != nil {
+			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
+		} else {
+			resp.Result = json.RawMessage(`{"ok":true}`)
+		}
+	case "artifact.import":
+		handle, err := s.Supervisor.ImportArtifact(p.Principal, p.ApplicationID, p.Key, p.Payload)
+		if err != nil {
+			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
+		} else {
+			resp.Result, _ = json.Marshal(map[string]string{"handle": handle})
 		}
 	case "message.ack":
 		err := s.Supervisor.AckMailbox(p.Principal, p.ApplicationID, p.MessageID)

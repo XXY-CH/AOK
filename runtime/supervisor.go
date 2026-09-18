@@ -45,6 +45,7 @@ type supervisorState struct {
 	Results      map[string]TurnResult       `json:"results"`
 	Prepared     map[string]TurnResult       `json:"prepared"`
 	Timers       map[string]ApplicationTimer `json:"timers"`
+	Bindings     map[string]WakeBinding      `json:"bindings"`
 }
 
 type Application struct {
@@ -125,7 +126,7 @@ func NewSupervisor(root string, policy CapabilitySet) (*Supervisor, error) {
 	policy.FSRead = append([]string(nil), policy.FSRead...)
 	policy.FSWrite = append([]string(nil), policy.FSWrite...)
 	policy.Tools = append([]string(nil), policy.Tools...)
-	s := &Supervisor{root: root, policy: policy, state: supervisorState{Applications: map[string]*Application{}, Mailbox: map[string][]MailboxMessage{}}, authorizer: CapabilityAuthorizer{Policy: cedarPolicyFromCapabilitySet(policy)}}
+	s := &Supervisor{root: root, policy: policy, state: supervisorState{Applications: map[string]*Application{}, Mailbox: map[string][]MailboxMessage{}, Bindings: map[string]WakeBinding{}}, authorizer: CapabilityAuthorizer{Policy: cedarPolicyFromCapabilitySet(policy)}}
 	s.lock = lock
 	if err := s.load(); err != nil {
 		s.Close()
@@ -180,6 +181,9 @@ func (s *Supervisor) load() error {
 	if s.state.Timers == nil {
 		s.state.Timers = map[string]ApplicationTimer{}
 	}
+	if s.state.Bindings == nil {
+		s.state.Bindings = map[string]WakeBinding{}
+	}
 	if err = VerifyAudit(s.state.Audit); err != nil {
 		return err
 	}
@@ -190,6 +194,10 @@ func (s *Supervisor) load() error {
 	// Claims belong to the previous worker incarnation. Unacked deliveries are
 	// replayed at least once; consumers must commit effects using the message ID.
 	for id, messages := range s.state.Mailbox {
+		if a := s.state.Applications[id]; a != nil && a.State == "tombstoned" {
+			s.expireMailboxLocked(id)
+			continue
+		}
 		for i := range messages {
 			if messages[i].Status == "claimed" {
 				s.state.Mailbox[id][i].Status = "pending"
@@ -401,12 +409,40 @@ func (s *Supervisor) RetireApplication(principal, id string) error {
 		return err
 	}
 	a.State = "tombstoned"
+	s.expireMailboxLocked(id)
+	for key, b := range s.state.Bindings {
+		if b.ApplicationID == id {
+			b.Enabled = false
+			s.state.Bindings[key] = b
+		}
+	}
 	return s.persistLocked(map[string]any{"type": "application.retire", "application_id": id})
 }
 
 func (s *Supervisor) Enqueue(principal, id, key string, payload json.RawMessage) (MailboxMessage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if strings.HasPrefix(key, "lsfs:") || strings.HasPrefix(key, "timer:") {
+		return MailboxMessage{}, errors.New("reserved event idempotency key")
+	}
+	if len(payload) > maxTextBytes {
+		return MailboxMessage{}, errors.New("invalid mailbox payload")
+	}
+	before := s.state.NextSequence
+	m, err := s.enqueueLocked(principal, id, key, payload)
+	if err != nil {
+		return MailboxMessage{}, err
+	}
+	if s.state.NextSequence != before {
+		if err := s.persistLocked(nil); err != nil {
+			return MailboxMessage{}, err
+		}
+	}
+	return m, nil
+}
+
+// enqueueLocked stages a record; callers commit it with any source progress.
+func (s *Supervisor) enqueueLocked(principal, id, key string, payload json.RawMessage) (MailboxMessage, error) {
 	a, ok := s.state.Applications[id]
 	if !ok {
 		return MailboxMessage{}, ErrApplicationNotFound
@@ -417,9 +453,16 @@ func (s *Supervisor) Enqueue(principal, id, key string, payload json.RawMessage)
 	if key == "" || len(key) > 256 {
 		return MailboxMessage{}, errors.New("invalid idempotency key")
 	}
-	if !json.Valid(payload) || len(payload) > maxTextBytes {
+	// External sends and timer creation bound the original JSON to maxTextBytes.
+	// Persisted timer JSON may be up to six times larger after HTML escaping.
+	if !json.Valid(payload) || len(payload) > 6*maxTextBytes {
 		return MailboxMessage{}, errors.New("invalid mailbox payload")
 	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return MailboxMessage{}, err
+	}
+	payload = encoded
 	for _, m := range s.state.Mailbox[id] {
 		if m.IdempotencyKey == key {
 			if !bytes.Equal(m.Payload, payload) {
@@ -429,13 +472,14 @@ func (s *Supervisor) Enqueue(principal, id, key string, payload json.RawMessage)
 			return m, nil
 		}
 	}
+	capacity := s.mailboxCapacityLocked(id)
+	if !capacity.Application.accepts(len(payload)) || !capacity.Supervisor.accepts(len(payload)) {
+		return MailboxMessage{}, ErrMailboxFull
+	}
 	s.state.NextSequence++
 	m := MailboxMessage{MessageID: fmt.Sprintf("msg-%d", s.state.NextSequence), IdempotencyKey: key, Payload: append(json.RawMessage(nil), payload...), Status: "pending", Sequence: s.state.NextSequence, CreatedAt: time.Now().UnixNano()}
 	s.state.Mailbox[id] = append(s.state.Mailbox[id], m)
 	if err := s.auditLocked(principal, id, "mailbox.enqueue", key, "allow", ""); err != nil {
-		return MailboxMessage{}, err
-	}
-	if err := s.persistLocked(map[string]any{"type": "mailbox.enqueue", "application_id": id, "message_id": m.MessageID}); err != nil {
 		return MailboxMessage{}, err
 	}
 	m.Payload = append(json.RawMessage(nil), m.Payload...)

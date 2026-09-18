@@ -95,7 +95,19 @@ func (s *Supervisor) deliverTimers() error {
 	defer s.mu.Unlock()
 	now := time.Now().UnixNano()
 	changed := false
-	for key, timer := range s.state.Timers {
+	keys := make([]string, 0, len(s.state.Timers))
+	for key := range s.state.Timers {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		a, b := s.state.Timers[keys[i]], s.state.Timers[keys[j]]
+		if a.Due == b.Due {
+			return keys[i] < keys[j]
+		}
+		return a.Due < b.Due
+	})
+	for _, key := range keys {
+		timer := s.state.Timers[key]
 		a := s.state.Applications[timer.ApplicationID]
 		if a == nil || a.State == "tombstoned" {
 			delete(s.state.Timers, key)
@@ -106,8 +118,13 @@ func (s *Supervisor) deliverTimers() error {
 			continue
 		}
 		keyID := fmt.Sprintf("timer:%s:%d", timer.TimerID, timer.Due)
-		s.state.NextSequence++
-		s.state.Mailbox[timer.ApplicationID] = append(s.state.Mailbox[timer.ApplicationID], MailboxMessage{MessageID: fmt.Sprintf("msg-%d", s.state.NextSequence), IdempotencyKey: keyID, Payload: append(json.RawMessage(nil), timer.Payload...), Status: "pending", Sequence: s.state.NextSequence, CreatedAt: now})
+		if _, err := s.enqueueLocked("supervisor", timer.ApplicationID, keyID, timer.Payload); err != nil {
+			if errors.Is(err, ErrMailboxFull) {
+				continue
+			}
+			s.restoreLocked()
+			return err
+		}
 		if timer.Interval == 0 {
 			delete(s.state.Timers, key)
 		} else {
@@ -288,6 +305,9 @@ func (s *Supervisor) Run(ctx context.Context, provider Provider) error {
 		case <-ticker.C:
 		}
 		if err := s.deliverTimers(); err != nil {
+			return err
+		}
+		if err := s.deliverLSFS(); err != nil {
 			return err
 		}
 		id, m, err := s.claimTurn()

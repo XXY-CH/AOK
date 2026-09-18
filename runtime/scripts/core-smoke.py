@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real supervisor process, crash recovery, headless timer and mailbox probe."""
+"""Real supervisor process, crash recovery, headless timer and LSFS wake probe."""
 import argparse
 import json
 import os
@@ -83,6 +83,31 @@ def main():
                 time.sleep(0.1)
             else:
                 raise AssertionError("headless timer did not commit inference")
+            watcher = call("application.create", {"owner_agent": "watcher", "wake_policy": "on_event"})
+            wid = watcher["application_id"]
+            source = {"application_id": wid, "source_kind": "lsfs", "binding_id": "artifacts"}
+            call("event_source.create", source)
+            call("event_source.disable", source)
+            artifact = {"application_id": wid, "idempotency_key": "report", "payload": {"report": "ready"}}
+            imported = call("artifact.import", artifact)
+            process.kill()
+            process.communicate(timeout=10)
+            start()
+            binding = call("event_source.list", source)[0]
+            assert not binding["enabled"] and binding["cursor"] == 0, binding
+            assert call("artifact.import", artifact) == imported
+            call("event_source.bind", source)
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline:
+                mailbox = call("mailbox.list", {"application_id": wid})
+                if len(mailbox) == 1 and mailbox[0]["status"] == "acked":
+                    assert mailbox[0]["payload"]["commit"]["handle"] == imported["handle"]
+                    result = call("message.result", {"application_id": wid, "message_id": mailbox[0]["message_id"]})
+                    assert result["status"] == "completed" and result["checkpoint"]
+                    break
+                time.sleep(0.1)
+            else:
+                raise AssertionError("headless LSFS event did not commit inference")
             verdict = call("capability.check", {"application_id": aid, "object": "net", "action": "connect"})
             assert not verdict["allowed"]
             process.terminate()
@@ -93,7 +118,15 @@ def main():
             restored = call("application.inspect", {"application_id": active["application_id"]})
             assert restored["checkpoint_ref"] == current["checkpoint_ref"]
             assert restored["tokens_used"] == current["tokens_used"]
-            print(json.dumps({"check": "AOK_CORE_SMOKE", "status": "pass", "provider": "llama.cpp" if args.llama_endpoint else "echo", "crash_replay": True, "headless_timer": True, "tokens_used": current["tokens_used"]}))
+            # Wait for the restored source cursor to pass the runner writebacks.
+            artifact_cursor = mailbox[0]["payload"]["commit"]["cursor"]
+            deadline = time.monotonic() + 10
+            while call("event_source.list", source)[0]["cursor"] <= artifact_cursor:
+                assert time.monotonic() < deadline, "LSFS cursor did not pass writebacks"
+                time.sleep(0.02)
+            recovered_mailbox = call("mailbox.list", {"application_id": wid})
+            assert len(recovered_mailbox) == 1 and recovered_mailbox[0]["message_id"] == mailbox[0]["message_id"]
+            print(json.dumps({"check": "AOK_CORE_SMOKE", "status": "pass", "provider": "llama.cpp" if args.llama_endpoint else "echo", "crash_replay": True, "headless_timer": True, "headless_lsfs": True, "lsfs_restart": True, "tokens_used": current["tokens_used"]}))
         finally:
             if process is not None and process.poll() is None:
                 process.terminate()
