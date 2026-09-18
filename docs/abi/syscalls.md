@@ -44,6 +44,32 @@
 `freeze`、`resume`、`abort` 与 ACP `session/cancel` 不同：ACP cancel 只请求结束当前
 prompt turn；AOK freeze 停止所有绑定 task；abort 是内核对象上的取消操作。
 
+### 已实现的内核事件切片
+
+`0009-aok-event-wake.patch` 在原 timer fd 上增加 `poll` 和有界 port 通知源，
+不新增 syscall 编号。此处是 arm64 原型 ABI，尚未连接 supervisor 的持久 registry。
+
+| 操作 | 当前行为与权限 |
+|---|---|
+| `poll(source_fd)` | `READ`；当前 fd cursor 后有未确认事件时返回 `POLLIN`，无 `READ` 返回 `POLLERR`。读取推进 cursor，普通 `dup` 共享 cursor，AOK duplicate 创建新 cursor。 |
+| `AOK_EVENT_SOURCE_PORT` (`kind=2`) | 创建时 flags、first_ns、interval_ns 必须为零；与 timer 一样最多保留 64 条未确认事件。 |
+| `ioctl(source_fd, AOK_EVENT_POST, 0)` (`0xa021`) | `WRITE`；仅 port，入队一条无 payload 的通知。满队列返回 `EAGAIN`，不消耗 event ID/sequence，ack 后由发送方重试。 |
+| `ioctl(source_fd, AOK_EVENT_SET_TARGET, &target)` (`0xa020`) | `WRITE` on source + `SIGNAL` on target aproc；原子绑定 identity、policy 与有引用保护的 aproc fd。 |
+
+`struct aok_event_target` 固定为 16 bytes：`__u64 application_id`、`__s32 aproc_fd`、
+`__u32 wake_policy`。`aproc_fd=-1` 配合 `MANUAL` 解除目标；关闭传入 fd 不解除已授权绑定。
+原 `aok_event_bind` 只设置标签与 policy，并解除旧目标；数字 `application_id` 不授予唤醒权限。
+
+有未确认或合并中的事件时，换 identity、目标或自动 policy 返回 `EBUSY`，避免旧事件被
+重标或投给新目标；保留原 identity 并切到 `MANUAL`/解除目标仍允许。ack 的权限域仍是
+source handle，而不是独立 Application registry。
+
+timer/port 入队后通过 workqueue 恢复显式绑定的 `FROZEN` aproc；`ON_EVENT` 和
+`ON_QUIESCENT` 在此切片均只恢复已有 frozen task。`MANUAL` 不恢复，资源超限造成的冻结
+不自动恢复，failed/reaped 对象不会复活。显式授权 resume 保持原有语义。
+该路径不创建 dormant Application、不恢复 checkpoint、不消费或 ack 事件，也不提供跨
+进程/VM 的 durable replay。timer 满队列继续使用已有 coalesce 语义。
+
 ## Budget
 
 资源账户层级为 `subos -> user principal -> job -> aproc -> turn`。v1 资源：

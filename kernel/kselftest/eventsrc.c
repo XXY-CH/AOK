@@ -32,7 +32,7 @@
 _Static_assert(sizeof(struct aok_event_source_attr) == 56, "source attr");
 _Static_assert(sizeof(struct aok_event_record) == 72, "event record");
 
-#define AOK_EVENTSRC_TEST_PLAN 37
+#define AOK_EVENTSRC_TEST_PLAN 38
 
 #define AOK_RIGHTS_SOURCE_INITIAL \
 	(AOK_RIGHT_INSPECT | AOK_RIGHT_DUPLICATE | AOK_RIGHT_READ | \
@@ -205,7 +205,10 @@ int main(int argc, char **argv)
 	ok = ok && read_event(fd, &ev) == sizeof(ev) &&
 		ev.application_id == 42;
 	ksft_test_result(ok, "bind stamps application id on events\n");
-	ok = !syscall(NR_AOK_EVENT_BIND, fd, 7, AOK_WAKE_MANUAL);
+	EXPECT_ERR(syscall(NR_AOK_EVENT_BIND, fd, 7, AOK_WAKE_MANUAL), EBUSY,
+		   "pending event identity cannot be rebound");
+	ok = !syscall(NR_AOK_EVENT_ACK, fd, ev.event_id) &&
+	      !syscall(NR_AOK_EVENT_BIND, fd, 7, AOK_WAKE_MANUAL);
 	ksft_test_result(ok, "rebinding replaces the application id\n");
 	EXPECT_ERR(syscall(NR_AOK_EVENT_BIND, fd, 1, 3), EINVAL,
 		   "unknown wake policy");
@@ -235,7 +238,7 @@ int main(int argc, char **argv)
 	EXPECT_ERR(syscall(NR_AOK_SOURCE_CREATE, &attr, &info), EINVAL,
 		   "source reserved field");
 	attr.reserved = 0;
-	attr.kind = 2;
+	attr.kind = 99;
 	EXPECT_ERR(syscall(NR_AOK_SOURCE_CREATE, &attr, &info), EINVAL,
 		   "unknown source kind");
 	attr.kind = AOK_EVENT_SOURCE_TIMER;

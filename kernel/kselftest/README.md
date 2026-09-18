@@ -4,10 +4,10 @@
 from the initial PID 1 of an arm64 QEMU guest. It is a test init, not the AOK
 supervisor. No mock or userspace replacement implements these calls.
 
-The 41 checks cover identity, argument sizing, invalid addresses/fds, rights
+The 44 checks cover identity, argument sizing, invalid addresses/fds, rights
 attenuation, fork/exec, PID namespace denial, fd exhaustion, copyout rollback,
 and 4000 concurrent duplicate/inspect/close cycles. The same binary verifies
-three `ENOSYS` results with `CONFIG_AOK_EXPERIMENTAL=n`.
+four `ENOSYS` results with `CONFIG_AOK_EXPERIMENTAL=n`.
 
 ## Build and Run
 
@@ -47,3 +47,11 @@ images, exported UAPI headers, initramfs, configs, hashes and serial logs. Overr
 The runner fails on timeout, panic, Oops, warning, failing TAP results or a missing
 `AOK_OBJECT_TEST=pass` marker. This is object-slice evidence only; task binding,
 resource domains and event sources need their own tests before integration.
+
+`eventwake.c` exercises source polling, bounded port notifications and authorized
+timer/port wake of a frozen aproc using a real child-task heartbeat. It also checks
+manual policy, detach, resource freeze, terminal states and repeated freeze/wake.
+`make aok-object-build` packs it into `eventwake-initramfs.cpio.gz`; run
+`make aok-eventwake-test` (optionally with `AOK_OBJECT_OUTPUT` for a separate build).
+See [event wake validation](../../docs/KERNEL-EVENT-WAKE-VALIDATION.md) for results
+and the boundary between this volatile kernel source and the durable supervisor.

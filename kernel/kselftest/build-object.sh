@@ -43,6 +43,7 @@ pack_initramfs aok-object-test initramfs.cpio.gz
 pack_initramfs aok-task-test task-initramfs.cpio.gz
 pack_initramfs aok-resource-test resource-initramfs.cpio.gz
 pack_initramfs aok-eventsrc-test eventsrc-initramfs.cpio.gz
+pack_initramfs aok-eventwake-test eventwake-initramfs.cpio.gz
 pack_initramfs aok-core-test core-initramfs.cpio.gz
 pack_initramfs aok-core-test core-initramfs.cpio.gz
 "$source_dir/scripts/config" --file "$object_dir/.config" --disable AOK_EXPERIMENTAL

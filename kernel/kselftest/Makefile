@@ -7,7 +7,11 @@ CPPFLAGS += -I$(OUTPUT)/headers/include -I$(LINUX)/tools/testing/selftests
 LDLIBS += -pthread
 
 .PHONY: all clean
-all: $(OUTPUT)/aok-object-test $(OUTPUT)/aok-task-test $(OUTPUT)/aok-resource-test $(OUTPUT)/aok-eventsrc-test $(OUTPUT)/aok-core-test
+all: $(OUTPUT)/aok-object-test $(OUTPUT)/aok-task-test $(OUTPUT)/aok-resource-test $(OUTPUT)/aok-eventsrc-test $(OUTPUT)/aok-eventwake-test $(OUTPUT)/aok-core-test
+
+$(OUTPUT)/aok-eventwake-test: eventwake.c $(OUTPUT)/headers/include/linux/aok.h
+	mkdir -p $(OUTPUT)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -static $< $(LDLIBS) -o $@
 
 $(OUTPUT)/aok-core-test: core.c $(OUTPUT)/headers/include/linux/aok.h
 	mkdir -p $(OUTPUT)
@@ -30,4 +34,4 @@ $(OUTPUT)/aok-task-test: task.c $(OUTPUT)/headers/include/linux/aok.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -static $< $(LDLIBS) -o $@
 
 clean:
-	rm -f $(OUTPUT)/aok-object-test $(OUTPUT)/aok-task-test $(OUTPUT)/aok-resource-test $(OUTPUT)/aok-eventsrc-test $(OUTPUT)/aok-core-test
+	rm -f $(OUTPUT)/aok-object-test $(OUTPUT)/aok-task-test $(OUTPUT)/aok-resource-test $(OUTPUT)/aok-eventsrc-test $(OUTPUT)/aok-eventwake-test $(OUTPUT)/aok-core-test

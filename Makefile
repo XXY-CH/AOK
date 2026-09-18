@@ -103,6 +103,12 @@ aok-eventsrc-test-disabled:
 	 AOK_TEST_MARKER=AOK_EVENTSRC_TEST \
 	 AOK_TEST_ARGS=--expect-disabled sh kernel/kselftest/run-object.sh
 
+.PHONY: aok-eventwake-test
+aok-eventwake-test:
+	@AOK_INITRD="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/eventwake-initramfs.cpio.gz" \
+	 AOK_SERIAL_LOG="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/serial-eventwake.log" \
+	 AOK_TEST_MARKER=AOK_EVENTWAKE_TEST sh kernel/kselftest/run-object.sh
+
 aok-candidate-check:
 	@test -n "$(PATCH)" || { echo 'usage: make aok-candidate-check PATCH=kernel/patches/0003-...patch' >&2; exit 2; }
 	@sh kernel/patches/check-candidate.sh "$(PATCH)"

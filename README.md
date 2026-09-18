@@ -82,10 +82,11 @@ capability, resource domains, cache compatibility, and usage reconciliation.
 
 ## Core capabilities
 
-- **AOK Linux kernel patch series** (`0001`–`0008`, on top of `linux-6.18.y`):
+- **AOK Linux kernel patch series** (`0001`–`0009`, on top of `linux-6.18.y`):
   object handles, PID1 root capability bootstrap, aproc/task/pidfd lifecycle,
   resource budget narrowing with CPU/RSS observation and token accounting,
-  timer event sources with ack/replay, and the inference capability.
+  timer/port event sources with poll, ack/replay, authorized aproc wake, and the
+  inference capability.
 - **Durable Go supervisor**: SQLite WAL state, application lifecycle, mailbox
   replay, timers, checkpoints, context CAS, and an audit hash chain.
 - **Inference backends**: llama.cpp, the Anthropic Messages API, a loopback
@@ -106,9 +107,10 @@ replay, supervised engine processes, runtime resource enforcement, KV
 save/restore, the Metal adapter, the Anthropic adapter, routing, the vsock API,
 PID1/initfs, and the capability sandbox.
 
-Kernel-side validation totals: object 44, task 64, event-source 37, resource
-53, and core 46 kselftests passing across enabled and disabled kernel builds,
-plus reproducible patch-series rebuilds.
+Kernel-side validation totals for the enabled build are: object 44, task 64,
+resource 53, event-source 38, event-wake 37, and core 46 kselftests passing.
+The disabled build separately passes object 4, task 11, resource 8, and
+event-source 6 `ENOSYS` checks, with reproducible patch-series rebuilds.
 
 Known boundaries remain explicit: `ANTHROPIC_API_KEY` is not configured on the
 development machine, so live Anthropic service verification is blocked; the
@@ -160,6 +162,7 @@ make aok-object-test
 make aok-task-test
 make aok-resource-test
 make aok-eventsrc-test
+make aok-eventwake-test
 make aok-core-test
 ```
 
@@ -204,6 +207,7 @@ The generated archive contains `/init`, `/sbin/aok-supervisor`,
 | --- | --- |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | layering, application model, ABI boundaries |
 | [docs/IMPLEMENTATION-STATUS.md](docs/IMPLEMENTATION-STATUS.md) | frozen decisions and current boundaries |
+| [docs/KERNEL-EVENT-WAKE-VALIDATION.md](docs/KERNEL-EVENT-WAKE-VALIDATION.md) | kernel timer/port poll and aproc wake evidence |
 | [docs/PLAN-L0-AGENT-KERNEL.md](docs/PLAN-L0-AGENT-KERNEL.md) | L0 agent-kernel design plan |
 | [docs/PLAN-AOK-DEEP.md](docs/PLAN-AOK-DEEP.md) | deep design decisions with research sources |
 | [docs/abi/](docs/abi/) | fd ABI, engine protocol, control API, application/context models |

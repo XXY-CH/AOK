@@ -8,3 +8,4 @@
 0006-aok-inference-capability.patch
 0007-aok-token-budget-enforcement.patch
 0008-aok-observed-resource-enforcement.patch
+0009-aok-event-wake.patch

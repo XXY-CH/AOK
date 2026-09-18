@@ -1,0 +1,687 @@
+diff --git a/include/linux/aok.h b/include/linux/aok.h
+index 89214b0..aa4a1dd 100644
+--- a/include/linux/aok.h
++++ b/include/linux/aok.h
+@@ -3,9 +3,12 @@
+ #define _LINUX_AOK_H
+ 
+ #include <linux/hrtimer.h>
++#include <linux/mutex.h>
+ #include <linux/refcount.h>
+ #include <linux/spinlock_types.h>
+ #include <linux/types.h>
++#include <linux/wait.h>
++#include <linux/workqueue.h>
+ #include <uapi/linux/aok.h>
+ 
+ struct file;
+@@ -31,6 +34,8 @@ struct aok_aproc {
+ 	u64 aid;
+ 	u32 state;
+ 	spinlock_t lock;		/* guards tasks/events/state */
++	struct mutex transition_lock; /* serializes freezer side effects */
++	bool resource_frozen;
+ 	struct list_head tasks;		/* member tasks via task->aok_tasks */
+ 	unsigned long ntasks;
+ 	unsigned long task_total;
+@@ -79,7 +84,12 @@ struct aok_event_source {
+ 	unsigned int live;
+ 	u64 koid;
+ 	u64 application_id;
++	u32 kind;
+ 	u32 wake_policy;
++	wait_queue_head_t wait;
++	struct mutex bind_lock; /* target lifetime and binding changes */
++	struct file *wake_target;
++	struct delayed_work wake_work;
+ 	u64 event_seq;			/* last assigned */
+ 	u64 event_id;			/* last issued, never reused */
+ 	unsigned long coalesced;	/* merged expiries awaiting a free slot */
+diff --git a/include/uapi/linux/aok.h b/include/uapi/linux/aok.h
+index 4af93e3..eb43cec 100644
+--- a/include/uapi/linux/aok.h
++++ b/include/uapi/linux/aok.h
+@@ -151,6 +151,18 @@ struct aok_budget_status {
+ 
+ #define AOK_EVENT_SOURCE_TIMER 1U
+ #define AOK_EVENT_KIND_TIMER 1U
++#define AOK_EVENT_SOURCE_PORT 2U
++#define AOK_EVENT_KIND_PORT 2U
++
++/* Event-source fd ioctls; SET_TARGET requires SIGNAL on the aproc fd. */
++#define AOK_EVENT_SET_TARGET 0xa020U
++#define AOK_EVENT_POST 0xa021U
++
++struct aok_event_target {
++	__u64 application_id;
++	__s32 aproc_fd; /* -1 detaches; wake_policy must then be MANUAL */
++	__u32 wake_policy;
++};
+ 
+ #define AOK_TIMER_ONESHOT 0U
+ #define AOK_TIMER_PERIODIC 1U
+diff --git a/kernel/aok.c b/kernel/aok.c
+index e05f665..7a3dfc5 100644
+--- a/kernel/aok.c
++++ b/kernel/aok.c
+@@ -492,6 +492,7 @@ SYSCALL_DEFINE3(aok_aproc_create,
+ 		goto err_free;
+ 	refcount_set(&aproc->refs, 1);
+ 	spin_lock_init(&aproc->lock);
++	mutex_init(&aproc->transition_lock);
+ 	INIT_LIST_HEAD(&aproc->tasks);
+ 	aproc->state = AOK_APROC_STATE_RUNNING;
+ 	aproc->rights_ceiling = info.rights;
+@@ -737,92 +738,80 @@ static void aok_put_tasks(struct task_struct **tasks, unsigned int count)
+ 	kvfree(tasks);
+ }
+ 
+-SYSCALL_DEFINE1(aok_aproc_freeze, int, fd)
++/* Snapshot membership and change state together; late joins inherit freeze_req.
++ * The mutex also covers freezer side effects, including asynchronous wake. */
++static int aok_transition_aproc(struct aok_aproc *aproc, u32 state,
++				bool automatic, bool resource)
+ {
+-	struct task_struct **tasks;
+-	struct aok_handle *handle;
+-	struct aok_aproc *aproc;
+-	unsigned int count, i;
+-	struct fd f;
+-	bool transitioned;
++	struct task_struct *task, **tasks;
++	unsigned int count = 0, i;
++	bool was_frozen;
++	int ret = 0;
+ 
+-	f = fdget(fd);
+-	if (fd_empty(f))
+-		return -EBADF;
+-	if (fd_file(f)->f_op != &aok_aproc_fops) {
+-		fdput(f);
+-		return -EINVAL;
+-	}
+-	handle = fd_file(f)->private_data;
+-	aproc = handle->aproc;
+-	if (!(handle->rights & AOK_RIGHT_SIGNAL)) {
+-		fdput(f);
+-		return -EACCES;
++	mutex_lock(&aproc->transition_lock);
++	tasks = kvmalloc_array(AOK_MAX_TASKS, sizeof(*tasks), GFP_KERNEL);
++	if (!tasks) {
++		ret = -ENOMEM;
++		goto out_mutex;
+ 	}
+ 	spin_lock(&aproc->lock);
+-	if (aproc->state == AOK_APROC_STATE_FROZEN) {
+-		spin_unlock(&aproc->lock);
+-		fdput(f);
+-		return 0;
++	was_frozen = aproc->state == AOK_APROC_STATE_FROZEN;
++	if (state == AOK_APROC_STATE_FROZEN && was_frozen) {
++		aproc->resource_frozen |= resource;
++		goto out_spin;
++	}
++	if (state == AOK_APROC_STATE_FAILED &&
++	    aproc->state == AOK_APROC_STATE_FAILED)
++		goto out_spin;
++	if ((state == AOK_APROC_STATE_FROZEN &&
++	     aproc->state != AOK_APROC_STATE_RUNNING) ||
++	    (state == AOK_APROC_STATE_RUNNING && !was_frozen) ||
++	    aproc->state == AOK_APROC_STATE_REAPED) {
++		ret = -EINVAL;
++		goto out_spin;
+ 	}
+-	if (aproc->state != AOK_APROC_STATE_RUNNING) {
+-		spin_unlock(&aproc->lock);
+-		fdput(f);
+-		return -EINVAL;
++	if (automatic && aproc->resource_frozen) {
++		ret = -EAGAIN;
++		goto out_spin;
+ 	}
+-	spin_unlock(&aproc->lock);
+-
+-	/*
+-	 * Collect the members before committing the transition: an
+-	 * allocation failure here leaves the aproc RUNNING and the call
+-	 * retryable, instead of committing FROZEN with nobody frozen.
+-	 */
+-	tasks = aok_collect_tasks(aproc, &count);
+-	if (IS_ERR(tasks)) {
+-		fdput(f);
+-		return PTR_ERR(tasks);
+-	}
+-
+-	spin_lock(&aproc->lock);
+-	transitioned = false;
+-	if (aproc->state == AOK_APROC_STATE_RUNNING) {
+-		aproc->state = AOK_APROC_STATE_FROZEN;
+-		aproc->freeze_req = true;
+-		aok_emit_locked(aproc, AOK_EVENT_STATE, 0, aproc->state);
+-		transitioned = true;
+-	} else if (aproc->state != AOK_APROC_STATE_FROZEN) {
+-		/* Lost a race with abort/reap; touch nothing. */
+-		spin_unlock(&aproc->lock);
+-		aok_put_tasks(tasks, count);
+-		fdput(f);
+-		return -EINVAL;
++	aproc->state = state;
++	aproc->freeze_req = state == AOK_APROC_STATE_FROZEN;
++	aproc->resource_frozen = resource;
++	list_for_each_entry(task, &aproc->tasks, aok_tasks) {
++		get_task_struct(task);
++		tasks[count++] = task;
++		WRITE_ONCE(task->aok_freeze, aproc->freeze_req);
+ 	}
++	aok_emit_locked(aproc, AOK_EVENT_STATE, 0, state);
+ 	spin_unlock(&aproc->lock);
+-
+-	/*
+-	 * The static key pairs with resume/abort of the same freeze, so only
+-	 * the caller that performed the transition takes a reference.
+-	 */
+-	if (transitioned)
++	if (state == AOK_APROC_STATE_FROZEN)
+ 		aok_freezer_enter();
+ 	for (i = 0; i < count; i++) {
+-		WRITE_ONCE(tasks[i]->aok_freeze, true);
+-		freeze_task(tasks[i]);
++		if (state == AOK_APROC_STATE_FROZEN) {
++			freeze_task(tasks[i]);
++		} else {
++			__thaw_task(tasks[i]);
++			if (state == AOK_APROC_STATE_FAILED)
++				send_sig(SIGKILL, tasks[i], 0);
++		}
+ 	}
++	if (was_frozen)
++		aok_freezer_leave();
+ 	aok_put_tasks(tasks, count);
+-	fdput(f);
+-	return 0;
++	goto out_mutex;
++out_spin:
++	spin_unlock(&aproc->lock);
++	kvfree(tasks);
++out_mutex:
++	mutex_unlock(&aproc->transition_lock);
++	return ret;
+ }
+ 
+-SYSCALL_DEFINE1(aok_aproc_resume, int, fd)
++static int aok_transition_fd(int fd, u32 state)
+ {
+-	struct task_struct **tasks;
+ 	struct aok_handle *handle;
+-	struct aok_aproc *aproc;
+-	unsigned int count, i;
+ 	struct fd f;
+-	bool transitioned;
+-	u32 state_after;
++	int ret;
+ 
+ 	f = fdget(fd);
+ 	if (fd_empty(f))
+@@ -832,134 +821,29 @@ SYSCALL_DEFINE1(aok_aproc_resume, int, fd)
+ 		return -EINVAL;
+ 	}
+ 	handle = fd_file(f)->private_data;
+-	aproc = handle->aproc;
+ 	if (!(handle->rights & AOK_RIGHT_SIGNAL)) {
+ 		fdput(f);
+ 		return -EACCES;
+ 	}
+-	spin_lock(&aproc->lock);
+-	if (aproc->state != AOK_APROC_STATE_FROZEN) {
+-		spin_unlock(&aproc->lock);
+-		fdput(f);
+-		return -EINVAL;
+-	}
+-	spin_unlock(&aproc->lock);
+-
+-	/*
+-	 * Collect before transitioning: on failure the aproc stays FROZEN
+-	 * and the freezer reference is untouched, leaving the call
+-	 * retryable instead of stranding frozen tasks with no static key.
+-	 */
+-	tasks = aok_collect_tasks(aproc, &count);
+-	if (IS_ERR(tasks)) {
+-		fdput(f);
+-		return PTR_ERR(tasks);
+-	}
++	ret = aok_transition_aproc(handle->aproc, state, false, false);
++	fdput(f);
++	return ret;
++}
+ 
+-	spin_lock(&aproc->lock);
+-	transitioned = false;
+-	state_after = aproc->state;
+-	if (state_after == AOK_APROC_STATE_FROZEN) {
+-		aproc->state = AOK_APROC_STATE_RUNNING;
+-		aproc->freeze_req = false;
+-		aok_emit_locked(aproc, AOK_EVENT_STATE, 0, aproc->state);
+-		transitioned = true;
+-		state_after = AOK_APROC_STATE_RUNNING;
+-	}
+-	spin_unlock(&aproc->lock);
++SYSCALL_DEFINE1(aok_aproc_freeze, int, fd)
++{
++	return aok_transition_fd(fd, AOK_APROC_STATE_FROZEN);
++}
+ 
+-	for (i = 0; i < count; i++) {
+-		WRITE_ONCE(tasks[i]->aok_freeze, false);
+-		__thaw_task(tasks[i]);
+-	}
+-	aok_put_tasks(tasks, count);
+-	/* Pairs with the freeze that transitioned into FROZEN. */
+-	if (transitioned)
+-		aok_freezer_leave();
+-	fdput(f);
++SYSCALL_DEFINE1(aok_aproc_resume, int, fd)
++{
+ 	/* No runtime checkpoint registry exists in this slice. */
+-	return state_after == AOK_APROC_STATE_RUNNING ?
+-	       AOK_RESUME_RECOVERY_NONE : -EINVAL;
++	return aok_transition_fd(fd, AOK_APROC_STATE_RUNNING);
+ }
+ 
+ SYSCALL_DEFINE1(aok_aproc_abort, int, fd)
+ {
+-	struct task_struct **tasks;
+-	struct aok_handle *handle;
+-	struct aok_aproc *aproc;
+-	unsigned int count, i;
+-	struct fd f;
+-	bool transitioned;
+-	bool was_frozen;
+-
+-	f = fdget(fd);
+-	if (fd_empty(f))
+-		return -EBADF;
+-	if (fd_file(f)->f_op != &aok_aproc_fops) {
+-		fdput(f);
+-		return -EINVAL;
+-	}
+-	handle = fd_file(f)->private_data;
+-	aproc = handle->aproc;
+-	if (!(handle->rights & AOK_RIGHT_SIGNAL)) {
+-		fdput(f);
+-		return -EACCES;
+-	}
+-	spin_lock(&aproc->lock);
+-	if (aproc->state == AOK_APROC_STATE_FAILED) {
+-		spin_unlock(&aproc->lock);
+-		fdput(f);
+-		return 0;
+-	}
+-	if (aproc->state == AOK_APROC_STATE_REAPED) {
+-		spin_unlock(&aproc->lock);
+-		fdput(f);
+-		return -EINVAL;
+-	}
+-	spin_unlock(&aproc->lock);
+-
+-	/*
+-	 * Collect before committing FAILED: an allocation failure leaves the
+-	 * previous state intact instead of a terminal FAILED aproc whose
+-	 * tasks were never terminated.
+-	 */
+-	tasks = aok_collect_tasks(aproc, &count);
+-	if (IS_ERR(tasks)) {
+-		fdput(f);
+-		return PTR_ERR(tasks);
+-	}
+-
+-	spin_lock(&aproc->lock);
+-	transitioned = false;
+-	was_frozen = false;
+-	if (aproc->state == AOK_APROC_STATE_FAILED) {
+-		spin_unlock(&aproc->lock);
+-		aok_put_tasks(tasks, count);
+-		fdput(f);
+-		return 0;
+-	}
+-	if (aproc->state != AOK_APROC_STATE_REAPED) {
+-		was_frozen = aproc->state == AOK_APROC_STATE_FROZEN;
+-		aproc->state = AOK_APROC_STATE_FAILED;
+-		aproc->freeze_req = false;
+-		aok_emit_locked(aproc, AOK_EVENT_STATE, 0, aproc->state);
+-		transitioned = true;
+-	}
+-	spin_unlock(&aproc->lock);
+-
+-	if (transitioned) {
+-		for (i = 0; i < count; i++) {
+-			WRITE_ONCE(tasks[i]->aok_freeze, false);
+-			__thaw_task(tasks[i]);
+-			send_sig(SIGKILL, tasks[i], 0);
+-		}
+-	}
+-	aok_put_tasks(tasks, count);
+-	/* Pairs with the freeze that transitioned into FROZEN. */
+-	if (transitioned && was_frozen)
+-		aok_freezer_leave();
+-	fdput(f);
+-	return 0;
++	return aok_transition_fd(fd, AOK_APROC_STATE_FAILED);
+ }
+ 
+ SYSCALL_DEFINE1(aok_aproc_reap, int, fd)
+@@ -1089,28 +973,7 @@ static int aok_copy_status_out(struct aok_budget_status __user *ustatus,
+ 
+ static void aok_force_freeze(struct aok_aproc *aproc)
+ {
+-	struct task_struct **tasks;
+-	unsigned int count, i;
+-	bool transitioned = false;
+-
+-	tasks = aok_collect_tasks(aproc, &count);
+-	if (IS_ERR(tasks))
+-		return;
+-	spin_lock(&aproc->lock);
+-	if (aproc->state == AOK_APROC_STATE_RUNNING) {
+-		aproc->state = AOK_APROC_STATE_FROZEN;
+-		aproc->freeze_req = true;
+-		aok_emit_locked(aproc, AOK_EVENT_STATE, 0, aproc->state);
+-		transitioned = true;
+-	}
+-	spin_unlock(&aproc->lock);
+-	if (transitioned)
+-		aok_freezer_enter();
+-	for (i = 0; transitioned && i < count; i++) {
+-		WRITE_ONCE(tasks[i]->aok_freeze, true);
+-		freeze_task(tasks[i]);
+-	}
+-	aok_put_tasks(tasks, count);
++	aok_transition_aproc(aproc, AOK_APROC_STATE_FROZEN, false, true);
+ }
+ 
+ /*
+@@ -1244,9 +1107,9 @@ SYSCALL_DEFINE2(aok_budget_get, int, fd,
+ 	if (over)
+ 		status.res_state = AOK_RES_STATE_OVER;
+ 	spin_unlock(&aproc->lock);
+-	fdput(f);
+ 	if (over)
+ 		aok_force_freeze(aproc);
++	fdput(f);
+ 	return aok_copy_status_out(ustatus, &status);
+ }
+ 
+@@ -1308,8 +1171,8 @@ SYSCALL_DEFINE2(aok_token_usage, int, fd,
+ 		aproc->last_usage_seq = usage.usage_seq;
+ 		aok_res_eval_locked(aproc);
+ 		spin_unlock(&aproc->lock);
+-		fdput(f);
+ 		aok_force_freeze(aproc);
++		fdput(f);
+ 		return -EDQUOT;
+ 	}
+ 	aproc->tokens_used = settled;
+@@ -1355,6 +1218,34 @@ static void aok_source_fire_locked(struct aok_event_source *source)
+ 	source->live++;
+ }
+ 
++static void aok_source_wake_work(struct work_struct *work)
++{
++	struct aok_event_source *source = container_of(to_delayed_work(work),
++					struct aok_event_source, wake_work);
++	struct aok_handle *target;
++	bool wake;
++	int ret = 0;
++
++	mutex_lock(&source->bind_lock);
++	spin_lock_irq(&source->lock);
++	wake = source->live && source->wake_policy != AOK_WAKE_MANUAL;
++	spin_unlock_irq(&source->lock);
++	if (wake && source->wake_target) {
++		target = source->wake_target->private_data;
++		ret = aok_transition_aproc(target->aproc,
++					 AOK_APROC_STATE_RUNNING, true, false);
++	}
++	mutex_unlock(&source->bind_lock);
++	if (ret == -ENOMEM)
++		schedule_delayed_work(&source->wake_work, max(1, HZ / 10));
++}
++
++static void aok_source_notify(struct aok_event_source *source)
++{
++	wake_up_interruptible_poll(&source->wait, EPOLLIN | EPOLLRDNORM);
++	schedule_delayed_work(&source->wake_work, 0);
++}
++
+ static enum hrtimer_restart aok_timer_fn(struct hrtimer *timer)
+ {
+ 	struct aok_event_source *source =
+@@ -1364,6 +1255,7 @@ static enum hrtimer_restart aok_timer_fn(struct hrtimer *timer)
+ 	spin_lock_irqsave(&source->lock, flags);
+ 	aok_source_fire_locked(source);
+ 	spin_unlock_irqrestore(&source->lock, flags);
++	aok_source_notify(source);
+ 
+ 	if (source->periodic) {
+ 		hrtimer_forward_now(timer, ns_to_ktime(source->interval_ns));
+@@ -1403,6 +1295,9 @@ static int aok_event_release(struct inode *inode, struct file *file)
+ 
+ 	if (refcount_dec_and_test(&source->refs)) {
+ 		hrtimer_cancel(&source->timer);
++		cancel_delayed_work_sync(&source->wake_work);
++		if (source->wake_target)
++			fput(source->wake_target);
+ 		kfree(source);
+ 	}
+ 	kfree(handle);
+@@ -1444,7 +1339,7 @@ static ssize_t aok_event_read(struct file *file, char __user *buf,
+ 	rec.application_id = source->application_id;
+ 	rec.event_id = node->event_id;
+ 	rec.event_seq = node->event_seq;
+-	rec.kind = AOK_EVENT_KIND_TIMER;
++	rec.kind = source->kind;
+ 	rec.coalesced = node->coalesced;
+ 	handle->read_seq = node->event_seq;
+ 	spin_unlock_irqrestore(&source->lock, flags);
+@@ -1454,10 +1349,122 @@ static ssize_t aok_event_read(struct file *file, char __user *buf,
+ 	return sizeof(rec);
+ }
+ 
++static __poll_t aok_event_poll(struct file *file, poll_table *wait)
++{
++	struct aok_event_file *handle = file->private_data;
++	struct aok_event_source *source = handle->source;
++	struct aok_event_node *node;
++	__poll_t mask = 0;
++
++	if (!(handle->rights & AOK_RIGHT_READ))
++		return EPOLLERR;
++	poll_wait(file, &source->wait, wait);
++	spin_lock_irq(&source->lock);
++	list_for_each_entry(node, &source->pending, list) {
++		if (node->event_seq > handle->read_seq) {
++			mask = EPOLLIN | EPOLLRDNORM;
++			break;
++		}
++	}
++	spin_unlock_irq(&source->lock);
++	return mask;
++}
++
++/* A pending record must never be relabelled or delivered to a new target.
++ * Detaching the same identity is allowed even with outstanding events. */
++static int aok_source_bind(struct aok_event_source *source, u64 application_id,
++			   u32 policy, struct file *target)
++{
++	struct file *old;
++	int ret = 0;
++
++	mutex_lock(&source->bind_lock);
++	spin_lock_irq(&source->lock);
++	if ((source->live || source->coalesced) &&
++	    (target || application_id != source->application_id ||
++	     policy != AOK_WAKE_MANUAL)) {
++		ret = -EBUSY;
++		goto out;
++	}
++	old = source->wake_target;
++	source->wake_target = target;
++	if (target)
++		get_file(target);
++	source->application_id = application_id;
++	source->wake_policy = policy;
++	spin_unlock_irq(&source->lock);
++	if (old)
++		fput(old);
++	mutex_unlock(&source->bind_lock);
++	return 0;
++out:
++	spin_unlock_irq(&source->lock);
++	mutex_unlock(&source->bind_lock);
++	return ret;
++}
++
++static long aok_event_ioctl(struct file *file, unsigned int cmd,
++			    unsigned long arg)
++{
++	struct aok_event_file *handle = file->private_data;
++	struct aok_event_source *source = handle->source;
++	struct aok_event_target attr;
++	struct aok_handle *target;
++	struct fd f;
++	int ret;
++
++	if (cmd != AOK_EVENT_SET_TARGET && cmd != AOK_EVENT_POST)
++		return -ENOTTY;
++	if (!(handle->rights & AOK_RIGHT_WRITE))
++		return -EACCES;
++	if (cmd == AOK_EVENT_POST) {
++		if (arg || source->kind != AOK_EVENT_SOURCE_PORT)
++			return -EINVAL;
++		spin_lock_irq(&source->lock);
++		if (source->live == AOK_EVENT_SOURCE_DEPTH) {
++			spin_unlock_irq(&source->lock);
++			return -EAGAIN;
++		}
++		aok_source_fire_locked(source);
++		spin_unlock_irq(&source->lock);
++		aok_source_notify(source);
++		return 0;
++	}
++	if (copy_from_user(&attr, (void __user *)arg, sizeof(attr)))
++		return -EFAULT;
++	if (attr.wake_policy > AOK_WAKE_ON_QUIESCENT || attr.aproc_fd < -1)
++		return -EINVAL;
++	if (attr.aproc_fd == -1) {
++		if (attr.wake_policy != AOK_WAKE_MANUAL)
++			return -EINVAL;
++		return aok_source_bind(source, attr.application_id,
++				       attr.wake_policy, NULL);
++	}
++	f = fdget(attr.aproc_fd);
++	if (fd_empty(f))
++		return -EBADF;
++	if (fd_file(f)->f_op != &aok_aproc_fops) {
++		ret = -EINVAL;
++		goto out_fd;
++	}
++	target = fd_file(f)->private_data;
++	if (!(target->rights & AOK_RIGHT_SIGNAL)) {
++		ret = -EACCES;
++		goto out_fd;
++	}
++	ret = aok_source_bind(source, attr.application_id, attr.wake_policy,
++			      fd_file(f));
++out_fd:
++	fdput(f);
++	return ret;
++}
++
+ static const struct file_operations aok_event_fops = {
+ 	.owner = THIS_MODULE,
+ 	.release = aok_event_release,
+ 	.read = aok_event_read,
++	.poll = aok_event_poll,
++	.unlocked_ioctl = aok_event_ioctl,
+ };
+ 
+ static int aok_copy_source_attr(struct aok_event_source_attr *attr,
+@@ -1473,9 +1480,14 @@ static int aok_copy_source_attr(struct aok_event_source_attr *attr,
+ 	ret = copy_struct_from_user(attr, sizeof(*attr), uattr, size);
+ 	if (ret)
+ 		return ret;
+-	if (attr->size != size || attr->kind != AOK_EVENT_SOURCE_TIMER ||
++	if (attr->size != size ||
+ 	    attr->reserved || attr->reserved2[0] || attr->reserved2[1])
+ 		return -EINVAL;
++	if (attr->kind == AOK_EVENT_SOURCE_PORT)
++		return attr->flags || attr->first_ns || attr->interval_ns ?
++		       -EINVAL : 0;
++	if (attr->kind != AOK_EVENT_SOURCE_TIMER)
++		return -EINVAL;
+ 	switch (attr->flags) {
+ 	case AOK_TIMER_ONESHOT:
+ 		if (attr->interval_ns)
+@@ -1539,6 +1551,10 @@ SYSCALL_DEFINE2(aok_event_source_create,
+ 		goto err_free;
+ 	refcount_set(&source->refs, 1);
+ 	spin_lock_init(&source->lock);
++	mutex_init(&source->bind_lock);
++	init_waitqueue_head(&source->wait);
++	INIT_DELAYED_WORK(&source->wake_work, aok_source_wake_work);
++	source->kind = attr.kind;
+ 	INIT_LIST_HEAD(&source->pending);
+ 	for (i = 0; i < AOK_EVENT_SOURCE_DEPTH; i++)
+ 		INIT_LIST_HEAD(&source->nodes[i].list);
+@@ -1574,6 +1590,7 @@ SYSCALL_DEFINE2(aok_event_source_create,
+ 
+ err_put_file:
+ 	fput(file);
++	put_unused_fd(fd);
+ 	return ret;
+ err_put_fd:
+ 	put_unused_fd(fd);
+@@ -1588,6 +1605,7 @@ SYSCALL_DEFINE3(aok_event_bind, int, fd, u64, application_id, u64, wake_policy)
+ 	struct aok_event_file *handle;
+ 	struct aok_event_source *source;
+ 	struct fd f;
++	int ret;
+ 
+ 	if (wake_policy > AOK_WAKE_ON_QUIESCENT)
+ 		return -EINVAL;
+@@ -1604,12 +1622,9 @@ SYSCALL_DEFINE3(aok_event_bind, int, fd, u64, application_id, u64, wake_policy)
+ 		fdput(f);
+ 		return -EACCES;
+ 	}
+-	spin_lock_irq(&source->lock);
+-	source->application_id = application_id;
+-	source->wake_policy = wake_policy;
+-	spin_unlock_irq(&source->lock);
++	ret = aok_source_bind(source, application_id, wake_policy, NULL);
+ 	fdput(f);
+-	return 0;
++	return ret;
+ }
+ 
+ SYSCALL_DEFINE2(aok_event_ack, int, fd, u64, event_id)
+@@ -1618,6 +1633,7 @@ SYSCALL_DEFINE2(aok_event_ack, int, fd, u64, event_id)
+ 	struct aok_event_source *source;
+ 	struct aok_event_node *node;
+ 	struct fd f;
++	bool flushed = false;
+ 
+ 	f = fdget(fd);
+ 	if (fd_empty(f))
+@@ -1644,10 +1660,13 @@ SYSCALL_DEFINE2(aok_event_ack, int, fd, u64, event_id)
+ 		list_del_init(&node->list);
+ 		node->used = false;
+ 		source->live--;
++		flushed = source->coalesced != 0;
+ 		aok_source_flush_locked(source);
+ 		break;
+ 	}
+ 	spin_unlock_irq(&source->lock);
++	if (flushed)
++		aok_source_notify(source);
+ 	fdput(f);
+ 	return 0;
+ }

@@ -32,14 +32,19 @@
 - `0004` 已实现资源预算收窄、CPU/RSS 观测、token 台账和资源状态事件；`0007` 补充
   token hard limit 超限后的保守记账和冻结，`0008` 补充 budget snapshot 观察到 CPU/RSS
   超限后的 fail-closed 冻结。P8 资源测试记录 53 项启用通过；此前 disabled 8 项及
-  object 44、task 64、event-source 37、core 46 回归保持通过。runtime 现在在 Linux
+  object 44、task 64、event-source 38、event-wake 37、core 46 回归保持通过。runtime 现在在 Linux
   cgroup v2 写入 `cpu.max`/`memory.max`，并由 `memory.current` 监控器触发 `memory.reclaim`；
   AOK 内核 patch 本身仍未提供专用 sched_ext quota 或独立 memcg。证据见
   [KERNEL-P7-VALIDATION.md](KERNEL-P7-VALIDATION.md) 和 [KERNEL-P8-VALIDATION.md](KERNEL-P8-VALIDATION.md)。
 - `0005` 已实现 timer 事件源、ack、句柄内存 replay、满队列 coalesce 与权限检查；
   报告记录 37 项启用 + 6 项禁用测试，以及五枚 series 重建和八组回归通过。
-  **尚无 durable replay、port/LSFS 源、poll 通知或实际 wake 动作**；
-  ack 尚未按 application_id 隔离。见 `kernel/.build/p5-report.md`。
+  原始证据见 `kernel/.build/p5-report.md`。
+- `0009` 新增 source fd 的 poll、有界 port 通知及 timer/port 恢复 frozen aproc。
+  目标绑定必须持有 aproc `SIGNAL`；自动恢复不能绕过资源冻结，未确认事件阻止换绑。
+  37 项实际 task 心跳/唤醒测试和 object 44、task 64、resource 53、event-source 38、
+  core 46 项 QEMU 回归通过，见 [KERNEL-EVENT-WAKE-VALIDATION.md](KERNEL-EVENT-WAKE-VALIDATION.md)。
+  内核 source 仍无 durable replay、LSFS 源或 Application registry 接线；ack 仍按 source
+  handle 授权，尚未按 application_id 独立隔离。
 - 用户态 `runtime` 已有 JSON-RPC 消息编解码、离线 Echo provider、多 session/turn、
   prompt replay、abort/close、事件序列和 session 独立 token 台账。
   2026-09-16 本轮验证 `go test -race ./...` 与 `go vet ./...` 通过；
@@ -62,9 +67,18 @@
   `TestProcessProviderSocketStaysInPrivateDir` 以 red/green 方式守护，证据见
   [RUNTIME-TRANSPORT-VALIDATION.md](RUNTIME-TRANSPORT-VALIDATION.md)。
 
+- 用户态 amem/LSFS v0 已有 context CAS/COW、checkpoint 和 artifact commit；2026-09-18
+  补齐 artifact commit → durable mailbox → headless runner 链路，binding/cursor 持久化，
+  mailbox 与 cursor 原子提交，支持停用/重启/恢复扫描。全量 race、vet、Linux arm64 编译、
+  engine/core smoke 及两项 mutation 验证通过，见 [RUNTIME-LSFS-WAKE-VALIDATION.md](RUNTIME-LSFS-WAKE-VALIDATION.md)。
+  这一项属于用户态已实现切片，不能替代以下内核验收项。
+- durable mailbox 新增未确认工作的单 Application 与 supervisor 总量准入上限；timer/LSFS
+  满载时保留源状态，ack 后继续投递，支持重启续投。claim 仍占额度，retire 释放执行额度。
+  这不限制已确认历史、context commit 或审计的保留量；磁盘配额仍未实现。
+
 ## 当前未实现
 
-- amem/LSFS、持久事件源与唤醒、sched_ext Agent 调度、ainf 内核设备化、Web capability、HostFS bridge
+- 内核 amem/LSFS、内核持久事件源与 supervisor 唤醒集成、sched_ext Agent 调度、ainf 内核设备化、Web capability、HostFS bridge
   和消息 gateway 尚未实现。`runtime/cmd/aok-init` 与 `kernel/initramfs/build-aok.sh` 已提供 supervisor
   PID1/initfs 基础闭环；QEMU kernel probe 仍是独立验证程序，不能替代完整 guest 服务编排。
 - `kernel/linux` 保持干净的上游基线；AOK 代码位于外层 patch，构建时应用到独立源码目录。
