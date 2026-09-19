@@ -169,6 +169,7 @@ make aok-eventsrc-test
 make aok-eventwake-test
 make aok-appregistry-test
 make aok-event-probe-test
+make aok-initfs-boot-test
 make aok-core-test
 ```
 

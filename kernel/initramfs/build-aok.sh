@@ -17,6 +17,8 @@ done
 
 rm -rf "$work_dir"
 mkdir -p "$work_dir/sbin" "$work_dir/etc/aok" "$work_dir/var/lib/aok" "$work_dir/dev" "$work_dir/proc" "$work_dir/sys" "$work_dir/tmp"
+# The supervisor refuses any state directory that is not private.
+chmod 0700 "$work_dir/var/lib/aok"
 cp "$init_bin" "$work_dir/init"
 cp "$supervisor_bin" "$work_dir/sbin/aok-supervisor"
 cp "$manifest" "$work_dir/etc/aok/manifest.yaml"

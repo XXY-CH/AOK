@@ -96,7 +96,7 @@ index 84661c97f..12a10970c 100644
 +	struct aok_handle *handle;
 +	int fd;
 +
-+	if (task_pid_nr(current) != 1)
++	if (task_tgid_nr(current) != 1)	/* tgid: threaded PID1 may claim */
 +		return -EPERM;
 +	handle = kzalloc(sizeof(*handle), GFP_KERNEL);
 +	if (!handle)

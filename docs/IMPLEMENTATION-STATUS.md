@@ -26,7 +26,7 @@
 - 第一枚 AOK 对象补丁已在 QEMU arm64 验证：空 aproc/AID、anon-inode fd、inspect、
   权限收窄和引用释放。41 项 kselftest 通过；禁用配置的 3 项 `ENOSYS` 测试通过。
   原型边界见 [abi/p1-object-prototype.md](abi/p1-object-prototype.md)。
-- `0002` 已验证 PID1 root capability bootstrap；`0003` 已验证 aproc task/pidfd 生命周期，
+- `0002` 已验证 PID1 root capability bootstrap（2026-09-19 修复多线程 PID1 的 tgid 判定）；`0003` 已验证 aproc task/pidfd 生命周期，
   包括继承、attach、freeze/resume、abort、reap 和有序事件环。四组 enabled/disabled
   QEMU 测试及三枚 patch series 重建均通过，证据见 `kernel/.build/p3-report.md`。
 - `0004` 已实现资源预算收窄、CPU/RSS 观测、token 台账和资源状态事件；`0007` 补充
@@ -75,8 +75,12 @@
   context CAS/checkpoint、ProcessProvider 子进程监督和 sandbox launcher。runtime 的 `go test -race ./...`
   与 `go vet ./...` 已通过。
 - supervisor 当前在重启时递增 Application `generation` 并恢复旧 incarnation 的 pending mailbox；engine
-  transport 支持有界 `session/suspend`/`session/resume`。`make aok-initramfs` 已验证 initfs archive 内容，
-  但本机没有 kernel Image，完整 guest PID1 boot 仍待 Linux/QEMU runner。
+  transport 支持有界 `session/suspend`/`session/resume`。2026-09-19 起，完整 guest 全栈 PID1 boot
+  （aok-init 认领 root 并经 `AOK_ROOT_FD` 传给 supervisor、内核 bridge 激活、echo 引擎就绪）已在
+  AOK 内核 QEMU 中通过 `make aok-initfs-boot-test` 验收，见
+  [GUEST-INITFS-BOOT-VALIDATION.md](GUEST-INITFS-BOOT-VALIDATION.md)；该切片同时修复
+  `0002` root claim 对多线程 PID1 误判（`task_pid_nr` → `task_tgid_nr`）与 initfs
+  状态目录权限。监督重启的 guest 内演练仍待做。
 - `ProcessProvider` 子进程 listener 地址已按平台分离：Linux 抽象命名空间，其他平台绑定到子进程
   私有 0700 目录。此前在 macOS 上每次 engine 启动泄漏一个 socket 文件（累积 253 个），现由
   `TestProcessProviderSocketStaysInPrivateDir` 以 red/green 方式守护，证据见
@@ -101,6 +105,7 @@
   仍是独立验证程序，不能替代完整 guest 服务编排。
 - `kernel/linux` 保持干净的上游基线；AOK 代码位于外层 patch，构建时应用到独立源码目录。
 - 本机 QEMU 构建没有 virtio-vsock device model，当前只完成内核配置检查，未完成 guest↔host
-  vsock 心跳；该项转移到 Apple Container 或支持 vsock 的 Linux/QEMU runner。
+  vsock 心跳；该项转移到 Apple Container 或支持 vsock 的 Linux/QEMU runner。P2 的 guest
+  全栈启动已验收，节流→freeze 渐进降级、前缀命中率与 cache 亲和 spawn 尚未实现。
 - 本机已安装 QEMU 11.1.1，可运行 guest 测试；macOS 系统 GNU Make 为 3.81，内核编译和
   `make kernel-config-probe` 仍使用 Linux builder。
