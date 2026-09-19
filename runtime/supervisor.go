@@ -43,18 +43,19 @@ type Supervisor struct {
 }
 
 type supervisorState struct {
-	Applications  map[string]*Application     `json:"applications"`
-	Mailbox       map[string][]MailboxMessage `json:"mailbox"`
-	Audit         []AuditRecord               `json:"audit"`
-	NextSequence  uint64                      `json:"next_sequence"`
-	Results       map[string]TurnResult       `json:"results"`
-	Prepared      map[string]TurnResult       `json:"prepared"`
-	Timers        map[string]ApplicationTimer `json:"timers"`
-	Bindings      map[string]WakeBinding      `json:"bindings"`
-	NextKernelID  uint64                      `json:"next_kernel_id,omitempty"`
-	KernelPending map[string][]KernelEvent    `json:"kernel_pending,omitempty"`
-	RouteRecords  []RouteRecord               `json:"route_records,omitempty"`
-	RevokedTokens []RevokedToken              `json:"revoked_tokens,omitempty"`
+	Applications  map[string]*Application        `json:"applications"`
+	Mailbox       map[string][]MailboxMessage    `json:"mailbox"`
+	Audit         []AuditRecord                  `json:"audit"`
+	NextSequence  uint64                         `json:"next_sequence"`
+	Results       map[string]TurnResult          `json:"results"`
+	Prepared      map[string]TurnResult          `json:"prepared"`
+	Timers        map[string]ApplicationTimer    `json:"timers"`
+	Bindings      map[string]WakeBinding         `json:"bindings"`
+	NextKernelID  uint64                         `json:"next_kernel_id,omitempty"`
+	KernelPending map[string][]KernelEvent       `json:"kernel_pending,omitempty"`
+	RouteRecords  []RouteRecord                  `json:"route_records,omitempty"`
+	RevokedTokens []RevokedToken                 `json:"revoked_tokens,omitempty"`
+	Confirmations map[string]ConfirmationRequest `json:"confirmations,omitempty"`
 }
 
 // RoutePolicy is the per-application routing policy: the allowed backend
@@ -231,6 +232,9 @@ func (s *Supervisor) load() error {
 	}
 	if s.state.KernelPending == nil {
 		s.state.KernelPending = map[string][]KernelEvent{}
+	}
+	if s.state.Confirmations == nil {
+		s.state.Confirmations = map[string]ConfirmationRequest{}
 	}
 	for _, a := range s.state.Applications {
 		if a == nil {

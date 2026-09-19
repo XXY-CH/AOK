@@ -21,7 +21,9 @@ control API 可使用本地 UDS 或宿主与 VM 之间的 vsock，方法语义�
 `message.channel.create`、`message.subscribe`、`message.send` 和
 `message.delivery.inspect`。
 
-目标规格中的 `route.policy`/`route.inspect` 已以 `application.set_route_policy`（设置版本化 backend fallback 策略）与 `route.list`（倒序返回路由记录）实现。
+`application.export`（污点外发门控：拒/`confirm` 同步放行/`escalate` 进入慢路径/
+`request_id` 凭已批准确认单次放行）、`confirmation.list`/`confirmation.settle`
+（人工确认队列）也已实现。目标规格中的 `route.policy`/`route.inspect` 已以 `application.set_route_policy`（设置版本化 backend fallback 策略）与 `route.list`（倒序返回路由记录）实现。
 
 当前本地控制实现还提供只读的 `application.list`、`mailbox.list` 和 `event_source.list`，供客户端展示。
 `event_source.list` 默认仍返回 timer 数组；显式传入 `source_kind: "lsfs"` 才返回 LSFS binding 数组。

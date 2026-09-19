@@ -18,7 +18,7 @@ func TestTaintGateBlocksAndConfirms(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 	// Clean application exports freely.
-	if _, err := s.exportApplication("tester", app.ApplicationID, "clean", false); err != nil {
+	if _, err := s.exportApplication("tester", app.ApplicationID, "clean", false, false, ""); err != nil {
 		t.Fatalf("clean export blocked: %v", err)
 	}
 	// A tainted message taints the application at claim time.
@@ -34,12 +34,12 @@ func TestTaintGateBlocksAndConfirms(t *testing.T) {
 		t.Fatalf("taint not accumulated: %d", inspected.TaintBits)
 	}
 	// Export mask is zero by default: both bits are unmasked.
-	_, err = s.exportApplication("tester", app.ApplicationID, "leak", false)
+	_, err = s.exportApplication("tester", app.ApplicationID, "leak", false, false, "")
 	if !errors.Is(err, ErrTaintBlocked) {
 		t.Fatalf("tainted export not blocked: %v", err)
 	}
 	// Explicit confirmation downgrades the block to an audited approval.
-	if _, err := s.exportApplication("tester", app.ApplicationID, "leak", true); err != nil {
+	if _, err := s.exportApplication("tester", app.ApplicationID, "leak", true, false, ""); err != nil {
 		t.Fatalf("confirmed export failed: %v", err)
 	}
 	audit := s.Audit()
@@ -76,7 +76,7 @@ func TestTaintGateHonorsExportMask(t *testing.T) {
 		t.Fatalf("taint: %d", inspected.TaintBits)
 	}
 	// TaintExternal (bit 0) is masked; TaintConfidential (bit 1) is not.
-	if _, err := s.exportApplication("tester", app.ApplicationID, "x", false); !errors.Is(err, ErrTaintBlocked) {
+	if _, err := s.exportApplication("tester", app.ApplicationID, "x", false, false, ""); !errors.Is(err, ErrTaintBlocked) {
 		t.Fatalf("unmasked confidential bit exported: %v", err)
 	}
 	// Restart keeps the taint ledger and the gate behavior.
@@ -89,10 +89,10 @@ func TestTaintGateHonorsExportMask(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s2.Close()
-	if _, err := s2.exportApplication("tester", app.ApplicationID, "x", false); !errors.Is(err, ErrTaintBlocked) {
+	if _, err := s2.exportApplication("tester", app.ApplicationID, "x", false, false, ""); !errors.Is(err, ErrTaintBlocked) {
 		t.Fatalf("taint ledger lost across restart: %v", err)
 	}
-	if _, err := s2.exportApplication("tester", app.ApplicationID, "x", true); err != nil {
+	if _, err := s2.exportApplication("tester", app.ApplicationID, "x", true, false, ""); err != nil {
 		t.Fatalf("confirm after restart failed: %v", err)
 	}
 }
@@ -128,7 +128,7 @@ func TestProviderTaintFlowsToExportGate(t *testing.T) {
 	if inspected.TaintBits&TaintConfidential == 0 {
 		t.Fatalf("provider taint not folded: %d", inspected.TaintBits)
 	}
-	if _, err := s.exportApplication("tester", app.ApplicationID, "x", false); !errors.Is(err, ErrTaintBlocked) {
+	if _, err := s.exportApplication("tester", app.ApplicationID, "x", false, false, ""); !errors.Is(err, ErrTaintBlocked) {
 		t.Fatalf("gate did not see provider taint: %v", err)
 	}
 }

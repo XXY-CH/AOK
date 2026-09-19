@@ -135,7 +135,11 @@
   控制面 `capability.revoke`。见
   [RUNTIME-REVOCATION-VALIDATION.md](RUNTIME-REVOCATION-VALIDATION.md)。
 
-## 当前未实现
+- 2026-09-19 P3 切片：人工确认慢路径——未掩蔽污点导出可 `escalate` 为 pending
+  确认（request_id/TTL 5 分钟），`confirmation.list/settle` 审批，approved 请求
+  单次放行（consumed），全部状态迁移入审计并跨重启保留；控制面
+  `application.export` 以 `-32007` 返回 pending。
+- 2026-09-19 P3 切片：撤销两级生效
 
 - 内核 amem/LSFS 存储、sched_ext Agent 调度、ainf 内核设备化、Web capability、HostFS bridge
   和消息 gateway 尚未实现。`0009` 的 wake target 仍是 source 私有，dormant aproc 创建与

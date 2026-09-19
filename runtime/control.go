@@ -112,6 +112,9 @@ func (s *ControlServer) handle(req Message, principal string) Message {
 		Backends      []string        `json:"backends"`
 		Text          string          `json:"text"`
 		Confirm       bool            `json:"confirm"`
+		Escalate      bool            `json:"escalate"`
+		RequestID     string          `json:"request_id"`
+		Approve       bool            `json:"approve"`
 		Reason        string          `json:"reason"`
 	}
 	if len(req.Params) > 0 && json.Unmarshal(req.Params, &p) != nil {
@@ -178,14 +181,33 @@ func (s *ControlServer) handle(req Message, principal string) Message {
 			resp.Result = raw
 		}
 	case "application.export":
-		if _, err := s.Supervisor.exportApplication(p.Principal, p.ApplicationID, p.Text, p.Confirm); err != nil {
+		if _, err := s.Supervisor.exportApplication(p.Principal, p.ApplicationID, p.Text, p.Confirm, p.Escalate, p.RequestID); err != nil {
 			code := -32000
 			if errors.Is(err, ErrTaintBlocked) {
 				code = -32006
 			}
+			if errors.Is(err, ErrConfirmationPending) {
+				code = -32007
+			}
 			resp.Error = &RPCError{Code: code, Message: err.Error()}
 		} else {
 			resp.Result = json.RawMessage(`{"exported":true}`)
+		}
+	case "confirmation.list":
+		requests := s.Supervisor.ListConfirmations(p.ApplicationID)
+		if raw, merr := json.Marshal(requests); merr != nil {
+			resp.Error = &RPCError{Code: -32000, Message: merr.Error()}
+		} else {
+			resp.Result = raw
+		}
+	case "confirmation.settle":
+		request, err := s.Supervisor.SettleConfirmation(p.Principal, p.RequestID, p.Approve)
+		if err != nil {
+			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
+		} else if raw, merr := json.Marshal(request); merr != nil {
+			resp.Error = &RPCError{Code: -32000, Message: merr.Error()}
+		} else {
+			resp.Result = raw
 		}
 	case "budget.set":
 		if err := s.Supervisor.SetTokenLimit(p.Principal, p.ApplicationID, p.TokenLimit); err != nil {
