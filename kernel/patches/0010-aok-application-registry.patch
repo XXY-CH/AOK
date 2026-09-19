@@ -92,7 +92,7 @@ index 82e8a31..7c54c19 100644
  /*
   * 32 bit systems traditionally used different
 diff --git a/include/uapi/linux/aok.h b/include/uapi/linux/aok.h
-index eb43cec..2eac787 100644
+index eb43cec..a2c41ec 100644
 --- a/include/uapi/linux/aok.h
 +++ b/include/uapi/linux/aok.h
 @@ -153,8 +153,13 @@ struct aok_budget_status {
@@ -110,7 +110,7 @@ index eb43cec..2eac787 100644
  #define AOK_EVENT_SET_TARGET 0xa020U
  #define AOK_EVENT_POST 0xa021U
  
-@@ -164,6 +169,36 @@ struct aok_event_target {
+@@ -164,6 +169,37 @@ struct aok_event_target {
  	__u32 wake_policy;
  };
  
@@ -118,7 +118,8 @@ index eb43cec..2eac787 100644
 + * Application-registry slice. An application fd owns the durable unacked
 + * queue for one registered application_id: events attached to it survive
 + * the release of every source fd within the boot, and snapshot/restore
-+ * hand the queue to the supervisor across VM reboots.
++ * hand the queue to the supervisor across VM reboots. snapshot returns
++ * the total pending count; at most the caller's count records are copied.
 + */
 +#define AOK_OBJECT_APPLICATION 4U
 +
@@ -147,7 +148,7 @@ index eb43cec..2eac787 100644
  #define AOK_TIMER_ONESHOT 0U
  #define AOK_TIMER_PERIODIC 1U
  
-@@ -218,13 +253,14 @@ struct aok_event_source_attr {
+@@ -218,13 +254,14 @@ struct aok_event_source_attr {
  
  struct aok_event_record {
  	__u64 size;
@@ -165,10 +166,10 @@ index eb43cec..2eac787 100644
  
  /* Capability/inference control ABI. All handles are close-on-exec. */
 diff --git a/kernel/aok.c b/kernel/aok.c
-index 7a3dfc5..90d7ded 100644
+index 7a3dfc5..1513bb3 100644
 --- a/kernel/aok.c
 +++ b/kernel/aok.c
-@@ -1193,7 +1193,72 @@ SYSCALL_DEFINE2(aok_token_usage, int, fd,
+@@ -1193,7 +1193,74 @@ SYSCALL_DEFINE2(aok_token_usage, int, fd,
   * into a single pending count, flushed as one event when an ack recycles
   * a slot.
   */
@@ -216,6 +217,8 @@ index 7a3dfc5..90d7ded 100644
 +	struct aok_app_node *node = NULL;
 +	int i;
 +
++	/* Only timer expiry coalesces: POST refuses a full queue under the
++	 * same lock, so the merged node is always a timer record. */
 +	if (!app->coalesced || app->live >= AOK_APP_QUEUE_DEPTH)
 +		return;
 +	for (i = 0; i < AOK_APP_QUEUE_DEPTH; i++) {
@@ -242,7 +245,7 @@ index 7a3dfc5..90d7ded 100644
  {
  	struct aok_event_node *node = NULL;
  	int i;
-@@ -1214,10 +1279,30 @@ static void aok_source_fire_locked(struct aok_event_source *source)
+@@ -1214,10 +1281,30 @@ static void aok_source_fire_locked(struct aok_event_source *source)
  	node->event_id = ++source->event_id;
  	node->event_seq = ++source->event_seq;
  	node->coalesced = 1;
@@ -273,7 +276,7 @@ index 7a3dfc5..90d7ded 100644
  static void aok_source_wake_work(struct work_struct *work)
  {
  	struct aok_event_source *source = container_of(to_delayed_work(work),
-@@ -1228,7 +1313,16 @@ static void aok_source_wake_work(struct work_struct *work)
+@@ -1228,7 +1315,16 @@ static void aok_source_wake_work(struct work_struct *work)
  
  	mutex_lock(&source->bind_lock);
  	spin_lock_irq(&source->lock);
@@ -291,7 +294,7 @@ index 7a3dfc5..90d7ded 100644
  	spin_unlock_irq(&source->lock);
  	if (wake && source->wake_target) {
  		target = source->wake_target->private_data;
-@@ -1242,10 +1336,27 @@ static void aok_source_wake_work(struct work_struct *work)
+@@ -1242,10 +1338,27 @@ static void aok_source_wake_work(struct work_struct *work)
  
  static void aok_source_notify(struct aok_event_source *source)
  {
@@ -319,7 +322,7 @@ index 7a3dfc5..90d7ded 100644
  static enum hrtimer_restart aok_timer_fn(struct hrtimer *timer)
  {
  	struct aok_event_source *source =
-@@ -1253,7 +1364,7 @@ static enum hrtimer_restart aok_timer_fn(struct hrtimer *timer)
+@@ -1253,7 +1366,7 @@ static enum hrtimer_restart aok_timer_fn(struct hrtimer *timer)
  	unsigned long flags;
  
  	spin_lock_irqsave(&source->lock, flags);
@@ -328,7 +331,7 @@ index 7a3dfc5..90d7ded 100644
  	spin_unlock_irqrestore(&source->lock, flags);
  	aok_source_notify(source);
  
-@@ -1283,6 +1394,7 @@ static void aok_source_flush_locked(struct aok_event_source *source)
+@@ -1283,6 +1396,7 @@ static void aok_source_flush_locked(struct aok_event_source *source)
  	node->event_id = ++source->event_id;
  	node->event_seq = ++source->event_seq;
  	node->coalesced = source->coalesced;
@@ -336,7 +339,7 @@ index 7a3dfc5..90d7ded 100644
  	list_add_tail(&node->list, &source->pending);
  	source->live++;
  	source->coalesced = 0;
-@@ -1298,6 +1410,8 @@ static int aok_event_release(struct inode *inode, struct file *file)
+@@ -1298,6 +1412,8 @@ static int aok_event_release(struct inode *inode, struct file *file)
  		cancel_delayed_work_sync(&source->wake_work);
  		if (source->wake_target)
  			fput(source->wake_target);
@@ -345,7 +348,7 @@ index 7a3dfc5..90d7ded 100644
  		kfree(source);
  	}
  	kfree(handle);
-@@ -1305,9 +1419,12 @@ static int aok_event_release(struct inode *inode, struct file *file)
+@@ -1305,9 +1421,12 @@ static int aok_event_release(struct inode *inode, struct file *file)
  }
  
  /*
@@ -361,7 +364,7 @@ index 7a3dfc5..90d7ded 100644
   */
  static ssize_t aok_event_read(struct file *file, char __user *buf,
  			      size_t count, loff_t *ppos)
-@@ -1315,7 +1432,8 @@ static ssize_t aok_event_read(struct file *file, char __user *buf,
+@@ -1315,7 +1434,8 @@ static ssize_t aok_event_read(struct file *file, char __user *buf,
  	struct aok_event_file *handle = file->private_data;
  	struct aok_event_source *source = handle->source;
  	struct aok_event_record rec = { .size = sizeof(rec), };
@@ -371,7 +374,7 @@ index 7a3dfc5..90d7ded 100644
  	unsigned long flags;
  
  	if (!(handle->rights & AOK_RIGHT_READ))
-@@ -1324,26 +1442,53 @@ static ssize_t aok_event_read(struct file *file, char __user *buf,
+@@ -1324,26 +1444,53 @@ static ssize_t aok_event_read(struct file *file, char __user *buf,
  		return -EINVAL;
  
  	spin_lock_irqsave(&source->lock, flags);
@@ -441,10 +444,11 @@ index 7a3dfc5..90d7ded 100644
  	if (copy_to_user(buf, &rec, sizeof(rec)))
  		return -EFAULT;
  	return sizeof(rec);
-@@ -1353,20 +1498,41 @@ static __poll_t aok_event_poll(struct file *file, poll_table *wait)
+@@ -1353,20 +1500,47 @@ static __poll_t aok_event_poll(struct file *file, poll_table *wait)
  {
  	struct aok_event_file *handle = file->private_data;
  	struct aok_event_source *source = handle->source;
++	struct aok_application *app;
 +	struct aok_app_node *app_node;
  	struct aok_event_node *node;
 +	bool ready = false;
@@ -462,9 +466,14 @@ index 7a3dfc5..90d7ded 100644
 +		handle->read_seq = 0;
 +		handle->cursor_app = source->app;
 +	}
++	/* Registry entries persist, so the pointer outlives the lock and
++	 * poll_wait (which may sleep in epoll) stays outside the spinlock. */
++	app = source->app;
++	spin_unlock_irq(&source->lock);
++	if (app)
++		poll_wait(file, &app->wait, wait);
++	spin_lock_irq(&source->lock);
 +	if (source->app) {
-+		/* Registry entries persist, so registering is always safe. */
-+		poll_wait(file, &source->app->wait, wait);
 +		spin_lock(&source->app->lock);
 +		list_for_each_entry(app_node, &source->app->pending, list) {
 +			if (app_node->event_seq > handle->read_seq) {
@@ -487,7 +496,7 @@ index 7a3dfc5..90d7ded 100644
  	return mask;
  }
  
-@@ -1375,14 +1541,27 @@ static __poll_t aok_event_poll(struct file *file, poll_table *wait)
+@@ -1375,14 +1549,27 @@ static __poll_t aok_event_poll(struct file *file, poll_table *wait)
  static int aok_source_bind(struct aok_event_source *source, u64 application_id,
  			   u32 policy, struct file *target)
  {
@@ -518,7 +527,7 @@ index 7a3dfc5..90d7ded 100644
  		ret = -EBUSY;
  		goto out;
  	}
-@@ -1403,33 +1582,124 @@ static int aok_source_bind(struct aok_event_source *source, u64 application_id,
+@@ -1403,33 +1590,128 @@ static int aok_source_bind(struct aok_event_source *source, u64 application_id,
  	return ret;
  }
  
@@ -557,6 +566,10 @@ index 7a3dfc5..90d7ded 100644
 +	if (old)
 +		refcount_dec(&old->refs);
 +	mutex_unlock(&source->bind_lock);
++	/* An attach can make the fd readable immediately: wake pollers and
++	 * let wake_work apply the policy to a pre-populated queue. */
++	if (app)
++		aok_source_notify(source);
 +	return 0;
 +out:
 +	spin_unlock_irq(&source->lock);
@@ -651,7 +664,7 @@ index 7a3dfc5..90d7ded 100644
  	if (copy_from_user(&attr, (void __user *)arg, sizeof(attr)))
  		return -EFAULT;
  	if (attr.wake_policy > AOK_WAKE_ON_QUIESCENT || attr.aproc_fd < -1)
-@@ -1483,7 +1753,8 @@ static int aok_copy_source_attr(struct aok_event_source_attr *attr,
+@@ -1483,7 +1765,8 @@ static int aok_copy_source_attr(struct aok_event_source_attr *attr,
  	if (attr->size != size ||
  	    attr->reserved || attr->reserved2[0] || attr->reserved2[1])
  		return -EINVAL;
@@ -661,7 +674,7 @@ index 7a3dfc5..90d7ded 100644
  		return attr->flags || attr->first_ns || attr->interval_ns ?
  		       -EINVAL : 0;
  	if (attr->kind != AOK_EVENT_SOURCE_TIMER)
-@@ -1632,6 +1903,7 @@ SYSCALL_DEFINE2(aok_event_ack, int, fd, u64, event_id)
+@@ -1632,6 +1915,7 @@ SYSCALL_DEFINE2(aok_event_ack, int, fd, u64, event_id)
  	struct aok_event_file *handle;
  	struct aok_event_source *source;
  	struct aok_event_node *node;
@@ -669,7 +682,7 @@ index 7a3dfc5..90d7ded 100644
  	struct fd f;
  	bool flushed = false;
  
-@@ -1649,28 +1921,464 @@ SYSCALL_DEFINE2(aok_event_ack, int, fd, u64, event_id)
+@@ -1649,28 +1933,468 @@ SYSCALL_DEFINE2(aok_event_ack, int, fd, u64, event_id)
  		return -EACCES;
  	}
  	spin_lock_irq(&source->lock);
@@ -760,7 +773,8 @@ index 7a3dfc5..90d7ded 100644
 +			node = iter;
 +			break;
 +		}
-+	}
+ 	}
+-	list_for_each_entry(node, &source->pending, list) {
 +	if (!node) {
 +		spin_unlock_irqrestore(&app->lock, flags);
 +		return 0;
@@ -796,8 +810,7 @@ index 7a3dfc5..90d7ded 100644
 +			mask = EPOLLIN | EPOLLRDNORM;
 +			break;
 +		}
- 	}
--	list_for_each_entry(node, &source->pending, list) {
++	}
 +	spin_unlock_irq(&app->lock);
 +	return mask;
 +}
@@ -897,6 +910,7 @@ index 7a3dfc5..90d7ded 100644
 +	struct aok_application *app = NULL, *iter;
 +	struct fd parent;
 +	struct file *file;
++	unsigned long flags;
 +	int fd, ret, i;
 +
 +	ret = aok_copy_app_attr(&attr, uattr);
@@ -957,10 +971,11 @@ index 7a3dfc5..90d7ded 100644
 +	handle->app = app;
 +	handle->rights = AOK_RIGHT_INSPECT | AOK_RIGHT_DUPLICATE |
 +			 AOK_RIGHT_READ | AOK_RIGHT_WRITE;
-+	spin_lock(&app->lock);
++	/* app->lock nests inside the timer hardirq path; irq-safe here. */
++	spin_lock_irqsave(&app->lock, flags);
 +	info.aid = app->koid;
 +	info.state = app->live;
-+	spin_unlock(&app->lock);
++	spin_unlock_irqrestore(&app->lock, flags);
 +	info.rights = handle->rights;
 +	fd = get_unused_fd_flags(O_CLOEXEC);
 +	if (fd < 0) {
@@ -1098,6 +1113,8 @@ index 7a3dfc5..90d7ded 100644
 +		if (rec->size != sizeof(*rec) ||
 +		    rec->application_id != app->application_id ||
 +		    !rec->kind || rec->kind > AOK_EVENT_KIND_LSFS ||
++		    !rec->event_id || rec->event_id == U64_MAX ||
++		    !rec->event_seq || rec->event_seq == U64_MAX ||
 +		    rec->reserved[0] || rec->reserved[1]) {
 +			ret = -EINVAL;
 +			goto out;
@@ -1145,7 +1162,11 @@ index 7a3dfc5..90d7ded 100644
  SYSCALL_DEFINE2(aok_object_inspect, int, fd,
  		struct aok_object_info __user *, uinfo)
  {
-@@ -1681,6 +2389,23 @@ SYSCALL_DEFINE2(aok_object_inspect, int, fd,
+@@ -1678,9 +2402,27 @@ SYSCALL_DEFINE2(aok_object_inspect, int, fd,
+ 	struct fd f = fdget(fd);
+ 	struct aok_handle *handle;
+ 	struct aok_aproc *aproc;
++	unsigned long flags;
  
  	if (fd_empty(f))
  		return -EBADF;
@@ -1157,10 +1178,10 @@ index 7a3dfc5..90d7ded 100644
 +			fdput(f);
 +			return -EACCES;
 +		}
-+		spin_lock(&app->lock);
++		spin_lock_irqsave(&app->lock, flags);
 +		info.aid = app->koid;
 +		info.state = app->live;
-+		spin_unlock(&app->lock);
++		spin_unlock_irqrestore(&app->lock, flags);
 +		info.type = AOK_OBJECT_APPLICATION;
 +		info.rights = app_handle->rights;
 +		fdput(f);
@@ -1169,7 +1190,7 @@ index 7a3dfc5..90d7ded 100644
  	if (fd_file(f)->f_op != &aok_aproc_fops) {
  		fdput(f);
  		return -EINVAL;
-@@ -1706,10 +2431,37 @@ SYSCALL_DEFINE2(aok_handle_duplicate, int, fd, u64, rights)
+@@ -1706,10 +2448,37 @@ SYSCALL_DEFINE2(aok_handle_duplicate, int, fd, u64, rights)
  	struct fd f = fdget(fd);
  	struct aok_handle *old, *handle;
  	struct aok_event_file *ev_old, *ev_handle;
@@ -1207,7 +1228,7 @@ index 7a3dfc5..90d7ded 100644
  	if (fd_file(f)->f_op == &aok_event_fops) {
  		ev_old = fd_file(f)->private_data;
  		if (!(ev_old->rights & AOK_RIGHT_DUPLICATE) ||
-@@ -1722,10 +2474,12 @@ SYSCALL_DEFINE2(aok_handle_duplicate, int, fd, u64, rights)
+@@ -1722,10 +2491,12 @@ SYSCALL_DEFINE2(aok_handle_duplicate, int, fd, u64, rights)
  			fdput(f);
  			return -ENOMEM;
  		}

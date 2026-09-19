@@ -34,7 +34,7 @@ _Static_assert(sizeof(struct aok_application_attr) == 40, "application attr");
 _Static_assert(sizeof(struct aok_event_app) == 16, "event attach");
 _Static_assert(sizeof(struct aok_event_record) == 72, "event record");
 
-#define AOK_APPREG_TEST_PLAN 45
+#define AOK_APPREG_TEST_PLAN 47
 
 static int root_fd = -1;
 static struct aok_object_info info = {};
@@ -333,6 +333,14 @@ int main(int argc, char **argv)
 	EXPECT_ERR(syscall(NR_AOK_APP_RESTORE, app902, NULL,
 			   AOK_APP_QUEUE_DEPTH + 1), EINVAL,
 		   "restore rejects oversized batch");
+	restore[0].event_id = 0;
+	restore[0].event_seq = 30;
+	EXPECT_ERR(syscall(NR_AOK_APP_RESTORE, app902, restore, 1), EINVAL,
+		   "restore rejects zero event identity");
+	restore[0].event_id = ~0ULL;
+	restore[0].event_seq = 30;
+	EXPECT_ERR(syscall(NR_AOK_APP_RESTORE, app902, restore, 1), EINVAL,
+		   "restore rejects terminal event identity");
 
 	app903 = open_app(903, root_fd);
 	timer = make_source(AOK_EVENT_SOURCE_TIMER, 200000000);
