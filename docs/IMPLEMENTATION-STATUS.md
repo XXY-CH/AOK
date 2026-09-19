@@ -125,7 +125,8 @@
 - 2026-09-19 P3 首切片：supervisor 污点网关——payload 声明污点位、claim 时累计进
   Application 持久台账、`application.export` 按 manifest `export_mask` 拒绝未掩蔽
   污点（`-32006`）或降级为已审计的人工确认；门控决策全部进 hash chain。见
-  [RUNTIME-TAINT-VALIDATION.md](RUNTIME-TAINT-VALIDATION.md)。unotify 慢路径、
+  [RUNTIME-TAINT-VALIDATION.md](RUNTIME-TAINT-VALIDATION.md)。内核会话污点经
+  `LastTaint()` 回流台账，外发门控同时看到 payload 与内核两类标记。unotify 慢路径、
   两级撤销与 witness 联签仍属后续。
 
 ## 当前未实现

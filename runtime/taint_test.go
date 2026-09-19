@@ -1,9 +1,11 @@
 package runtime
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 )
 
 // The P3 taint gate: payloads declare taint, the application accumulates it
@@ -92,5 +94,41 @@ func TestTaintGateHonorsExportMask(t *testing.T) {
 	}
 	if _, err := s2.exportApplication("tester", app.ApplicationID, "x", true); err != nil {
 		t.Fatalf("confirm after restart failed: %v", err)
+	}
+}
+
+// A provider that reports kernel-style session taint: the runner must fold
+// it into the application ledger, and the export gate must then block.
+type taintedEcho struct{ taint uint64 }
+
+func (p *taintedEcho) Name() string { return "tainted-echo" }
+func (p *taintedEcho) Complete(ctx context.Context, prompt string) (string, Usage, error) {
+	return prompt, Usage{InputTokens: uint64(len(prompt)), OutputTokens: uint64(len(prompt))}, nil
+}
+func (p *taintedEcho) LastTaint() uint64 { return p.taint }
+
+func TestProviderTaintFlowsToExportGate(t *testing.T) {
+	s := newKernelTestSupervisor(t)
+	app, err := s.CreateApplication("tester", "owner", "on_event")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Enqueue("tester", app.ApplicationID, "k",
+		json.RawMessage(`{"text":"clean"}`)); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	// The input is untainted; the provider labels its result with session
+	// taint — the ledger must pick it up and the gate must block.
+	if err := s.Run(ctx, &taintedEcho{taint: TaintConfidential}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	inspected, _ := s.InspectApplication(app.ApplicationID)
+	if inspected.TaintBits&TaintConfidential == 0 {
+		t.Fatalf("provider taint not folded: %d", inspected.TaintBits)
+	}
+	if _, err := s.exportApplication("tester", app.ApplicationID, "x", false); !errors.Is(err, ErrTaintBlocked) {
+		t.Fatalf("gate did not see provider taint: %v", err)
 	}
 }

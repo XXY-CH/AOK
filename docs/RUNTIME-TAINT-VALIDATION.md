@@ -15,8 +15,11 @@
   confirm）都进 hash chain 审计。
 - 与内核侧的关系：0006 的 capability `export_mask` gate（export ioctl 拒绝
   `taint & ~mask`）已在 QEMU 验证；本切片补齐 supervisor 边界的数据流标记与外发
-  门控。`KernelInferProvider` 的会话污点（0006 submit 的 `io.taint |= session
-  taint`）尚未回流到 Application 台账，属后续接线。
+  门控。`KernelInferProvider` 通过 `LastTaint()` 把内核会话污点（0006 的
+  `io.taint |= session taint`）回流到 Application 台账——runner 在每个成功 turn
+  后折算，外发门控同时看到 payload 声明与内核标记两类来源
+  （`TestProviderTaintFlowsToExportGate` 以假 provider 覆盖；linux/arm64 的真实
+  回流随 KernelInferProvider 由 event probe 间接覆盖）。
 
 ## 证据
 
@@ -36,4 +39,4 @@ python3 scripts/core-smoke.py
 ## 尚未完成
 
 - unotify 人工确认慢路径（当前 `confirm` 是同步标志；真正的宿主确认 UI 属 P3 后续）、
-  两级撤销、Sigsum/witness 联签、内核污点回流、全系统 LSM。
+  两级撤销、Sigsum/witness 联签、全系统 LSM。

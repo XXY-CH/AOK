@@ -29,8 +29,18 @@ type KernelInferProvider struct {
 	// other's settles and fail reconciliation spuriously. settled mirrors
 	// every charge the kernel makes against the capability, including the
 	// full-reservation charges on cancelled or abandoned sessions.
-	mu      sync.Mutex
-	settled uint64
+	mu       sync.Mutex
+	settled  uint64
+	lastTain uint64
+}
+
+// LastTaint returns the kernel-reported taint of the most recent session
+// result: the kernel ORs the session's policy taint into every record, so
+// a nonzero value taints this turn's output dataflow.
+func (p *KernelInferProvider) LastTaint() uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastTain
 }
 
 // NewKernelInferProvider wraps inner with the kernel inference device. The
@@ -120,6 +130,7 @@ func (p *KernelInferProvider) Complete(ctx context.Context, prompt string) (stri
 		return "", Usage{}, fmt.Errorf("kernel result: %w", err)
 	}
 	p.settled += settled
+	p.lastTain = result.Taint
 	reconciled := Usage{InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens}
 	if result.TokensUsed != p.settled || !bytes.Equal(result.Data, []byte(text)) {
 		return "", Usage{}, fmt.Errorf("kernel reconciliation mismatch: used=%d expected=%d",

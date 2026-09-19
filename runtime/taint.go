@@ -68,7 +68,7 @@ func (s *Supervisor) exportApplication(principal, id, text string, confirm bool)
 }
 
 // accumulateTaint folds a message's declared taint into the application so
-// later turns (and their outputs) inherit it.
+// later turns (and their outputs) inherit it. Caller holds s.mu.
 func (s *Supervisor) accumulateTaint(id string, taint uint64) {
 	if taint == 0 {
 		return
@@ -76,4 +76,16 @@ func (s *Supervisor) accumulateTaint(id string, taint uint64) {
 	if a, ok := s.state.Applications[id]; ok {
 		a.TaintBits |= taint
 	}
+}
+
+// foldTaint is the locked entry for provider-reported taint (kernel
+// inference sessions label their results with the session policy taint).
+func (s *Supervisor) foldTaint(id string, taint uint64) {
+	if taint == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.accumulateTaint(id, taint)
+	_ = s.persistLocked(nil)
 }

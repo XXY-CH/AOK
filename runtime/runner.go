@@ -510,6 +510,14 @@ func (s *Supervisor) Run(ctx context.Context, provider Provider) error {
 			}
 			return nil
 		} // Recovery requeues the unacknowledged claim.
+		// Kernel inference reports the session taint with each result;
+		// fold it into the application's dataflow ledger so the export
+		// gate sees kernel-side labels too.
+		if err == nil {
+			if tainted, ok := provider.(interface{ LastTaint() uint64 }); ok {
+				s.foldTaint(id, tainted.LastTaint())
+			}
+		}
 		if err = s.finishTurn(id, m, text, usage, route, err); err != nil {
 			if requeueErr := s.requeueClaim(id, m.MessageID); requeueErr != nil {
 				return fmt.Errorf("%w (requeue failed: %v)", err, requeueErr)
