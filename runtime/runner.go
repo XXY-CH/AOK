@@ -258,6 +258,7 @@ func (s *Supervisor) finishTurn(id string, m MailboxMessage, text string, usage 
 	// Capture the sentinel before the prepared-result path normalizes the
 	// provider error into a generic failure.
 	routeDenied := providerErr != nil && errors.Is(providerErr, ErrRouteDenied)
+	overflowed := false
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	a := s.state.Applications[id]
@@ -268,10 +269,14 @@ func (s *Supervisor) finishTurn(id string, m MailboxMessage, text string, usage 
 		return nil
 	}
 	cacheHit := cacheHitKind(usage, a.LastCompat, route.CompatKey)
+	overflowed = false
 	prepared, ok := s.state.Prepared[m.MessageID]
 	if !ok {
 		status := "completed"
-		if providerErr != nil || len(text) > maxTextBytes {
+		if len(text) > maxTextBytes {
+			overflowed = true
+		}
+		if providerErr != nil || overflowed {
 			status = "failed"
 			text = ""
 		}
@@ -283,6 +288,9 @@ func (s *Supervisor) finishTurn(id string, m MailboxMessage, text string, usage 
 		}
 	}
 	text, usage = prepared.Text, prepared.Usage
+	if prepared.Status == "failed" && providerErr == nil && text == "" {
+		overflowed = true // staged clamp on the first pass
+	}
 	if prepared.Provider != "" {
 		route.Provider = prepared.Provider
 		route.Fallbacks = prepared.Fallbacks
@@ -324,7 +332,6 @@ func (s *Supervisor) finishTurn(id string, m MailboxMessage, text string, usage 
 		status = "retired"
 		text = ""
 	}
-	overflowed := false
 	if len(text) > maxTextBytes {
 		status = "failed"
 		text = ""

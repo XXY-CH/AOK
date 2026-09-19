@@ -28,11 +28,11 @@ fallback / KV compatibility / 命中分类验证。
 
 ```text
 AOK_HITRATE_SMOKE=pass turns=2 hit_rates=0.00/0.99 cached_total=87
-AOK_AFFINITY_SMOKE=pass shared_hit=87/88 kind=kv_exact
+AOK_AFFINITY_SMOKE=pass shared_hit=87/88 kind=kv_exact other_kind=kv_exact
 ```
 
 `make runtime-affinity-smoke` 归档输出到
-`kernel/.build/smoke-logs/runtime-affinity.log`；脚本对同 tick 竞态最多重试三次。
+`kernel/.build/smoke-logs/runtime-affinity.log`；脚本对同 tick 竞态共尝试三次（两次重试）。
 
 亲和场景：应用 A 完成 shared 前缀 turn 预热；随后把无关前缀 turn（B）与 shared
 前缀 turn（C）背靠背排队——C 后发。无亲和时 B 先执行并逐出缓存、C 必 miss；

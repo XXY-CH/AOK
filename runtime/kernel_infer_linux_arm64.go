@@ -114,7 +114,9 @@ func (p *KernelInferProvider) Complete(ctx context.Context, prompt string) (stri
 	result, err := client.Result()
 	if err != nil {
 		// Completion already settled the real usage; a failed result read
-		// closes a DONE session with no further charge.
+		// closes a DONE session with no further charge — the ledger must
+		// still advance or every later turn would mismatch.
+		p.settled += settled
 		return "", Usage{}, fmt.Errorf("kernel result: %w", err)
 	}
 	p.settled += settled

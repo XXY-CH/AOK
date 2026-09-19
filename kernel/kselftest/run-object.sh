@@ -43,7 +43,6 @@ while kill -0 "$qpid" 2>/dev/null; do
     seconds=$((seconds + 1))
 done
 wait "$qpid"
-trap - EXIT INT TERM
 cat "$serial"
 grep -q "^${AOK_TEST_MARKER:-AOK_OBJECT_TEST}=pass" "$serial"
 if grep -Eq '(^not ok |Kernel panic|BUG:|WARNING:|Oops:)' "$serial"; then

@@ -22,7 +22,7 @@ index a2c41ec9d..7c282894a 100644
  /*
   * Minimal first-task ABI of this slice: the first task of aok_aproc_create()
   * and every aok_aproc_spawn() task is a fork of the caller. The child returns
-@@ -135,8 +145,10 @@ struct aok_budget_status {
+@@ -135,8 +148,10 @@ struct aok_budget_status {
  	__u64 tokens_used;
  	__u64 tokens_cached;
  	__u32 res_state;
