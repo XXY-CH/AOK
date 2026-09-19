@@ -135,6 +135,12 @@
   控制面 `capability.revoke`。见
   [RUNTIME-REVOCATION-VALIDATION.md](RUNTIME-REVOCATION-VALIDATION.md)。
 
+- 2026-09-19 P4 首切片：消息网关——持久 channel/conversation 绑定外部身份到
+  application，入站以 `gw:<channel>:<id>:<seq>` 幂等键进 durable mailbox 并按
+  wake policy 驱动（on_event headless / manual 离线累积），出站 outbox 以
+  `reply:<message_id>` 幂等、claim/ack 重连不重复投递并携带 receipt；八个控制面
+  方法。见 [RUNTIME-GATEWAY-VALIDATION.md](RUNTIME-GATEWAY-VALIDATION.md)。
+  真实外部 transport 与 MCP/A2A/ACP 驱动属后续。
 - 2026-09-19 P3 独立审查修复：确认审批与升级 payload 绑定（防偷换）、pending
   确认队列上限 64+终局清扫（防无界状态）、撤销按 Subject+严格前缀收紧（防兄弟链
   误伤）、`message.claim` 控制面路径补污点折叠（防 RPC 绕过门控）、witness
