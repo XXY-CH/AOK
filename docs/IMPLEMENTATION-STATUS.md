@@ -65,6 +65,11 @@
   不变，resource kselftest 扩到 56 项；runtime `claimTurn` 在同一压力带做准入节流
   （每应用每秒一个 turn）。同轮修复 runner 对容器挂载路径的陈旧页缓存问题：QEMU
   一律从本地临时副本引导。见 [KERNEL-P8-VALIDATION.md](KERNEL-P8-VALIDATION.md)。
+- 2026-09-19 P2 切片：前缀命中率按后端 usage 可复算——llama provider 强制
+  `cache_n` 一致性，supervisor 累计 `tokens_cached` 并经 inspect/result 暴露；
+  真实 llama.cpp smoke 实测命中率 0.00→0.99（87/88 前缀复用），见
+  [RUNTIME-HITRATE-VALIDATION.md](RUNTIME-HITRATE-VALIDATION.md)。cache 亲和
+  spawn 与 router KV compatibility 验证仍待做。
 - 用户态 `runtime` 已有 JSON-RPC 消息编解码、离线 Echo provider、多 session/turn、
   prompt replay、abort/close、事件序列和 session 独立 token 台账。
   2026-09-16 本轮验证 `go test -race ./...` 与 `go vet ./...` 通过；

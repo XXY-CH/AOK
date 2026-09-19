@@ -65,6 +65,7 @@ type Application struct {
 	CreatedAt       int64  `json:"created_at"`
 	RetiredAt       int64  `json:"retired_at,omitempty"`
 	TokensUsed      uint64 `json:"tokens_used"`
+	TokensCached    uint64 `json:"tokens_cached,omitempty"`
 	TokenLimit      uint64 `json:"token_limit"`
 	Failures        uint32 `json:"failures"`
 	ContextID       string `json:"context_id"`

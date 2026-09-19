@@ -149,9 +149,12 @@ aok-initfs-boot-test:
 runtime-smoke:
 	@python3 runtime/scripts/smoke.py
 
-.PHONY: runtime-core-smoke aok-core-test
+.PHONY: runtime-core-smoke runtime-hitrate-smoke aok-core-test
 runtime-core-smoke:
 	@python3 runtime/scripts/core-smoke.py
+
+runtime-hitrate-smoke:
+	@python3 runtime/scripts/hitrate-smoke.py
 
 aok-core-test:
 	@AOK_INITRD="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/core-initramfs.cpio.gz" \

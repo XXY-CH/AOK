@@ -240,6 +240,7 @@ func (s *Supervisor) finishTurn(id string, m MailboxMessage, text string, usage 
 		return err
 	}
 	a.TokensUsed = saturatingAdd(a.TokensUsed, saturatingAdd(usage.InputTokens, usage.OutputTokens))
+	a.TokensCached = saturatingAdd(a.TokensCached, usage.CachedTokens)
 	status := "completed"
 	if providerErr != nil {
 		status = "failed"
