@@ -56,7 +56,10 @@ v0 只投递 `artifact` commit；append/checkpoint 等记录只推进 cursor，�
 写回再次唤醒自己。事件包含 `source_kind`、`binding_id`、`commit` 元数据和供 provider
 读取的 `text` 通知，不会把 artifact 内容自动拼入 prompt。内部 mailbox 幂等键为
 `lsfs:<binding_id>:<cursor>`；timer 使用 `timer:<timer_id>:<due>`。
-`message.send` 禁用 `lsfs:` 和 `timer:` 前缀。
+`message.send` 禁用 `lsfs:`、`timer:` 和 `kernel:` 前缀。内核 registry 接线后
+（PID1 认领 root 并经 `AOK_ROOT_FD` 交给 supervisor），artifact commit 先投递到
+application 的内核 durable 队列（携带 cursor），drain 阶段以
+`kernel:<application_id>:<event_id>` 幂等键进入 mailbox；满载保留 cursor 的语义不变。
 
 mailbox 与 cursor 在同一 supervisor state 写入中提交；context DB 的 commit 先持久化，
 扫描或进程失败后可以重读。artifact 导入后的审计写入是另一笔事务：若它失败，artifact

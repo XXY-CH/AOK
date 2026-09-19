@@ -97,6 +97,12 @@ func run() error {
 		return err
 	}
 	defer s.Close()
+	if bridge, err := aok.OpenKernelEventBridge(); err == nil {
+		s.SetKernelBridge(bridge)
+		fmt.Printf("AOK_KERNEL_BRIDGE=on\n")
+	} else {
+		fmt.Printf("AOK_KERNEL_BRIDGE=off reason=%v\n", err)
+	}
 	path := filepath.Join(*root, "control.sock")
 	// State lock is held. A stale socket from a crashed instance can be removed,
 	// but ordinary files are never removed on behalf of a socket configuration.

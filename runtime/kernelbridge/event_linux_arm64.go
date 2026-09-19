@@ -34,25 +34,25 @@ const (
 
 // Layout guards mirror the UAPI structs so drift is a compile error.
 type rawSourceAttr struct {
-	Size                                     uint64
-	ParentJobFd                              int32
-	Kind, Flags, Reserved                    uint32
-	FirstNs, IntervalNs                      uint64
-	Reserved2                                [2]uint64
+	Size                  uint64
+	ParentJobFd           int32
+	Kind, Flags, Reserved uint32
+	FirstNs, IntervalNs   uint64
+	Reserved2             [2]uint64
 }
 
-var _ [56-unsafe.Sizeof(rawSourceAttr{})]byte
+var _ [56 - unsafe.Sizeof(rawSourceAttr{})]byte
 var _ [unsafe.Sizeof(rawSourceAttr{}) - 56]byte
 
 type rawAppAttr struct {
-	Size                          uint64
-	ParentJobFd                   int32
-	Reserved                      uint32
-	ApplicationID                 uint64
-	Reserved2                     [2]uint64
+	Size          uint64
+	ParentJobFd   int32
+	Reserved      uint32
+	ApplicationID uint64
+	Reserved2     [2]uint64
 }
 
-var _ [40-unsafe.Sizeof(rawAppAttr{})]byte
+var _ [40 - unsafe.Sizeof(rawAppAttr{})]byte
 var _ [unsafe.Sizeof(rawAppAttr{}) - 40]byte
 
 type rawEventApp struct {
@@ -61,7 +61,7 @@ type rawEventApp struct {
 	Reserved      uint32
 }
 
-var _ [16-unsafe.Sizeof(rawEventApp{})]byte
+var _ [16 - unsafe.Sizeof(rawEventApp{})]byte
 var _ [unsafe.Sizeof(rawEventApp{}) - 16]byte
 
 type rawEventRecord struct {
@@ -71,7 +71,7 @@ type rawEventRecord struct {
 	Reserved                                           [2]uint64
 }
 
-var _ [72-unsafe.Sizeof(rawEventRecord{})]byte
+var _ [72 - unsafe.Sizeof(rawEventRecord{})]byte
 var _ [unsafe.Sizeof(rawEventRecord{}) - 72]byte
 
 type rawObjectInfo struct {
@@ -106,6 +106,10 @@ func OpenRegistry() (*Registry, error) {
 	return &Registry{root: root}, nil
 }
 
+// RegistryFromRoot reuses a root descriptor already claimed by PID1; the
+// registry does not take ownership of the underlying file.
+func RegistryFromRoot(root *Root) *Registry { return &Registry{root: root} }
+
 func (r *Registry) Close() error { return r.root.Close() }
 
 func fdOf(file *os.File) (uintptr, error) {
@@ -129,6 +133,7 @@ func (r *Registry) OpenApplication(applicationID uint64) (*Application, error) {
 	}
 	attr := rawAppAttr{Size: 40, ParentJobFd: int32(parent), ApplicationID: applicationID}
 	var info rawObjectInfo
+	info.Size = uint64(unsafe.Sizeof(info))
 	n, _, errno := syscall.Syscall(nrAppCreate, uintptr(unsafe.Pointer(&attr)),
 		uintptr(unsafe.Pointer(&info)), 0)
 	if errno != 0 {
@@ -152,6 +157,7 @@ func (r *Registry) OpenEventSource(kind uint32, firstNs, intervalNs uint64) (*Ev
 	attr := rawSourceAttr{Size: 56, ParentJobFd: int32(parent), Kind: kind,
 		FirstNs: firstNs, IntervalNs: intervalNs}
 	var info rawObjectInfo
+	info.Size = uint64(unsafe.Sizeof(info))
 	n, _, errno := syscall.Syscall(nrEventSourceCreate, uintptr(unsafe.Pointer(&attr)),
 		uintptr(unsafe.Pointer(&info)), 0)
 	if errno != 0 {

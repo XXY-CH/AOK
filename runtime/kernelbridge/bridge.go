@@ -49,6 +49,14 @@ type Capability struct{ file *os.File }
 type Client struct{ file *os.File }
 type Backend struct{ file *os.File }
 
+// File exposes the owned root descriptor for exec/SCM_RIGHTS handoff. The
+// receiver keeps ownership; the caller must not close the returned file.
+func (r *Root) File() *os.File { return r.file }
+
+// RootFromFile wraps a root descriptor handed over by the guest PID1.
+// Ownership transfers to the returned Root.
+func RootFromFile(file *os.File) *Root { return &Root{file: file} }
+
 func (r *Root) Close() error       { return r.file.Close() }
 func (c *Capability) Close() error { return c.file.Close() }
 func (c *Client) Close() error     { return c.file.Close() }

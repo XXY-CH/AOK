@@ -28,12 +28,31 @@ type KernelApplication interface {
 	Close() error
 }
 
+// KernelEventSource is one kernel event producer attached to an application.
+type KernelEventSource interface {
+	// Attach routes every event the source fires into the application queue.
+	Attach(app KernelApplication, applicationID uint64) error
+	// Post enqueues one event carrying the cursor; a full durable queue
+	// returns EAGAIN without consuming an event id and the caller retries.
+	Post(cursor uint64) error
+	Close() error
+}
+
 // KernelEventBridge opens kernel registry handles by numeric application id.
 // Handles are idempotent within one boot, which is the cross-process
 // recovery path after a supervisor restart.
 type KernelEventBridge interface {
 	Open(applicationID uint64) (KernelApplication, error)
+	// OpenSource creates a producer of the given KernelSource* kind.
+	OpenSource(kind uint32) (KernelEventSource, error)
 }
+
+// Kernel source kinds mirror the UAPI AOK_EVENT_SOURCE_* values.
+const (
+	KernelSourceTimer uint32 = 1
+	KernelSourcePort  uint32 = 2
+	KernelSourceLSFS  uint32 = 3
+)
 
 // KernelWakeEvent is the mailbox payload for one drained kernel event.
 type KernelWakeEvent struct {
@@ -64,8 +83,49 @@ func kernelKindName(kind uint32) string {
 func (s *Supervisor) SetKernelBridge(bridge KernelEventBridge) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.closeKernelHandlesLocked()
+	if s.kernelApps == nil {
+		s.kernelApps = map[string]KernelApplication{}
+	}
+	if s.kernelSrcs == nil {
+		s.kernelSrcs = map[string]KernelEventSource{}
+	}
 	s.kernel = bridge
-	s.kernelApps = map[string]KernelApplication{}
+}
+
+func (s *Supervisor) closeKernelHandlesLocked() {
+	for id, h := range s.kernelApps {
+		h.Close()
+		delete(s.kernelApps, id)
+	}
+	for id, src := range s.kernelSrcs {
+		src.Close()
+		delete(s.kernelSrcs, id)
+	}
+}
+
+// ensureKernelSourceLocked opens and attaches the application's LSFS
+// producer; the binding scan posts artifact commits into the kernel durable
+// queue instead of enqueueing directly.
+func (s *Supervisor) ensureKernelSourceLocked(id string) (KernelEventSource, error) {
+	if src, ok := s.kernelSrcs[id]; ok {
+		return src, nil
+	}
+	app, err := s.ensureKernelHandleLocked(id)
+	if err != nil {
+		return nil, err
+	}
+	src, err := s.kernel.OpenSource(KernelSourceLSFS)
+	if err != nil {
+		return nil, err
+	}
+	kernelID := s.state.Applications[id].KernelID
+	if err := src.Attach(app, kernelID); err != nil {
+		src.Close()
+		return nil, err
+	}
+	s.kernelSrcs[id] = src
+	return src, nil
 }
 
 func (s *Supervisor) ensureKernelHandleLocked(id string) (KernelApplication, error) {
@@ -246,10 +306,7 @@ func (s *Supervisor) snapshotKernel() {
 		s.state.KernelPending[id] = events
 		changed = true
 	}
-	for id, h := range s.kernelApps {
-		h.Close()
-		delete(s.kernelApps, id)
-	}
+	s.closeKernelHandlesLocked()
 	if changed {
 		_ = s.persistLocked(nil)
 	}

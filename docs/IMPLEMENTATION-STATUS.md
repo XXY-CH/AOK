@@ -53,9 +53,13 @@
   [KERNEL-APP-REGISTRY-VALIDATION.md](KERNEL-APP-REGISTRY-VALIDATION.md)。
   runtime 侧 `kernelbridge` 绑定 0010 ABI，supervisor 以 `kernel:<app>:<event_id>`
   幂等键先持久后 ack 地 drain 内核队列，满载丢弃 handle 重放，关停 snapshot/启动
-  restore；`go test -race`、vet（含 linux/arm64 交叉）、smoke 与 core-smoke 通过。
-  内核 registry 仍不落盘，跨 VM 持久性由 supervisor 承接；按持久 owner 的隔离属于
-  supervisor 策略层。
+  restore。生产路径已通电：PID1 认领 root 经 `AOK_ROOT_FD` 传给 supervisor，LSFS
+  binding 的 artifact commit 经内核 durable 队列路由（满载保留 cursor）。QEMU 端到端
+  probe（`make aok-event-probe-test`）在真实内核上运行 ABI 阶段与完整 supervisor
+  链路（binding→内核队列→drain→mailbox→echo turn→关停→重启精确一次续投）；
+  `go test -race`、vet（含 linux/arm64 交叉）、smoke 与 core-smoke 通过。
+  内核 registry 仍不落盘，跨 VM 持久性由 supervisor 承接；生产者是 supervisor 自身的
+  LSFS 扫描器，独立 fsd 尚不存在；按持久 owner 的隔离属于 supervisor 策略层。
 - 用户态 `runtime` 已有 JSON-RPC 消息编解码、离线 Echo provider、多 session/turn、
   prompt replay、abort/close、事件序列和 session 独立 token 台账。
   2026-09-16 本轮验证 `go test -race ./...` 与 `go vet ./...` 通过；
@@ -92,7 +96,7 @@
 - 内核 amem/LSFS 存储、sched_ext Agent 调度、ainf 内核设备化、Web capability、HostFS bridge
   和消息 gateway 尚未实现。`0009` 的 wake target 仍是 source 私有，dormant aproc 创建与
   `ON_QUIESCENT` 语义不完整；内核 registry 不落盘，跨 VM 持久性由 supervisor snapshot/
-  restore 承接；fsd 尚未真实接入 LSFS source。`runtime/cmd/aok-init` 与
+  restore 承接；独立受监督的 fsd 进程尚未存在（当前由 supervisor 扫描器兼任生产者）。`runtime/cmd/aok-init` 与
   `kernel/initramfs/build-aok.sh` 已提供 supervisor PID1/initfs 基础闭环；QEMU kernel probe
   仍是独立验证程序，不能替代完整 guest 服务编排。
 - `kernel/linux` 保持干净的上游基线；AOK 代码位于外层 patch，构建时应用到独立源码目录。

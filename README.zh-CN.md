@@ -157,6 +157,7 @@ make aok-resource-test
 make aok-eventsrc-test
 make aok-eventwake-test
 make aok-appregistry-test
+make aok-event-probe-test
 make aok-core-test
 ```
 

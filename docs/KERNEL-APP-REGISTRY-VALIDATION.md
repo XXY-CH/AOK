@@ -76,6 +76,26 @@ source 关闭后仍 durable、volatile 积压阻塞挂接、挂接后不可换�
 - 根目录 `Makefile` 的 object/task/resource/eventsrc/core 测试 target 此前硬编码
   旧输出目录，`AOK_OBJECT_OUTPUT` 不生效；已统一改为可覆盖。
 
+## 生产路径与端到端 probe
+
+- **入口通电**：guest PID1（`aok-init`）在启动子进程前认领 root capability，
+  经 `AOK_ROOT_FD` 把描述符传给每个 supervisor 化身；`cmd/aok-supervisor`
+  启动时激活内核 bridge（打印 `AOK_KERNEL_BRIDGE=on/off`），失败回退纯用户态。
+- **最小生产者**：bridge 激活时，LSFS binding 的 artifact commit 不再直接入
+  mailbox，而是投递到 application 的内核 LSFS 源（携带 commit cursor），由
+  drain 以 `kernel:` 幂等键送入 mailbox；内核队列满载（`EAGAIN`）保留 cursor，
+  与用户态背压语义一致。
+- **端到端 probe**（`runtime/cmd/aok-kernel-event-probe`，`make
+  aok-event-probe-test`）在 QEMU AOK 内核上以 PID1 运行真实 Go 代码：
+  - ABI 阶段：注册/幂等重开、LSFS source 挂接、post 携带 cursor、read、
+    snapshot、ack、restore 后新 handle 重放、id 空间延续。
+  - supervisor 阶段：真实 `Supervisor.Run` + echo provider——AddLSFSBinding →
+    ImportArtifact → 内核 durable 队列 → drain → mailbox → echo turn 完成并
+    ack；有序关停（snapshot）→ 重启 supervisor → 第二个 artifact 精确一次
+    续投（合计 2 个 `kernel:` 事件）。
+  - probe 过程修复了 `rawObjectInfo.Size` 未初始化导致 create 返回 `EINVAL`
+    的绑定错误——这正是端到端验证的意义：布局/编号类错误无法被 fake 测试发现。
+
 ## Supervisor 接线
 
 - `runtime/kernelbridge` 新增 0010 ABI 绑定（仅 linux/arm64；其余平台返回
@@ -109,8 +129,11 @@ python3 scripts/core-smoke.py
 ## 尚未完成
 
 - 内核 registry 是 boot 内 durable：跨 VM 的持久性由 supervisor snapshot/restore
-  承接，内核自身不落盘。fsd 尚未真实接入 LSFS source；`0009` 的 wake target
-  仍是 source 私有，dormant aproc 创建与 `ON_QUIESCENT` 语义仍不完整。
+  承接，内核自身不落盘；不洁 VM 崩溃丢失最后窗口。`aok-init` → supervisor 的
+  `AOK_ROOT_FD` 传递路径尚未在 guest 内整体演练（probe 直接以 PID1 认领）。
+- 生产者是 supervisor 自己的 LSFS 扫描器；独立的受监督 fsd 进程尚不存在。
+  `0009` 的 wake target 仍是 source 私有，dormant aproc 创建与 `ON_QUIESCENT`
+  语义仍不完整。
 - 按持久 owner/agent 隔离 application（registry 授权来自 parent capability）属于
   supervisor 策略层，内核未实现。
 - 跨层背压协议、KASAN/lockdep 证据、compat handler 与非 arm64 ABI 仍未覆盖。

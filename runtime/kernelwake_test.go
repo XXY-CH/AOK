@@ -7,21 +7,24 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 )
 
 // fakeKernelBridge mirrors the kernel registry: queues survive handles,
 // cursors are per-open, restore requires an empty queue.
 type fakeKernelBridge struct {
-	mu               sync.Mutex
-	queues           map[uint64][]KernelEvent
-	ackLog           []uint64
-	restoreAttempts  int
+	mu                sync.Mutex
+	queues            map[uint64][]KernelEvent
+	ackLog            []uint64
+	restoreAttempts   int
 	restoreRejections int
+	nextEvent         map[uint64]uint64
+	eagainNext        bool
 }
 
 func newFakeKernelBridge() *fakeKernelBridge {
-	return &fakeKernelBridge{queues: map[uint64][]KernelEvent{}}
+	return &fakeKernelBridge{queues: map[uint64][]KernelEvent{}, nextEvent: map[uint64]uint64{}}
 }
 
 func (b *fakeKernelBridge) post(id uint64, events ...KernelEvent) {
@@ -39,6 +42,41 @@ func (b *fakeKernelBridge) pending(id uint64) []KernelEvent {
 func (b *fakeKernelBridge) Open(id uint64) (KernelApplication, error) {
 	return &fakeKernelApp{bridge: b, id: id}, nil
 }
+
+func (b *fakeKernelBridge) OpenSource(kind uint32) (KernelEventSource, error) {
+	if kind != KernelSourceLSFS {
+		return nil, errors.New("fake bridge only produces LSFS sources")
+	}
+	return &fakeKernelSource{bridge: b}, nil
+}
+
+type fakeKernelSource struct {
+	bridge   *fakeKernelBridge
+	appID    uint64
+	attached int
+}
+
+func (s *fakeKernelSource) Attach(_ KernelApplication, applicationID uint64) error {
+	s.appID = applicationID
+	s.attached++
+	return nil
+}
+
+func (s *fakeKernelSource) Post(cursor uint64) error {
+	s.bridge.mu.Lock()
+	defer s.bridge.mu.Unlock()
+	if s.bridge.eagainNext || len(s.bridge.queues[s.appID]) >= 128 {
+		return syscall.EAGAIN
+	}
+	s.bridge.nextEvent[s.appID]++
+	seq := s.bridge.nextEvent[s.appID]
+	s.bridge.queues[s.appID] = append(s.bridge.queues[s.appID], KernelEvent{
+		ApplicationID: s.appID, EventID: seq, EventSeq: seq,
+		Kind: KernelSourceLSFS, Data: cursor})
+	return nil
+}
+
+func (s *fakeKernelSource) Close() error { return nil }
 
 type fakeKernelApp struct {
 	bridge  *fakeKernelBridge
@@ -346,5 +384,90 @@ func TestKernelIDAssignmentPersists(t *testing.T) {
 	}
 	if third.KernelID <= second.KernelID {
 		t.Fatalf("new kernel id %d must exceed %d", third.KernelID, second.KernelID)
+	}
+}
+
+func TestKernelLSFSBindingsRouteThroughKernel(t *testing.T) {
+	s := newKernelTestSupervisor(t)
+	app, err := s.CreateApplication("tester", "owner", "on_event")
+	if err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	bridge := newFakeKernelBridge()
+	s.SetKernelBridge(bridge)
+	if err := s.AddLSFSBinding("tester", app.ApplicationID, "b1", "", 0); err != nil {
+		t.Fatalf("AddLSFSBinding: %v", err)
+	}
+	if _, err := s.ImportArtifact("tester", app.ApplicationID, "k1",
+		json.RawMessage(`{"v":1}`)); err != nil {
+		t.Fatalf("ImportArtifact: %v", err)
+	}
+	if err := s.deliverLSFS(); err != nil {
+		t.Fatalf("deliverLSFS: %v", err)
+	}
+	pending := bridge.pending(app.KernelID)
+	if len(pending) != 1 || pending[0].Kind != KernelSourceLSFS ||
+		pending[0].Data == 0 {
+		t.Fatalf("artifact commit not posted to kernel queue: %+v", pending)
+	}
+	if mailbox, _ := s.ListMailbox(app.ApplicationID); len(mailbox) != 0 {
+		t.Fatalf("kernel-routed commit must not enqueue directly: %+v", mailbox)
+	}
+	if err := s.deliverKernel(); err != nil {
+		t.Fatalf("deliverKernel: %v", err)
+	}
+	mailbox, err := s.ListMailbox(app.ApplicationID)
+	if err != nil || len(mailbox) != 1 ||
+		!strings.HasPrefix(mailbox[0].IdempotencyKey, "kernel:") {
+		t.Fatalf("drained kernel event missing: %+v err=%v", mailbox, err)
+	}
+	var event KernelWakeEvent
+	if err := json.Unmarshal(mailbox[0].Payload, &event); err != nil {
+		t.Fatalf("payload: %v", err)
+	}
+	if event.KernelKind != "lsfs" || event.Data != pending[0].Data {
+		t.Fatalf("cursor not preserved: %+v", event)
+	}
+	if left := bridge.pending(app.KernelID); len(left) != 0 {
+		t.Fatalf("kernel queue not drained: %+v", left)
+	}
+}
+
+func TestKernelLSFSBackpressureKeepsCursor(t *testing.T) {
+	s := newKernelTestSupervisor(t)
+	app, err := s.CreateApplication("tester", "owner", "on_event")
+	if err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	bridge := newFakeKernelBridge()
+	bridge.eagainNext = true
+	s.SetKernelBridge(bridge)
+	if err := s.AddLSFSBinding("tester", app.ApplicationID, "b1", "", 0); err != nil {
+		t.Fatalf("AddLSFSBinding: %v", err)
+	}
+	if _, err := s.ImportArtifact("tester", app.ApplicationID, "k1",
+		json.RawMessage(`{}`)); err != nil {
+		t.Fatalf("ImportArtifact: %v", err)
+	}
+	if err := s.deliverLSFS(); err != nil {
+		t.Fatalf("deliverLSFS under backpressure: %v", err)
+	}
+	if pending := bridge.pending(app.KernelID); len(pending) != 0 {
+		t.Fatalf("EAGAIN must not enqueue: %+v", pending)
+	}
+	bindings, err := s.ListLSFSBindings(app.ApplicationID)
+	if err != nil || len(bindings) != 1 || bindings[0].Cursor != 0 {
+		t.Fatalf("cursor advanced past refused post: %+v err=%v", bindings, err)
+	}
+	bridge.eagainNext = false
+	if err := s.deliverLSFS(); err != nil {
+		t.Fatalf("deliverLSFS after release: %v", err)
+	}
+	if pending := bridge.pending(app.KernelID); len(pending) != 1 {
+		t.Fatalf("post not retried: %+v", pending)
+	}
+	bindings, _ = s.ListLSFSBindings(app.ApplicationID)
+	if bindings[0].Cursor == 0 {
+		t.Fatal("cursor did not advance after successful post")
 	}
 }

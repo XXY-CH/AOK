@@ -135,9 +135,12 @@ linux-clean-prep:
 	@find host/.build -depth -type d -empty -delete 2>/dev/null || true
 	@printf '%s\n' 'Removed generated host build output; Linux source and AOK design artifacts were preserved.'
 
-.PHONY: runtime-test runtime-smoke
+.PHONY: runtime-test runtime-smoke aok-event-probe-test
 runtime-test:
 	@cd runtime && go test -race ./... && go vet ./...
+
+aok-event-probe-test:
+	@sh runtime/scripts/event-probe.sh
 
 runtime-smoke:
 	@python3 runtime/scripts/smoke.py

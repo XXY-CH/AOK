@@ -40,6 +40,9 @@ func RunInit(ctx context.Context, config InitConfig) error {
 		return errors.New("invalid init restart limits")
 	}
 	var starts []time.Time
+	// The root capability is claimable only by PID1; keep it for the whole
+	// boot and hand each supervisor incarnation the same descriptor.
+	kernelRoot := claimInitKernelRoot()
 	for {
 		now := time.Now()
 		kept := starts[:0]
@@ -55,6 +58,10 @@ func RunInit(ctx context.Context, config InitConfig) error {
 		starts = append(starts, now)
 		cmd := exec.Command(config.Supervisor, config.SupervisorArgs...)
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+		if kernelRoot != nil {
+			cmd.ExtraFiles = []*os.File{kernelRoot}
+			cmd.Env = append(os.Environ(), "AOK_ROOT_FD=3")
+		}
 		if err := cmd.Start(); err != nil {
 			return err
 		}

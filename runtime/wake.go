@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"syscall"
 )
 
 const maxWakeBindings = 64
@@ -163,20 +164,44 @@ func (s *Supervisor) deliverLSFS() error {
 			return err
 		}
 		for _, commit := range commits {
-			if commit.Kind == "artifact" {
-				event := LSFSWakeEvent{"lsfs", b.BindingID, commit,
-					fmt.Sprintf("LSFS artifact committed: context=%s cursor=%d handle=%s", commit.ContextID, commit.Cursor, commit.Handle)}
-				payload, err := json.Marshal(event)
-				if err == nil {
-					_, err = s.enqueueLocked("supervisor", b.ApplicationID, fmt.Sprintf("lsfs:%s:%d", b.BindingID, commit.Cursor), payload)
-				}
-				if errors.Is(err, ErrMailboxFull) {
-					break
-				}
+			if commit.Kind != "artifact" {
+				b.Cursor = commit.Cursor
+				changed = true
+				continue
+			}
+			// With a kernel bridge attached, artifact commits are posted
+			// into the application's durable kernel queue; deliverKernel
+			// moves them into the mailbox with kernel idempotency keys.
+			// A full queue keeps the cursor exactly like mailbox backpressure.
+			if s.kernel != nil {
+				src, err := s.ensureKernelSourceLocked(b.ApplicationID)
 				if err != nil {
 					s.restoreLocked()
 					return err
 				}
+				if err := src.Post(uint64(commit.Cursor)); err != nil {
+					if errors.Is(err, syscall.EAGAIN) {
+						break
+					}
+					s.restoreLocked()
+					return err
+				}
+				b.Cursor = commit.Cursor
+				changed = true
+				continue
+			}
+			event := LSFSWakeEvent{"lsfs", b.BindingID, commit,
+				fmt.Sprintf("LSFS artifact committed: context=%s cursor=%d handle=%s", commit.ContextID, commit.Cursor, commit.Handle)}
+			payload, err := json.Marshal(event)
+			if err == nil {
+				_, err = s.enqueueLocked("supervisor", b.ApplicationID, fmt.Sprintf("lsfs:%s:%d", b.BindingID, commit.Cursor), payload)
+			}
+			if errors.Is(err, ErrMailboxFull) {
+				break
+			}
+			if err != nil {
+				s.restoreLocked()
+				return err
 			}
 			b.Cursor = commit.Cursor
 			changed = true

@@ -37,6 +37,7 @@ type Supervisor struct {
 	authorizer   CapabilityAuthorizer
 	kernel       KernelEventBridge
 	kernelApps   map[string]KernelApplication
+	kernelSrcs   map[string]KernelEventSource
 }
 
 type supervisorState struct {
@@ -433,6 +434,10 @@ func (s *Supervisor) RetireApplication(principal, id string) error {
 	if h, ok := s.kernelApps[id]; ok {
 		h.Close()
 		delete(s.kernelApps, id)
+	}
+	if src, ok := s.kernelSrcs[id]; ok {
+		src.Close()
+		delete(s.kernelSrcs, id)
 	}
 	delete(s.state.KernelPending, id)
 	for key, b := range s.state.Bindings {
