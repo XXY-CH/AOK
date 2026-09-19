@@ -500,8 +500,10 @@ int main(int argc, char **argv)
 	memset(&budget, 0, sizeof(budget));
 	ok = !budget_get(fd2, &st) && st.memory_bytes_used > 0;
 	budget.cpu_usec_limit = UINT64_MAX;
+	/* ~8% headroom keeps the second reading inside the 90% throttle
+	 * band even if the parked child's RSS drifts by a page or two. */
 	budget.memory_bytes_limit = st.memory_bytes_used +
-				     st.memory_bytes_used / 17;
+				     st.memory_bytes_used / 12;
 	budget.token_reserve = UINT64_MAX;
 	budget.token_hard_limit = UINT64_MAX;
 	memset(&st, 0, sizeof(st));

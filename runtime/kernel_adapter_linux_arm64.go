@@ -50,6 +50,15 @@ func KernelEventBridgeFromRoot(root *kernelbridge.Root) (KernelEventBridge, erro
 	if root == nil {
 		return nil, kernelbridge.ErrUnsupported
 	}
+	// Fail fast on a garbage descriptor: deriving a throwaway capability
+	// proves the fd really is a root capability before anything reports
+	// the bridge as active. The probe capability is closed immediately and
+	// charges no tokens.
+	probe, err := root.Create(kernelbridge.CapabilitySpec{Rights: kernelbridge.Infer, TokenLimit: 1})
+	if err != nil {
+		return nil, err
+	}
+	_ = probe.Close()
 	registry := kernelbridge.RegistryFromRoot(root)
 	return kernelBridgeAdapter{registry: registry}, nil
 }
@@ -95,8 +104,8 @@ func (a kernelAppAdapter) Read() (*KernelEvent, error) {
 		Data: event.Data}, nil
 }
 
-func (a kernelAppAdapter) Ack(eventID uint64) error  { return a.app.Ack(eventID) }
-func (a kernelAppAdapter) Close() error              { return a.app.Close() }
+func (a kernelAppAdapter) Ack(eventID uint64) error { return a.app.Ack(eventID) }
+func (a kernelAppAdapter) Close() error             { return a.app.Close() }
 func (a kernelAppAdapter) Snapshot() ([]KernelEvent, error) {
 	events, err := a.app.Snapshot()
 	if err != nil {

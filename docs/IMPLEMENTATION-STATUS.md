@@ -69,11 +69,14 @@
   版本化 backend fallback 策略（router 按 context 过滤、直连 provider 调用前检查、
   越权 turn 以 `route_denied` 失败且不触达 backend），每个 turn 追加不可变 route
   record（policy 版本/backend/compat/fallbacks/cache_hit_kind/token 三项/理由码，
-  上限 512 条），`application.set_route_policy` 与 `route.list` 上控制面。
+  supervisor 全局上限 512 条、新的逐出旧的），`application.set_route_policy` 与 `route.list` 上控制面。
 - 2026-09-19 P2 切片：supervisor 推理经内核 ainf 设备闭环——`KernelInferProvider`
-  把每个 turn 放入 0006 会话（预留/实报/对账/EDQUOT 全内核强制），event probe
-  第三阶段在真实内核上验证短 turn 结算与超预算 fail-closed，见
-  [AOK-CORE-VALIDATION.md](AOK-CORE-VALIDATION.md) 追加节。
+  把每个 turn 放入 0006 会话（预留/实报/对账/EDQUOT 全内核强制；Cancel/失败完成按
+  全额预留计费并保持对账），event probe 在真实内核上验证短 turn 结算、取消后对账
+  不发散与超预算 fail-closed，见
+  [AOK-CORE-VALIDATION.md](AOK-CORE-VALIDATION.md) 追加节。生产 supervisor 的
+  engine 开关尚未接入 kernel-infer，当前证据范围是 probe 内以真实 supervisor 栈
+  运行。
 - 2026-09-19 P2 切片：router 记录每 turn 的 provider/fallbacks/compat key 并按
   后端回报分类 cache_hit_kind（kv_exact/prefix_replay/text_replay）；调度带前缀
   亲和（公平带内优先共享前缀的 turn）。真实 llama 证明：无干扰命中 87/88，且在
@@ -130,6 +133,7 @@
 - `kernel/linux` 保持干净的上游基线；AOK 代码位于外层 patch，构建时应用到独立源码目录。
 - 本机 QEMU 构建没有 virtio-vsock device model，当前只完成内核配置检查，未完成 guest↔host
   vsock 心跳；该项转移到 Apple Container 或支持 vsock 的 Linux/QEMU runner。P2 的 guest
-  全栈启动已验收，节流→freeze 渐进降级、前缀命中率与 cache 亲和 spawn 尚未实现。
+  全栈启动已验收；节流→freeze 渐进降级与前缀命中率/亲和已有实现与证据，cache 亲和
+  spawn（spawn 期放置决策）与多 slot 联合测量尚未实现。
 - 本机已安装 QEMU 11.1.1，可运行 guest 测试；macOS 系统 GNU Make 为 3.81，内核编译和
   `make kernel-config-probe` 仍使用 Linux builder。

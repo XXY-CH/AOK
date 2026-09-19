@@ -230,6 +230,10 @@ CREATE TABLE message_delivery_attempts (
 密钥、cookie、authorization header 和 webhook secret 不进入普通对象 payload。消息正文、
 附件 artifact 和路由 usage 仍受 ACL、taint、TTL 和可达性 GC 规则约束。
 
+route 记录当前同样落在 supervisor JSON snapshot（`route_records`，全局上限 512 条、
+新的逐出旧的，字段为 policy 版本/backend/compat key/fallbacks/cache_hit_kind/token
+三项/理由码）；本节的 SQL `route_records` 表属于后续迁移。
+
 `generation` 和当前 AID 属于运行时映射，不覆盖持久身份。worker 重建或 VM 重启时，
 supervisor 为同一个 `application_id` 创建新的 aproc/AID，并从 `checkpoint_ref` 和
 `pending` mailbox 恢复。退役先写入 `state='retiring'` 和 tombstone commit；只有没有

@@ -52,3 +52,8 @@ AOK_EVENT_PROBE=pass
 ```
 
 macOS/非 arm64 构建返回 `ErrUnsupported`，supervisor 回退直连 provider。
+
+独立审核后补齐的失败路径账本与回归：Cancel（RUNNING 态）与失败的 Complete 都按
+全额预留计费，provider 侧 `settled` 同步跟踪这些收费，Complete 全程持锁（capability
+级台账在 Result 时是全局视图，并发会话会假性失配）。event probe 的回归场景：注入
+一次 backend 失败（取消、按 68 token 全额计费）后，后续 turn 仍精确对账。

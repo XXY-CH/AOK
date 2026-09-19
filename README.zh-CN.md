@@ -74,7 +74,7 @@ Application 不属于某一个 Linux task。它由持久身份、版本化 contr
 
 ## 核心能力
 
-- **AOK Linux kernel patch series**（`0001`–`0010`，基于 `linux-6.18.y`）：
+- **AOK Linux kernel patch series**（`0001`–`0011`，基于 `linux-6.18.y`）：
   object handles、PID1 root capability bootstrap、aproc/task/pidfd 生命周期、
   资源预算收窄与 CPU/RSS 观测及 token 台账、带 ack/replay 的 timer 事件源、
   可 poll 的 port 事件源、授权 aproc 唤醒、推理 capability，以及 boot 内
@@ -159,6 +159,8 @@ make aok-eventwake-test
 make aok-appregistry-test
 make aok-event-probe-test
 make aok-initfs-boot-test
+make runtime-hitrate-smoke
+make runtime-affinity-smoke
 make aok-core-test
 ```
 

@@ -43,8 +43,7 @@ within -> throttle -> freeze -> supervisor_event
 `0011` 起按资源报告 enforcement level（`aok_budget_status` 的 `cpu_level`、
 `memory_level`、`token_level`，取值 `AOK_RES_LEVEL_WITHIN/THROTTLE/FREEZE`）：
 token 在硬限的 80% 进入 `THROTTLE`、到达硬限为 `FREEZE`；观测 CPU/RSS 在限值的
-90% 进入 `THROTTLE`。内核在硬限处冻结（fail-closed）；`THROTTLE` 带是策略区间，
-由 runtime 执行准入节流（每应用每秒至多一个 turn），冻结语义保持显式 resume。
+90% 进入 `THROTTLE`。内核在硬限处冻结（fail-closed）；由 runtime 执行准入节流（token 维度：每应用每秒至多一个 turn；CPU/RSS 的 THROTTLE 仅报告，尚未被 runtime 消费），冻结语义保持显式 resume。
 
 超限事件写入 aproc 有序事件环，包含资源类型、used、limit、level 和单调 sequence；事件
 投递不改变 turn 或 checkpoint 语义。并发更新采用账户锁和饱和算术，不能因计数器溢出绕过限制。

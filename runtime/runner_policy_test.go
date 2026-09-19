@@ -18,8 +18,8 @@ func TestRouterPolicyFiltersBackends(t *testing.T) {
 	if err != nil || text != "no" {
 		t.Fatalf("policy routing wrong: %q %v", text, err)
 	}
-	if route := r.LastRoute(); route.Provider != "echo" {
-		t.Fatalf("route provider: %+v", route)
+	if route := r.LastRoute(); route.Provider != "echo" || route.Fallbacks != 0 {
+		t.Fatalf("policy-skipped providers must not count as fallbacks: %+v", route)
 	}
 	if _, _, err = r.Complete(WithRouteBackends(context.Background(), []string{"absent"}), "p"); err == nil ||
 		"route policy excludes every backend" != err.Error() {
@@ -28,6 +28,21 @@ func TestRouterPolicyFiltersBackends(t *testing.T) {
 	// Unrestricted context still falls back past the failing provider.
 	if text, _, err = r.Complete(context.Background(), "p"); err != nil || text != "ok" {
 		t.Fatalf("unrestricted routing broken: %q %v", text, err)
+	}
+}
+
+func TestRouterFallbackCountExcludesPolicySkips(t *testing.T) {
+	r, err := NewRouterProvider(failingProvider{"llama.cpp"}, failingProvider{"metal"},
+		fixedProvider{"anthropic", "ok"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := WithRouteBackends(context.Background(), []string{"llama.cpp", "anthropic"})
+	if _, _, err = r.Complete(ctx, "p"); err != nil {
+		t.Fatal(err)
+	}
+	if route := r.LastRoute(); route.Provider != "anthropic" || route.Fallbacks != 1 {
+		t.Fatalf("fallback count must exclude the policy-skipped metal: %+v", route)
 	}
 }
 

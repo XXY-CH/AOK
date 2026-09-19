@@ -75,7 +75,7 @@ func WithRouteBackends(ctx context.Context, backends []string) context.Context {
 func (r *RouterProvider) Complete(ctx context.Context, prompt string) (string, Usage, error) {
 	var failures []string
 	allowed, _ := ctx.Value(routeBackendsKey{}).([]string)
-	for index, provider := range r.providers {
+	for _, provider := range r.providers {
 		if len(allowed) > 0 && !containsString(allowed, provider.Name()) {
 			continue
 		}
@@ -85,8 +85,10 @@ func (r *RouterProvider) Complete(ctx context.Context, prompt string) (string, U
 		text, usage, err := provider.Complete(ctx, prompt)
 		if err == nil {
 			r.mu.Lock()
+			// Policy-skipped providers are not attempts; only real
+			// failures count as fallbacks.
 			r.last = RouteInfo{Provider: provider.Name(),
-				Fallbacks: uint32(index), CompatKey: compatKeyOf(provider)}
+				Fallbacks: uint32(len(failures)), CompatKey: compatKeyOf(provider)}
 			r.mu.Unlock()
 			return text, usage, nil
 		}

@@ -186,8 +186,15 @@ func (s *Supervisor) deliverLSFS() error {
 					s.restoreLocked()
 					return err
 				}
+				// The post is a non-idempotent external effect (the kernel
+				// mints a fresh event id), so the cursor must be durable
+				// before the scan continues; otherwise a later rollback in
+				// this pass would re-post the same commit.
 				b.Cursor = commit.Cursor
-				changed = true
+				if err := s.persistLocked(nil); err != nil {
+					s.restoreLocked()
+					return err
+				}
 				continue
 			}
 			event := LSFSWakeEvent{"lsfs", b.BindingID, commit,

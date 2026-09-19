@@ -6,7 +6,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"sync/atomic"
+	"sync"
 
 	"aok/runtime/kernelbridge"
 )
@@ -23,7 +23,14 @@ type KernelInferProvider struct {
 	inner     Provider
 	limit     uint64
 	maxOutput uint64
-	settled   atomic.Uint64
+
+	// mu serializes Complete: the kernel reports a capability-wide ledger
+	// at Result time, so concurrent sessions could otherwise observe each
+	// other's settles and fail reconciliation spuriously. settled mirrors
+	// every charge the kernel makes against the capability, including the
+	// full-reservation charges on cancelled or abandoned sessions.
+	mu      sync.Mutex
+	settled uint64
 }
 
 // NewKernelInferProvider wraps inner with the kernel inference device. The
@@ -62,6 +69,8 @@ func (p *KernelInferProvider) Complete(ctx context.Context, prompt string) (stri
 	if len(prompt) > kernelbridge.DataMax {
 		return "", Usage{}, fmt.Errorf("kernel infer prompt exceeds device limit")
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	client, backend, err := p.cap.Session()
 	if err != nil {
 		return "", Usage{}, err
@@ -69,42 +78,50 @@ func (p *KernelInferProvider) Complete(ctx context.Context, prompt string) (stri
 	defer client.Close()
 	defer backend.Close()
 	// Sequence numbers are per session and this provider uses one submit
-	// per session, so every session starts at 1.
-	// The kernel takes the reservation at submit time and settles the real
-	// usage at completion, so reserve the input plus the declared output
-	// ceiling up front.
+	// per session, so every session starts at 1. The kernel takes the
+	// reservation at submit time and settles the real usage at completion,
+	// so reserve the input plus the declared output ceiling up front.
+	reservation := uint64(len(prompt)) + p.maxOutput
 	if err := client.Submit(kernelbridge.Record{
 		Sequence: 1, InputTokens: uint64(len(prompt)),
 		OutputTokens: p.maxOutput, Data: []byte(prompt),
 	}); err != nil {
+		// A failed submit reserves nothing and charges nothing.
 		return "", Usage{}, fmt.Errorf("kernel submit: %w", err)
 	}
 	request, err := backend.Take()
 	if err != nil {
+		// A failed take leaves the session PENDING, which releases with a
+		// zero charge.
 		return "", Usage{}, fmt.Errorf("kernel take: %w", err)
 	}
+	// From here the session is RUNNING: the kernel charges the full
+	// reservation on both cancel and an abandoned (failed) completion.
 	text, usage, err := p.inner.Complete(ctx, string(request.Data))
 	if err != nil {
 		_ = client.Cancel()
+		p.settled += reservation
 		return "", Usage{}, err
 	}
+	settled := usage.InputTokens + usage.OutputTokens
 	if err := backend.Complete(kernelbridge.Record{
 		Sequence: request.Sequence, InputTokens: usage.InputTokens,
 		OutputTokens: usage.OutputTokens, Data: []byte(text),
 	}); err != nil {
+		p.settled += reservation
 		return "", Usage{}, fmt.Errorf("kernel complete: %w", err)
 	}
 	result, err := client.Result()
 	if err != nil {
+		// Completion already settled the real usage; a failed result read
+		// closes a DONE session with no further charge.
 		return "", Usage{}, fmt.Errorf("kernel result: %w", err)
 	}
+	p.settled += settled
 	reconciled := Usage{InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens}
-	// Result reports the capability-wide ledger, so reconcile against the
-	// sum of every settled turn this provider has submitted.
-	expected := p.settled.Add(reconciled.InputTokens + reconciled.OutputTokens)
-	if result.TokensUsed != expected || !bytes.Equal(result.Data, []byte(text)) {
+	if result.TokensUsed != p.settled || !bytes.Equal(result.Data, []byte(text)) {
 		return "", Usage{}, fmt.Errorf("kernel reconciliation mismatch: used=%d expected=%d",
-			result.TokensUsed, expected)
+			result.TokensUsed, p.settled)
 	}
 	return text, reconciled, nil
 }

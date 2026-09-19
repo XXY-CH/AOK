@@ -23,6 +23,15 @@ import urllib.request
 PREFIX = "Once upon a time in a quiet village lived a curious little robot named Pip. " * 5
 
 
+def report(line):
+    print(line)
+    log = os.environ.get("AOK_SMOKE_LOG")
+    if log:
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        with open(log, "a") as handle:
+            handle.write(line + "\n")
+
+
 def main():
     server = os.environ.get("AOK_LLAMA_SERVER") or shutil.which("llama-server")
     model = os.environ.get("AOK_LLAMA_MODEL")
@@ -41,16 +50,21 @@ def main():
         llama = subprocess.Popen(
             [server, "-m", model, "--port", str(port), "--ctx-size", "2048", "-np", "1", "-ngl", "0"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        binary = work / "supervisor"
-        subprocess.run(["go", "build", "-o", str(binary), "./cmd/aok-supervisor"], cwd=root, check=True)
-        manifest = work / "manifest.yaml"
-        manifest.write_text("engine: llama\ncapabilities:\n  net: false\n")
-        state = work / "state"
-        path = str(state / "control.sock")
-        process = subprocess.Popen(
-            [str(binary), "-state", str(state), "-manifest", str(manifest),
-             "-llama-endpoint", f"http://127.0.0.1:{port}", "-max-tokens", "24"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            binary = work / "supervisor"
+            subprocess.run(["go", "build", "-o", str(binary), "./cmd/aok-supervisor"], cwd=root, check=True)
+            manifest = work / "manifest.yaml"
+            manifest.write_text("engine: llama\ncapabilities:\n  net: false\n")
+            state = work / "state"
+            path = str(state / "control.sock")
+            process = subprocess.Popen(
+                [str(binary), "-state", str(state), "-manifest", str(manifest),
+                 "-llama-endpoint", f"http://127.0.0.1:{port}", "-max-tokens", "24"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except BaseException:
+            llama.terminate()
+            llama.wait(timeout=10)
+            raise
         sequence = 0
 
         def call(method, params):
@@ -121,9 +135,9 @@ def main():
             inspected = call("application.inspect", {"application_id": aid})
             assert inspected["tokens_cached"] >= turns[0]["usage"]["cached_tokens"] + second["cached_tokens"], inspected
             rates = [t["usage"]["cached_tokens"] / t["usage"]["input_tokens"] for t in turns]
-            print(f"AOK_HITRATE_SMOKE=pass turns={len(turns)} "
-                  f"hit_rates={'/'.join(f'{r:.2f}' for r in rates)} "
-                  f"cached_total={inspected['tokens_cached']}")
+            report(f"AOK_HITRATE_SMOKE=pass turns={len(turns)} "
+                   f"hit_rates={'/'.join(f'{r:.2f}' for r in rates)} "
+                   f"cached_total={inspected['tokens_cached']}")
             return 0
         finally:
             process.kill()

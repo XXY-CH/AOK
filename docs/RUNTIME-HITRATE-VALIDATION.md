@@ -25,6 +25,9 @@ control API 驱动两个共享 ~88-token 前缀的 turn：
 AOK_HITRATE_SMOKE=pass turns=2 hit_rates=0.00/0.99 cached_total=87
 ```
 
+`make runtime-hitrate-smoke` 会把输出归档到
+`kernel/.build/smoke-logs/runtime-hitrate.log`。
+
 第二个 turn 复用 87/88 个前缀 token（`timings.cache_n` 报告），台账累计 87。
 llama-server 或模型缺失时脚本显式输出 `AOK_HITRATE_SMOKE=skip`。注意：该模型
 训练上下文为 128 token，服务端会硬性封顶 slot 上下文，脚本的前缀长度据此选择。

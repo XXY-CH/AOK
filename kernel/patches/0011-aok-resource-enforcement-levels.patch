@@ -2,15 +2,18 @@ diff --git a/include/uapi/linux/aok.h b/include/uapi/linux/aok.h
 index a2c41ec9d..7c282894a 100644
 --- a/include/uapi/linux/aok.h
 +++ b/include/uapi/linux/aok.h
-@@ -59,6 +59,16 @@
+@@ -59,6 +59,19 @@
  #define AOK_RES_STATE_PRESSURE 1U
  #define AOK_RES_STATE_OVER 2U
  
 +/*
 + * Per-resource enforcement levels, monotonically within -> throttle ->
 + * freeze. Tokens enter throttle at 80% of the hard limit; observed CPU
-+ * and RSS at 90% of their limits. The kernel freezes at the limit; the
-+ * throttle band is reported for admission policy (runtime rate limiting).
++ * and RSS at 90% of their limits. FREEZE reports that the resource is at
++ * or over its limit: observed CPU/RSS freeze immediately at budget_get,
++ * while tokens freeze fail-closed on the next usage report that settles
++ * over the hard limit. The throttle band is reported for admission
++ * policy (runtime rate limiting).
 + */
 +#define AOK_RES_LEVEL_WITHIN 0U
 +#define AOK_RES_LEVEL_THROTTLE 1U

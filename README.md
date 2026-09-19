@@ -82,7 +82,7 @@ capability, resource domains, cache compatibility, and usage reconciliation.
 
 ## Core capabilities
 
-- **AOK Linux kernel patch series** (`0001`–`0010`, on top of `linux-6.18.y`):
+- **AOK Linux kernel patch series** (`0001`–`0011`, on top of `linux-6.18.y`):
   object handles, PID1 root capability bootstrap, aproc/task/pidfd lifecycle,
   resource budget narrowing with CPU/RSS observation and token accounting,
   timer/port event sources with poll, ack/replay, authorized aproc wake, the
@@ -170,6 +170,8 @@ make aok-eventwake-test
 make aok-appregistry-test
 make aok-event-probe-test
 make aok-initfs-boot-test
+make runtime-hitrate-smoke
+make runtime-affinity-smoke
 make aok-core-test
 ```
 

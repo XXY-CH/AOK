@@ -14,11 +14,11 @@ test -f "$initrd"
 # Container-mounted paths can serve stale page cache to QEMU after the
 # artifacts are rewritten; boot from a private local copy instead.
 boot_dir=$(mktemp -d "${TMPDIR:-/tmp}/aok-boot.XXXXXX")
+trap 'kill "${qpid:-}" 2>/dev/null || true; rm -rf "$boot_dir"' EXIT
 cp "$image" "$boot_dir/Image"
 cp "$initrd" "$boot_dir/initrd"
 image="$boot_dir/Image"
 initrd="$boot_dir/initrd"
-trap 'kill "$qpid" 2>/dev/null || true; rm -rf "$boot_dir"' EXIT
 
 set --
 if [ "${AOK_QEMU_NETWORK:-0}" = 1 ]; then

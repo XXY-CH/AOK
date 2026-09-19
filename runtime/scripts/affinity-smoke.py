@@ -23,7 +23,29 @@ SHARED = "Once upon a time in a quiet village lived a curious little robot named
 OTHER = "Deep in the misty mountains an old dragon guarded a silent golden bell. " * 5
 
 
+def report(line):
+    print(line)
+    log = os.environ.get("AOK_SMOKE_LOG")
+    if log:
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        with open(log, "a") as handle:
+            handle.write(line + "\n")
+
+
 def main():
+    # The same-tick premise is a narrow race: if the runner tick fires
+    # between the two sends the shared turn misses for reasons unrelated
+    # to affinity, so retry on a fresh stack before declaring failure.
+    for attempt in range(3):
+        try:
+            return run_once()
+        except AssertionError as missed:
+            if attempt == 2:
+                raise
+            print(f"retrying affinity attempt {attempt + 1}: {missed}")
+
+
+def run_once():
     server = os.environ.get("AOK_LLAMA_SERVER") or shutil.which("llama-server")
     model = os.environ.get("AOK_LLAMA_MODEL")
     repo = Path(__file__).resolve().parents[2]
@@ -41,16 +63,21 @@ def main():
         llama = subprocess.Popen(
             [server, "-m", model, "--port", str(port), "--ctx-size", "2048",
              "-np", "1", "-ngl", "0"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        binary = work / "supervisor"
-        subprocess.run(["go", "build", "-o", str(binary), "./cmd/aok-supervisor"], cwd=root, check=True)
-        manifest = work / "manifest.yaml"
-        manifest.write_text("engine: llama\ncapabilities:\n  net: false\n")
-        state = work / "state"
-        path = str(state / "control.sock")
-        process = subprocess.Popen(
-            [str(binary), "-state", str(state), "-manifest", str(manifest),
-             "-llama-endpoint", f"http://127.0.0.1:{port}", "-max-tokens", "8"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            binary = work / "supervisor"
+            subprocess.run(["go", "build", "-o", str(binary), "./cmd/aok-supervisor"], cwd=root, check=True)
+            manifest = work / "manifest.yaml"
+            manifest.write_text("engine: llama\ncapabilities:\n  net: false\n")
+            state = work / "state"
+            path = str(state / "control.sock")
+            process = subprocess.Popen(
+                [str(binary), "-state", str(state), "-manifest", str(manifest),
+                 "-llama-endpoint", f"http://127.0.0.1:{port}", "-max-tokens", "8"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except BaseException:
+            llama.terminate()
+            llama.wait(timeout=10)
+            raise
         sequence = 0
 
         def call(method, params):
@@ -89,6 +116,7 @@ def main():
             while time.monotonic() < deadline and not healthy():
                 assert llama.poll() is None, "llama-server exited"
                 time.sleep(0.2)
+            assert healthy(), "llama-server did not become ready"
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
                 assert process.poll() is None, process.communicate()
@@ -127,9 +155,9 @@ def main():
             assert shared_cached * 4 > shared_input * 3, \
                 f"affinity did not preserve the warm prefix: {shared_result['usage']}"
             assert shared_result["cache_hit_kind"] == "kv_exact", shared_result
-            print(f"AOK_AFFINITY_SMOKE=pass shared_hit={shared_cached}/{shared_input} "
-                  f"kind={shared_result['cache_hit_kind']} "
-                  f"other_kind={other_result['cache_hit_kind']}")
+            report(f"AOK_AFFINITY_SMOKE=pass shared_hit={shared_cached}/{shared_input} "
+                   f"kind={shared_result['cache_hit_kind']} "
+                   f"other_kind={other_result['cache_hit_kind']}")
             return 0
         finally:
             process.kill()

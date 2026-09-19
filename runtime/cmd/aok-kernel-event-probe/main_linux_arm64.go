@@ -197,6 +197,21 @@ func waitForKernelTurns(s *aok.Supervisor, appID string, want int, timeout time.
 	return fmt.Errorf("%d kernel turns did not complete in %s", want, timeout)
 }
 
+// flakyInner fails its first N completions so the kernel's failure-path
+// charging (full reservation on cancel) can be exercised in one provider.
+type flakyInner struct {
+	remaining int
+}
+
+func (f *flakyInner) Name() string { return "flaky" }
+func (f *flakyInner) Complete(ctx context.Context, prompt string) (string, aok.Usage, error) {
+	if f.remaining > 0 {
+		f.remaining--
+		return "", aok.Usage{}, errors.New("injected backend failure")
+	}
+	return prompt, aok.Usage{InputTokens: uint64(len(prompt)), OutputTokens: uint64(len(prompt))}, nil
+}
+
 // runKernelInfer drives supervisor turns through the kernel inference
 // device: the echo provider serves only the backend half of an ainf
 // session, usage is reconciled by the kernel, and a turn that exceeds the
@@ -217,6 +232,19 @@ func runKernelInfer(root *kernelbridge.Root, stateDir string) error {
 			return fmt.Errorf("kernel infer diagnostic len=%d: %w", len(diagPrompt), derr)
 		}
 	}
+	// Failure-path regression: a cancelled session charges the full
+	// reservation, and the provider must keep reconciling afterwards.
+	flaky, ferr := aok.NewKernelInferProvider(root, &flakyInner{remaining: 1}, 256, 64)
+	if ferr != nil {
+		return fmt.Errorf("flaky provider: %w", ferr)
+	}
+	if _, _, ferr = flaky.Complete(context.Background(), "boom"); ferr == nil {
+		return errors.New("injected failure was not reported")
+	}
+	if text, _, ferr := flaky.Complete(context.Background(), "ok"); ferr != nil || text != "ok" {
+		return fmt.Errorf("reconciliation diverged after cancelled turn: %q %v", text, ferr)
+	}
+	_ = flaky.Close()
 	app, err := s.CreateApplication("probe", "probe-owner", "on_event")
 	if err != nil {
 		s.Close()

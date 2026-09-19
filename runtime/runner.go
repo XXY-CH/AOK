@@ -207,7 +207,7 @@ func (s *Supervisor) claimTurn() (string, MailboxMessage, error) {
 		// executed prefix so the backend KV stays warm. The band keeps
 		// token fairness intact and bounds starvation.
 		if c.affine && s.state.Applications[c.id].TokensUsed <=
-			minTokens+maxThrottleBand(minTokens) {
+			saturatingAdd(minTokens, maxThrottleBand(minTokens)) {
 			chosen, chosenMessage = c.id, c.message
 			break
 		}
@@ -283,6 +283,10 @@ func (s *Supervisor) finishTurn(id string, m MailboxMessage, text string, usage 
 		}
 	}
 	text, usage = prepared.Text, prepared.Usage
+	if prepared.Provider != "" {
+		route.Provider = prepared.Provider
+		route.Fallbacks = prepared.Fallbacks
+	}
 	if prepared.Status == "failed" {
 		providerErr = errors.New("provider failed")
 	} else {
@@ -320,9 +324,11 @@ func (s *Supervisor) finishTurn(id string, m MailboxMessage, text string, usage 
 		status = "retired"
 		text = ""
 	}
+	overflowed := false
 	if len(text) > maxTextBytes {
 		status = "failed"
 		text = ""
+		overflowed = true
 	}
 	s.state.Results[m.MessageID] = TurnResult{ApplicationID: id, MessageID: m.MessageID, Text: text, Usage: usage, Status: status, Checkpoint: checkpoint,
 		Provider: route.Provider, Fallbacks: route.Fallbacks, CacheHitKind: cacheHit}
@@ -341,6 +347,9 @@ func (s *Supervisor) finishTurn(id string, m MailboxMessage, text string, usage 
 	}
 	if routeDenied {
 		reason = "route_denied"
+	}
+	if overflowed {
+		reason = "text_overflow"
 	}
 	s.recordRouteLocked(RouteRecord{
 		ApplicationID: id, MessageID: m.MessageID,

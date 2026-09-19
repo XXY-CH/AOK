@@ -22,6 +22,7 @@ control API 可使用本地 UDS 或宿主与 VM 之间的 vsock，方法语义�
 `message.delivery.inspect`。
 
 当前本地控制实现还提供只读的 `application.list`、`mailbox.list` 和
+`application.set_route_policy`（设置版本化 backend fallback 策略）、`route.list`（倒序返回路由记录）也已实现；目标规格中的 `route.policy`/`route.inspect` 对应这两个方法。
 `event_source.list`，供客户端展示持久 Application、durable mailbox 和事件源快照。
 `event_source.list` 默认仍返回 timer 数组；显式传入 `source_kind: "lsfs"` 才返回 LSFS binding 数组。
 

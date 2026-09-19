@@ -394,7 +394,9 @@ func (s *Supervisor) InspectApplication(id string) (Application, error) {
 	if !ok {
 		return Application{}, ErrApplicationNotFound
 	}
-	return *a, nil
+	out := *a
+	out.RoutePolicy.Backends = append([]string(nil), a.RoutePolicy.Backends...)
+	return out, nil
 }
 
 // ListApplications returns stable snapshots for the local control console.
@@ -404,7 +406,9 @@ func (s *Supervisor) ListApplications() []Application {
 	defer s.mu.Unlock()
 	out := make([]Application, 0, len(s.state.Applications))
 	for _, a := range s.state.Applications {
-		out = append(out, *a)
+		snapshot := *a
+		snapshot.RoutePolicy.Backends = append([]string(nil), a.RoutePolicy.Backends...)
+		out = append(out, snapshot)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].CreatedAt == out[j].CreatedAt {
@@ -471,6 +475,7 @@ func (s *Supervisor) RetireApplication(principal, id string) error {
 		h.Close()
 		delete(s.kernelApps, id)
 	}
+	delete(s.lastClaim, id)
 	if src, ok := s.kernelSrcs[id]; ok {
 		src.Close()
 		delete(s.kernelSrcs, id)
