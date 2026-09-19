@@ -57,6 +57,9 @@ type supervisorState struct {
 	RevokedTokens      []RevokedToken                 `json:"revoked_tokens,omitempty"`
 	Confirmations      map[string]ConfirmationRequest `json:"confirmations,omitempty"`
 	WitnessCheckpoints []WitnessCheckpoint            `json:"witness_checkpoints,omitempty"`
+	Channels           map[string]MessageChannel      `json:"channels,omitempty"`
+	Conversations      map[string]MessageConversation `json:"conversations,omitempty"`
+	Outbox             []OutboxEntry                  `json:"outbox,omitempty"`
 }
 
 // RoutePolicy is the per-application routing policy: the allowed backend
@@ -236,6 +239,12 @@ func (s *Supervisor) load() error {
 	}
 	if s.state.Confirmations == nil {
 		s.state.Confirmations = map[string]ConfirmationRequest{}
+	}
+	if s.state.Channels == nil {
+		s.state.Channels = map[string]MessageChannel{}
+	}
+	if s.state.Conversations == nil {
+		s.state.Conversations = map[string]MessageConversation{}
 	}
 	for _, a := range s.state.Applications {
 		if a == nil {

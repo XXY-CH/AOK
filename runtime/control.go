@@ -236,6 +236,73 @@ func (s *ControlServer) handle(req Message, principal string) Message {
 		} else {
 			resp.Result = json.RawMessage(`{"verified":true}`)
 		}
+	case "message.channel.create":
+		channel, err := s.Supervisor.CreateChannel(p.Principal, p.BindingID, p.SourceKind)
+		if err != nil {
+			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
+		} else if raw, merr := json.Marshal(channel); merr != nil {
+			resp.Error = &RPCError{Code: -32000, Message: merr.Error()}
+		} else {
+			resp.Result = raw
+		}
+	case "message.channel.revoke":
+		if err := s.Supervisor.RevokeChannel(p.Principal, p.BindingID); err != nil {
+			resp.Error = &RPCError{Code: -32004, Message: err.Error()}
+		} else {
+			resp.Result = json.RawMessage(`{"revoked":true}`)
+		}
+	case "message.conversation.bind":
+		conversation, err := s.Supervisor.BindConversation(p.Principal, p.BindingID, p.Path, p.ApplicationID)
+		if err != nil {
+			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
+		} else if raw, merr := json.Marshal(conversation); merr != nil {
+			resp.Error = &RPCError{Code: -32000, Message: merr.Error()}
+		} else {
+			resp.Result = raw
+		}
+	case "message.conversation.list":
+		if raw, merr := json.Marshal(s.Supervisor.ListConversations(p.BindingID)); merr != nil {
+			resp.Error = &RPCError{Code: -32000, Message: merr.Error()}
+		} else {
+			resp.Result = raw
+		}
+	case "gateway.deliver":
+		if p.Count <= 0 {
+			resp.Error = &RPCError{Code: -32002, Message: "sequence required"}
+			break
+		}
+		message, err := s.Supervisor.DeliverInbound(p.BindingID, p.Path, int64(p.Count), p.Payload)
+		if err != nil {
+			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
+		} else if raw, merr := json.Marshal(message); merr != nil {
+			resp.Error = &RPCError{Code: -32000, Message: merr.Error()}
+		} else {
+			resp.Result = raw
+		}
+	case "gateway.reply":
+		entry, err := s.Supervisor.Reply(p.Principal, p.ApplicationID, p.MessageID)
+		if err != nil {
+			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
+		} else if raw, merr := json.Marshal(entry); merr != nil {
+			resp.Error = &RPCError{Code: -32000, Message: merr.Error()}
+		} else {
+			resp.Result = raw
+		}
+	case "gateway.outbox.claim":
+		entries, err := s.Supervisor.ClaimOutbox(p.BindingID, p.Path)
+		if err != nil {
+			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
+		} else if raw, merr := json.Marshal(entries); merr != nil {
+			resp.Error = &RPCError{Code: -32000, Message: merr.Error()}
+		} else {
+			resp.Result = raw
+		}
+	case "gateway.outbox.ack":
+		if err := s.Supervisor.AckOutbox(p.Principal, p.MessageID, p.Reason); err != nil {
+			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
+		} else {
+			resp.Result = json.RawMessage(`{"acked":true}`)
+		}
 	case "confirmation.list":
 		requests := s.Supervisor.ListConfirmations(p.ApplicationID)
 		if raw, merr := json.Marshal(requests); merr != nil {
