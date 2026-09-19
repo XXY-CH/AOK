@@ -109,6 +109,7 @@ func (s *ControlServer) handle(req Message, principal string) Message {
 		SourceRef     string          `json:"source_ref"`
 		BindingID     string          `json:"binding_id"`
 		AfterCursor   int64           `json:"after_cursor"`
+		Backends      []string        `json:"backends"`
 	}
 	if len(req.Params) > 0 && json.Unmarshal(req.Params, &p) != nil {
 		resp.Error = &RPCError{Code: -32602, Message: "invalid params"}
@@ -154,6 +155,24 @@ func (s *ControlServer) handle(req Message, principal string) Message {
 			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
 		} else {
 			resp.Result = json.RawMessage(`{"ok":true}`)
+		}
+	case "application.set_route_policy":
+		policy, err := s.Supervisor.SetRoutePolicy(p.Principal, p.ApplicationID, p.Backends)
+		if err != nil {
+			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
+		} else if raw, merr := json.Marshal(policy); merr != nil {
+			resp.Error = &RPCError{Code: -32000, Message: merr.Error()}
+		} else {
+			resp.Result = raw
+		}
+	case "route.list":
+		records, err := s.Supervisor.RouteRecords(p.ApplicationID)
+		if err != nil {
+			resp.Error = &RPCError{Code: -32004, Message: err.Error()}
+		} else if raw, merr := json.Marshal(records); merr != nil {
+			resp.Error = &RPCError{Code: -32000, Message: merr.Error()}
+		} else {
+			resp.Result = raw
 		}
 	case "budget.set":
 		if err := s.Supervisor.SetTokenLimit(p.Principal, p.ApplicationID, p.TokenLimit); err != nil {

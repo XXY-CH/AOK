@@ -255,6 +255,9 @@ func promptPrefix(payload json.RawMessage) string {
 }
 
 func (s *Supervisor) finishTurn(id string, m MailboxMessage, text string, usage Usage, route RouteInfo, providerErr error) error {
+	// Capture the sentinel before the prepared-result path normalizes the
+	// provider error into a generic failure.
+	routeDenied := providerErr != nil && errors.Is(providerErr, ErrRouteDenied)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	a := s.state.Applications[id]
@@ -332,6 +335,20 @@ func (s *Supervisor) finishTurn(id string, m MailboxMessage, text string, usage 
 	// The prepared result fixes nondeterministic model output before idempotent
 	// context writes. Recovery finishes that result without running the model.
 	a.Checkpoint = checkpoint
+	reason := ""
+	if providerErr != nil {
+		reason = "provider_failed"
+	}
+	if routeDenied {
+		reason = "route_denied"
+	}
+	s.recordRouteLocked(RouteRecord{
+		ApplicationID: id, MessageID: m.MessageID,
+		PolicyVersion: a.RoutePolicy.Version, Provider: route.Provider,
+		CompatKey: route.CompatKey, Fallbacks: route.Fallbacks,
+		CacheHitKind: cacheHit, PromptTokens: usage.InputTokens,
+		CachedTokens: usage.CachedTokens, OutputTokens: usage.OutputTokens,
+		Status: status, Reason: reason})
 	if status != "failed" {
 		a.LastProvider = route.Provider
 		a.LastCompat = route.CompatKey
@@ -340,6 +357,10 @@ func (s *Supervisor) finishTurn(id string, m MailboxMessage, text string, usage 
 	_ = s.auditLocked("supervisor", id, "turn."+status, m.MessageID, "allow", "")
 	return s.persistLocked(nil)
 }
+
+// ErrRouteDenied marks a turn rejected by the application's route policy
+// before any backend was contacted.
+var ErrRouteDenied = errors.New("route denied by application policy")
 
 // cacheHitKind classifies one turn against the route model's recovery
 // levels: a backend-reported cache hit is kv_exact; the same compatibility
@@ -431,10 +452,23 @@ func (s *Supervisor) Run(ctx context.Context, provider Provider) error {
 		s.mu.Unlock()
 		route := RouteInfo{Provider: provider.Name(), CompatKey: compatKeyOf(provider)}
 		if !prepared {
-			if err = json.Unmarshal(m.Payload, &p); err == nil {
-				turnCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-				text, usage, err = provider.Complete(turnCtx, p.Text)
-				cancel()
+			s.mu.Lock()
+			policy := s.state.Applications[id].RoutePolicy
+			s.mu.Unlock()
+			// Self-enforcing providers (routers) read the policy from the
+			// context; direct providers are checked here.
+			if len(policy.Backends) > 0 {
+				if _, selfEnforcing := provider.(interface{ LastRoute() RouteInfo }); !selfEnforcing &&
+					!containsString(policy.Backends, provider.Name()) {
+					err = ErrRouteDenied
+				}
+			}
+			if err == nil {
+				if err = json.Unmarshal(m.Payload, &p); err == nil {
+					turnCtx, cancel := context.WithTimeout(WithRouteBackends(ctx, policy.Backends), 2*time.Minute)
+					text, usage, err = provider.Complete(turnCtx, p.Text)
+					cancel()
+				}
 			}
 			if tracker, ok := provider.(interface{ LastRoute() RouteInfo }); ok && err == nil {
 				route = tracker.LastRoute()

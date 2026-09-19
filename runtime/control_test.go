@@ -45,14 +45,14 @@ func TestControlSocketLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	var applications []Application
-	if err = c.Call(ctx, "application.list", map[string]any{}, &applications); err != nil || len(applications) != 1 || applications[0] != a {
+	if err = c.Call(ctx, "application.list", map[string]any{}, &applications); err != nil || len(applications) != 1 || applications[0].ApplicationID != a.ApplicationID {
 		t.Fatal("application list", err)
 	}
 	if err = c.Call(ctx, "application.retire", map[string]any{"application_id": a.ApplicationID, "principal": "root"}, nil); err == nil {
 		t.Fatal("spoofed principal accepted")
 	}
 	var inspected Application
-	if err = c.Call(ctx, "application.inspect", map[string]string{"application_id": a.ApplicationID}, &inspected); err != nil || inspected != a {
+	if err = c.Call(ctx, "application.inspect", map[string]string{"application_id": a.ApplicationID}, &inspected); err != nil || inspected.ApplicationID != a.ApplicationID {
 		t.Fatal("inspect", err)
 	}
 	var m MailboxMessage

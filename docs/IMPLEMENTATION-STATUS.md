@@ -65,6 +65,11 @@
   不变，resource kselftest 扩到 56 项；runtime `claimTurn` 在同一压力带做准入节流
   （每应用每秒一个 turn）。同轮修复 runner 对容器挂载路径的陈旧页缓存问题：QEMU
   一律从本地临时副本引导。见 [KERNEL-P8-VALIDATION.md](KERNEL-P8-VALIDATION.md)。
+- 2026-09-19 P2 切片：route_policy/route_record 对象落地——Application 持久化
+  版本化 backend fallback 策略（router 按 context 过滤、直连 provider 调用前检查、
+  越权 turn 以 `route_denied` 失败且不触达 backend），每个 turn 追加不可变 route
+  record（policy 版本/backend/compat/fallbacks/cache_hit_kind/token 三项/理由码，
+  上限 512 条），`application.set_route_policy` 与 `route.list` 上控制面。
 - 2026-09-19 P2 切片：supervisor 推理经内核 ainf 设备闭环——`KernelInferProvider`
   把每个 turn 放入 0006 会话（预留/实报/对账/EDQUOT 全内核强制），event probe
   第三阶段在真实内核上验证短 turn 结算与超预算 fail-closed，见

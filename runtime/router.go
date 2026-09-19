@@ -61,9 +61,24 @@ func NewRouterProvider(providers ...Provider) (*RouterProvider, error) {
 
 func (r *RouterProvider) Name() string { return "router" }
 
+type routeBackendsKey struct{}
+
+// WithRouteBackends attaches an application's allowed backend fallback
+// order to the turn context. An empty or absent list means unrestricted.
+func WithRouteBackends(ctx context.Context, backends []string) context.Context {
+	if len(backends) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, routeBackendsKey{}, backends)
+}
+
 func (r *RouterProvider) Complete(ctx context.Context, prompt string) (string, Usage, error) {
 	var failures []string
+	allowed, _ := ctx.Value(routeBackendsKey{}).([]string)
 	for index, provider := range r.providers {
+		if len(allowed) > 0 && !containsString(allowed, provider.Name()) {
+			continue
+		}
 		if err := ctx.Err(); err != nil {
 			return "", Usage{}, err
 		}
@@ -83,7 +98,19 @@ func (r *RouterProvider) Complete(ctx context.Context, prompt string) (string, U
 	r.mu.Lock()
 	r.last = RouteInfo{}
 	r.mu.Unlock()
+	if len(failures) == 0 {
+		return "", Usage{}, errors.New("route policy excludes every backend")
+	}
 	return "", Usage{}, errors.New("all routed providers failed: " + strings.Join(failures, "; "))
+}
+
+func containsString(list []string, value string) bool {
+	for _, item := range list {
+		if item == value {
+			return true
+		}
+	}
+	return false
 }
 
 func compatKeyOf(provider Provider) string {

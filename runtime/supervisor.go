@@ -53,26 +53,57 @@ type supervisorState struct {
 	Bindings      map[string]WakeBinding      `json:"bindings"`
 	NextKernelID  uint64                      `json:"next_kernel_id,omitempty"`
 	KernelPending map[string][]KernelEvent    `json:"kernel_pending,omitempty"`
+	RouteRecords  []RouteRecord               `json:"route_records,omitempty"`
 }
 
+// RoutePolicy is the per-application routing policy: the allowed backend
+// fallback order. It is part of the application contract (route-model.md);
+// an empty list means no restriction. Version increments on every change.
+type RoutePolicy struct {
+	Version  uint64   `json:"version"`
+	Backends []string `json:"backends"`
+}
+
+// RouteRecord is the immutable per-turn routing decision, the runtime side
+// of the route_record contract. The list is bounded; the newest win.
+type RouteRecord struct {
+	Sequence      uint64 `json:"sequence"`
+	Time          int64  `json:"time"`
+	ApplicationID string `json:"application_id"`
+	MessageID     string `json:"message_id"`
+	PolicyVersion uint64 `json:"policy_version"`
+	Provider      string `json:"provider"`
+	CompatKey     string `json:"compat_key"`
+	Fallbacks     uint32 `json:"fallbacks"`
+	CacheHitKind  string `json:"cache_hit_kind"`
+	PromptTokens  uint64 `json:"prompt_tokens"`
+	CachedTokens  uint64 `json:"cached_tokens"`
+	OutputTokens  uint64 `json:"output_tokens"`
+	Status        string `json:"status"`
+	Reason        string `json:"reason,omitempty"`
+}
+
+const maxRouteRecords = 512
+
 type Application struct {
-	ApplicationID   string `json:"application_id"`
-	OwnerAgent      string `json:"owner_agent"`
-	ContractVersion uint64 `json:"contract_version"`
-	State           string `json:"state"`
-	WakePolicy      string `json:"wake_policy"`
-	Checkpoint      string `json:"checkpoint_ref,omitempty"`
-	Generation      uint64 `json:"generation"`
-	CreatedAt       int64  `json:"created_at"`
-	RetiredAt       int64  `json:"retired_at,omitempty"`
-	TokensUsed      uint64 `json:"tokens_used"`
-	TokensCached    uint64 `json:"tokens_cached,omitempty"`
-	TokenLimit      uint64 `json:"token_limit"`
-	Failures        uint32 `json:"failures"`
-	ContextID       string `json:"context_id"`
-	KernelID        uint64 `json:"kernel_id,omitempty"`
-	LastProvider    string `json:"last_provider,omitempty"`
-	LastCompat      string `json:"last_compat,omitempty"`
+	ApplicationID   string      `json:"application_id"`
+	OwnerAgent      string      `json:"owner_agent"`
+	ContractVersion uint64      `json:"contract_version"`
+	State           string      `json:"state"`
+	WakePolicy      string      `json:"wake_policy"`
+	Checkpoint      string      `json:"checkpoint_ref,omitempty"`
+	Generation      uint64      `json:"generation"`
+	CreatedAt       int64       `json:"created_at"`
+	RetiredAt       int64       `json:"retired_at,omitempty"`
+	TokensUsed      uint64      `json:"tokens_used"`
+	TokensCached    uint64      `json:"tokens_cached,omitempty"`
+	TokenLimit      uint64      `json:"token_limit"`
+	Failures        uint32      `json:"failures"`
+	ContextID       string      `json:"context_id"`
+	KernelID        uint64      `json:"kernel_id,omitempty"`
+	LastProvider    string      `json:"last_provider,omitempty"`
+	LastCompat      string      `json:"last_compat,omitempty"`
+	RoutePolicy     RoutePolicy `json:"route_policy,omitempty"`
 }
 
 type MailboxMessage struct {
@@ -452,6 +483,60 @@ func (s *Supervisor) RetireApplication(principal, id string) error {
 		}
 	}
 	return s.persistLocked(map[string]any{"type": "application.retire", "application_id": id})
+}
+
+// SetRoutePolicy replaces the application's allowed backend fallback order.
+// Backend names refer to provider names (llama.cpp, anthropic, metal, echo,
+// kernel-infer/*); an empty list lifts the restriction.
+func (s *Supervisor) SetRoutePolicy(principal, id string, backends []string) (RoutePolicy, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a, ok := s.state.Applications[id]
+	if !ok {
+		return RoutePolicy{}, ErrApplicationNotFound
+	}
+	if a.State == "tombstoned" || a.State == "retiring" {
+		return RoutePolicy{}, ErrApplicationRetired
+	}
+	seen := map[string]bool{}
+	for _, backend := range backends {
+		if backend == "" || len(backend) > 128 || seen[backend] {
+			return RoutePolicy{}, errors.New("invalid route policy backends")
+		}
+		seen[backend] = true
+	}
+	policy := RoutePolicy{Version: a.RoutePolicy.Version + 1,
+		Backends: append([]string(nil), backends...)}
+	a.RoutePolicy = policy
+	_ = s.auditLocked(principal, id, "route.policy.set",
+		fmt.Sprint(policy.Version), "allow", strings.Join(backends, ","))
+	return policy, s.persistLocked(nil)
+}
+
+// RouteRecords returns the application's routing decisions, newest first.
+func (s *Supervisor) RouteRecords(id string) ([]RouteRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.Applications[id]; !ok {
+		return nil, ErrApplicationNotFound
+	}
+	var out []RouteRecord
+	for i := len(s.state.RouteRecords) - 1; i >= 0; i-- {
+		if s.state.RouteRecords[i].ApplicationID == id {
+			out = append(out, s.state.RouteRecords[i])
+		}
+	}
+	return out, nil
+}
+
+func (s *Supervisor) recordRouteLocked(record RouteRecord) {
+	s.state.NextSequence++
+	record.Sequence = s.state.NextSequence
+	record.Time = time.Now().UnixNano()
+	s.state.RouteRecords = append(s.state.RouteRecords, record)
+	if overflow := len(s.state.RouteRecords) - maxRouteRecords; overflow > 0 {
+		s.state.RouteRecords = append([]RouteRecord(nil), s.state.RouteRecords[overflow:]...)
+	}
 }
 
 func (s *Supervisor) Enqueue(principal, id, key string, payload json.RawMessage) (MailboxMessage, error) {
