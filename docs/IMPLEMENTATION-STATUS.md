@@ -41,14 +41,14 @@
   原始证据见 `kernel/.build/p5-report.md`。
 - `0009` 新增 source fd 的 poll、有界 port 通知及 timer/port 恢复 frozen aproc。
   目标绑定必须持有 aproc `SIGNAL`；自动恢复不能绕过资源冻结，未确认事件阻止换绑。
-  37 项实际 task 心跳/唤醒测试和 object 44、task 64、resource 53、event-source 38、
+  37 项实际 task 心跳/唤醒测试和 object 44、task 64、resource 56、event-source 38、
   core 46 项 QEMU 回归通过，见 [KERNEL-EVENT-WAKE-VALIDATION.md](KERNEL-EVENT-WAKE-VALIDATION.md)。
 - `0010` 加入 Application registry、durable replay、LSFS source 与 supervisor 接线：
   application fd 按 `application_id` 幂等注册（boot 内存活），未确认事件跨 source fd
   释放与进程退出 replay；`AOK_EVENT_ATTACH_APP` 把 timer/port/LSFS 源挂入 128 深的
   durable 队列，LSFS post 携带 commit cursor；ack 按 application 隔离；
   snapshot/restore 交接 supervisor 实现跨 VM 恢复。appregistry 47 项 + 全部六套
-  enabled（object 44、task 64、resource 53、event-source 38、event-wake 37、
+  enabled（object 44、task 64、resource 56、event-source 38、event-wake 37、
   core 46）与五套 disabled ENOSYS 回归通过，含一项游标重置 mutation 验证，见
   [KERNEL-APP-REGISTRY-VALIDATION.md](KERNEL-APP-REGISTRY-VALIDATION.md)。
   runtime 侧 `kernelbridge` 绑定 0010 ABI，supervisor 以 `kernel:<app>:<event_id>`
@@ -60,6 +60,11 @@
   `go test -race`、vet（含 linux/arm64 交叉）、smoke 与 core-smoke 通过。
   内核 registry 仍不落盘，跨 VM 持久性由 supervisor 承接；生产者是 supervisor 自身的
   LSFS 扫描器，独立 fsd 尚不存在；按持久 owner 的隔离属于 supervisor 策略层。
+- `0011` 加入按资源 enforcement level（`cpu_level`/`memory_level`/`token_level`，
+  WITHIN→THROTTLE→FREEZE；token 80%、观测 CPU/RSS 90% 进入 THROTTLE），结构尺寸
+  不变，resource kselftest 扩到 56 项；runtime `claimTurn` 在同一压力带做准入节流
+  （每应用每秒一个 turn）。同轮修复 runner 对容器挂载路径的陈旧页缓存问题：QEMU
+  一律从本地临时副本引导。见 [KERNEL-P8-VALIDATION.md](KERNEL-P8-VALIDATION.md)。
 - 用户态 `runtime` 已有 JSON-RPC 消息编解码、离线 Echo provider、多 session/turn、
   prompt replay、abort/close、事件序列和 session 独立 token 台账。
   2026-09-16 本轮验证 `go test -race ./...` 与 `go vet ./...` 通过；

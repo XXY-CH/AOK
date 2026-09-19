@@ -18,11 +18,19 @@ test -f "$initrd"
 mkdir -p "$(dirname "$serial")"
 : > "$serial"
 
+# Boot from a private local copy: container-mounted paths can serve stale
+# page cache to QEMU after the artifacts are rewritten.
+boot_dir=$(mktemp -d "${TMPDIR:-/tmp}/aok-initfs.XXXXXX")
+cp "$image" "$boot_dir/Image"
+cp "$initrd" "$boot_dir/initrd"
+image="$boot_dir/Image"
+initrd="$boot_dir/initrd"
+
 "$qemu" -M virt -cpu cortex-a72 -m 512 -smp 2 -nographic -no-reboot \
     -kernel "$image" -initrd "$initrd" \
     -append "console=ttyAMA0 rdinit=/init panic=-1" > "$serial" 2>&1 &
 qpid=$!
-trap 'kill "$qpid" 2>/dev/null || true' EXIT
+trap 'kill "$qpid" 2>/dev/null || true; rm -rf "$boot_dir"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
@@ -78,6 +86,7 @@ fi
 kill "$qpid" 2>/dev/null || true
 wait "$qpid" 2>/dev/null || true
 trap - EXIT INT TERM
+rm -rf "$boot_dir"
 if [ "$fail" -ne 0 ]; then
     tail -20 "$serial"
     exit 1

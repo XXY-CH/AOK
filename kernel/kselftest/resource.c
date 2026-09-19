@@ -39,7 +39,7 @@ _Static_assert(sizeof(struct aok_budget) == 64, "budget layout");
 _Static_assert(sizeof(struct aok_budget_status) == 96, "budget status layout");
 _Static_assert(sizeof(struct aok_token_usage) == 64, "token usage layout");
 
-#define AOK_RESOURCE_TEST_PLAN 53
+#define AOK_RESOURCE_TEST_PLAN 56
 
 static int root_fd = -1;
 static struct aok_aproc_create_args create_args = { .size = 40, };
@@ -111,6 +111,7 @@ int main(int argc, char **argv)
 	struct aok_object_info first = {};
 	struct aok_budget budget = {};
 	struct aok_budget_status st = {};
+	struct aok_aproc_status st2 = {};
 	struct aok_token_usage usage = {};
 	struct aok_aproc_event ev;
 	long page = sysconf(_SC_PAGESIZE);
@@ -442,6 +443,73 @@ int main(int argc, char **argv)
 	     st.memory_bytes_used > 0 &&
 	     st.res_state == AOK_RES_STATE_OVER;
 	ksft_test_result(ok, "observed RSS limit freezes domain\n");
+	syscall(NR_AOK_ABORT, fd2);
+	close(result.pidfd);
+	close(fd2);
+
+	/* Progressive degradation levels: throttle band reported without
+	 * freezing; the hard limit reports freeze. */
+	fd2 = create_living(&first, &result);
+	if (fd2 < 0)
+		finish(1);
+	memset(&budget, 0, sizeof(budget));
+	budget.cpu_usec_limit = UINT64_MAX;
+	budget.memory_bytes_limit = UINT64_MAX;
+	budget.token_reserve = 100;
+	budget.token_hard_limit = 100;
+	usage.usage_id = 10;
+	usage.usage_seq = 10;
+	usage.input_tokens = 85;
+	usage.output_tokens = 0;
+	memset(&st, 0, sizeof(st));
+	memset(&st2, 0, sizeof(st2));
+	st2.size = sizeof(st2);
+	ok = !budget_set(fd2, &budget) && !token_usage(fd2, &usage) &&
+	     !budget_get(fd2, &st) &&
+	     st.token_level == AOK_RES_LEVEL_THROTTLE &&
+	     st.cpu_level == AOK_RES_LEVEL_WITHIN &&
+	     st.res_state == AOK_RES_STATE_PRESSURE &&
+	     !syscall(NR_AOK_STATUS, fd2, &st2) &&
+	     st2.state == AOK_APROC_STATE_RUNNING;
+	ksft_test_result(ok, "token pressure reports throttle level\n");
+	usage.usage_id = 11;
+	usage.usage_seq = 11;
+	usage.input_tokens = 100;
+	errno = 0;
+	memset(&st, 0, sizeof(st));
+	memset(&st2, 0, sizeof(st2));
+	st2.size = sizeof(st2);
+	ok = token_usage(fd2, &usage) == -1 && errno == EDQUOT &&
+	     !budget_get(fd2, &st) &&
+	     st.token_level == AOK_RES_LEVEL_FREEZE &&
+	     st.res_state == AOK_RES_STATE_OVER &&
+	     !syscall(NR_AOK_STATUS, fd2, &st2) &&
+	     st2.state == AOK_APROC_STATE_FROZEN;
+	ksft_test_result(ok, "token over limit reports freeze level\n");
+	syscall(NR_AOK_ABORT, fd2);
+	close(result.pidfd);
+	close(fd2);
+
+	fd2 = create_living(&first, &result);
+	if (fd2 < 0)
+		finish(1);
+	usleep(150000);
+	memset(&st, 0, sizeof(st));
+	memset(&st2, 0, sizeof(st2));
+	st2.size = sizeof(st2);
+	memset(&budget, 0, sizeof(budget));
+	ok = !budget_get(fd2, &st) && st.memory_bytes_used > 0;
+	budget.cpu_usec_limit = UINT64_MAX;
+	budget.memory_bytes_limit = st.memory_bytes_used +
+				     st.memory_bytes_used / 17;
+	budget.token_reserve = UINT64_MAX;
+	budget.token_hard_limit = UINT64_MAX;
+	memset(&st, 0, sizeof(st));
+	ok = ok && !budget_set(fd2, &budget) && !budget_get(fd2, &st) &&
+	     st.memory_level == AOK_RES_LEVEL_THROTTLE &&
+	     !syscall(NR_AOK_STATUS, fd2, &st2) &&
+	     st2.state == AOK_APROC_STATE_RUNNING;
+	ksft_test_result(ok, "observed RSS reports throttle level\n");
 	syscall(NR_AOK_ABORT, fd2);
 	close(result.pidfd);
 	close(fd2);

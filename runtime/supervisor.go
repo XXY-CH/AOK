@@ -38,19 +38,20 @@ type Supervisor struct {
 	kernel       KernelEventBridge
 	kernelApps   map[string]KernelApplication
 	kernelSrcs   map[string]KernelEventSource
+	lastClaim    map[string]time.Time
 }
 
 type supervisorState struct {
-	Applications map[string]*Application     `json:"applications"`
-	Mailbox      map[string][]MailboxMessage `json:"mailbox"`
-	Audit        []AuditRecord               `json:"audit"`
-	NextSequence uint64                      `json:"next_sequence"`
-	Results      map[string]TurnResult       `json:"results"`
-	Prepared     map[string]TurnResult       `json:"prepared"`
-	Timers       map[string]ApplicationTimer `json:"timers"`
-	Bindings     map[string]WakeBinding      `json:"bindings"`
-	NextKernelID uint64                      `json:"next_kernel_id,omitempty"`
-	KernelPending map[string][]KernelEvent   `json:"kernel_pending,omitempty"`
+	Applications  map[string]*Application     `json:"applications"`
+	Mailbox       map[string][]MailboxMessage `json:"mailbox"`
+	Audit         []AuditRecord               `json:"audit"`
+	NextSequence  uint64                      `json:"next_sequence"`
+	Results       map[string]TurnResult       `json:"results"`
+	Prepared      map[string]TurnResult       `json:"prepared"`
+	Timers        map[string]ApplicationTimer `json:"timers"`
+	Bindings      map[string]WakeBinding      `json:"bindings"`
+	NextKernelID  uint64                      `json:"next_kernel_id,omitempty"`
+	KernelPending map[string][]KernelEvent    `json:"kernel_pending,omitempty"`
 }
 
 type Application struct {
@@ -132,7 +133,7 @@ func NewSupervisor(root string, policy CapabilitySet) (*Supervisor, error) {
 	policy.FSRead = append([]string(nil), policy.FSRead...)
 	policy.FSWrite = append([]string(nil), policy.FSWrite...)
 	policy.Tools = append([]string(nil), policy.Tools...)
-	s := &Supervisor{root: root, policy: policy, state: supervisorState{Applications: map[string]*Application{}, Mailbox: map[string][]MailboxMessage{}, Bindings: map[string]WakeBinding{}}, authorizer: CapabilityAuthorizer{Policy: cedarPolicyFromCapabilitySet(policy)}}
+	s := &Supervisor{root: root, policy: policy, lastClaim: map[string]time.Time{}, state: supervisorState{Applications: map[string]*Application{}, Mailbox: map[string][]MailboxMessage{}, Bindings: map[string]WakeBinding{}}, authorizer: CapabilityAuthorizer{Policy: cedarPolicyFromCapabilitySet(policy)}}
 	s.lock = lock
 	if err := s.load(); err != nil {
 		s.Close()

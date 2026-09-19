@@ -1,0 +1,73 @@
+diff --git a/include/uapi/linux/aok.h b/include/uapi/linux/aok.h
+index a2c41ec9d..7c282894a 100644
+--- a/include/uapi/linux/aok.h
++++ b/include/uapi/linux/aok.h
+@@ -59,6 +59,16 @@
+ #define AOK_RES_STATE_PRESSURE 1U
+ #define AOK_RES_STATE_OVER 2U
+ 
++/*
++ * Per-resource enforcement levels, monotonically within -> throttle ->
++ * freeze. Tokens enter throttle at 80% of the hard limit; observed CPU
++ * and RSS at 90% of their limits. The kernel freezes at the limit; the
++ * throttle band is reported for admission policy (runtime rate limiting).
++ */
++#define AOK_RES_LEVEL_WITHIN 0U
++#define AOK_RES_LEVEL_THROTTLE 1U
++#define AOK_RES_LEVEL_FREEZE 2U
++
+ /*
+  * Minimal first-task ABI of this slice: the first task of aok_aproc_create()
+  * and every aok_aproc_spawn() task is a fork of the caller. The child returns
+@@ -135,8 +145,10 @@ struct aok_budget_status {
+ 	__u64 tokens_used;
+ 	__u64 tokens_cached;
+ 	__u32 res_state;
+-	__u32 reserved;
+-	__u64 reserved2[2];
++	__u32 cpu_level;
++	__u32 memory_level;
++	__u32 token_level;
++	__u64 reserved;
+ };
+ 
+ /*
+diff --git a/kernel/aok.c b/kernel/aok.c
+index 1513bb3fa..86361cbff 100644
+--- a/kernel/aok.c
++++ b/kernel/aok.c
+@@ -981,6 +981,21 @@ static void aok_force_freeze(struct aok_aproc *aproc)
+  * enforcement path in this slice; racy reads approximate per-task counters
+  * without perturbing the scheduler or reclaim.
+  */
++/* Per-resource enforcement level: within -> throttle -> freeze. `div` is
++ * the throttle denominator (5 = 80% for tokens, 10 = 90% for observed
++ * CPU/RSS). The kernel freezes at the limit; the throttle band is policy.
++ */
++static u32 aok_res_level(u64 limit, u64 used, u32 div)
++{
++	if (limit == U64_MAX)
++		return AOK_RES_LEVEL_WITHIN;
++	if (used >= limit)
++		return AOK_RES_LEVEL_FREEZE;
++	if (used >= limit - div64_u64(limit, div))
++		return AOK_RES_LEVEL_THROTTLE;
++	return AOK_RES_LEVEL_WITHIN;
++}
++
+ static void aok_observe_usage(struct aok_aproc *aproc, u64 *cpu_ns, u64 *bytes)
+ {
+ 	struct task_struct **tasks;
+@@ -1100,6 +1115,12 @@ SYSCALL_DEFINE2(aok_budget_get, int, fd,
+ 	status.tokens_used = aproc->tokens_used;
+ 	status.tokens_cached = aproc->tokens_cached;
+ 	status.res_state = aproc->res_state;
++	status.cpu_level = aok_res_level(aproc->res_cpu_limit,
++					 status.cpu_usec_used, 10);
++	status.memory_level = aok_res_level(aproc->res_mem_limit,
++						 status.memory_bytes_used, 10);
++	status.token_level = aok_res_level(aproc->res_token_hard,
++						   aproc->tokens_used, 5);
+ 	over = (status.cpu_usec_limit != U64_MAX &&
+ 		status.cpu_usec_used >= status.cpu_usec_limit) ||
+ 		(status.memory_bytes_limit != U64_MAX &&

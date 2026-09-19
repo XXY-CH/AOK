@@ -11,6 +11,15 @@ qemu=${QEMU:-qemu-system-aarch64}
 test -f "$image"
 test -f "$initrd"
 
+# Container-mounted paths can serve stale page cache to QEMU after the
+# artifacts are rewritten; boot from a private local copy instead.
+boot_dir=$(mktemp -d "${TMPDIR:-/tmp}/aok-boot.XXXXXX")
+cp "$image" "$boot_dir/Image"
+cp "$initrd" "$boot_dir/initrd"
+image="$boot_dir/Image"
+initrd="$boot_dir/initrd"
+trap 'kill "$qpid" 2>/dev/null || true; rm -rf "$boot_dir"' EXIT
+
 set --
 if [ "${AOK_QEMU_NETWORK:-0}" = 1 ]; then
     set -- -netdev user,id=aoknet -device virtio-net-device,netdev=aoknet
@@ -19,7 +28,7 @@ fi
     -kernel "$image" -initrd "$initrd" \
     -append "console=ttyAMA0 rdinit=/init panic=-1 ${AOK_TEST_ARGS:-}" > "$serial" 2>&1 &
 qpid=$!
-trap 'kill "$qpid" 2>/dev/null || true' EXIT
+trap 'kill "$qpid" 2>/dev/null || true; rm -rf "$boot_dir"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 seconds=0

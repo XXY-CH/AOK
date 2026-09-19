@@ -140,9 +140,17 @@ func (s *Supervisor) deliverTimers() error {
 	return nil
 }
 
+// throttleClaimInterval is the reduced admission rate for applications in
+// the token pressure band (>=80% of the limit): turns still run, one per
+// interval, instead of freezing at the first sign of pressure. The kernel
+// reports the band as AOK_RES_LEVEL_THROTTLE; the freeze at the hard limit
+// keeps its existing fail-closed behavior.
+const throttleClaimInterval = time.Second
+
 func (s *Supervisor) claimTurn() (string, MailboxMessage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now()
 	ids := make([]string, 0, len(s.state.Applications))
 	for id := range s.state.Applications {
 		ids = append(ids, id)
@@ -161,6 +169,13 @@ func (s *Supervisor) claimTurn() (string, MailboxMessage, error) {
 		if a.State != "serving" || a.WakePolicy == "manual" {
 			continue
 		}
+		// Admission throttle: in the pressure band admit at most one
+		// turn per interval; freezing only happens at the hard limit.
+		if a.TokenLimit > 0 && a.TokensUsed < a.TokenLimit &&
+			a.TokensUsed >= a.TokenLimit-a.TokenLimit/5 &&
+			now.Sub(s.lastClaim[id]) < throttleClaimInterval {
+			continue
+		}
 		for i := range s.state.Mailbox[id] {
 			m := &s.state.Mailbox[id][i]
 			if m.Status != "pending" {
@@ -174,6 +189,7 @@ func (s *Supervisor) claimTurn() (string, MailboxMessage, error) {
 			if err := s.persistLocked(nil); err != nil {
 				return "", MailboxMessage{}, err
 			}
+			s.lastClaim[id] = now
 			return id, copy, nil
 		}
 	}

@@ -109,7 +109,7 @@ save/restore, the Metal adapter, the Anthropic adapter, routing, the vsock API,
 PID1/initfs, and the capability sandbox.
 
 Kernel-side validation totals for the enabled build are: object 44, task 64,
-resource 53, event-source 38, event-wake 37, app-registry 47, and core 46
+resource 56, event-source 38, event-wake 37, app-registry 47, and core 46
 kselftests passing. The disabled build separately passes object 4, task 11,
 resource 8, event-source 6, and app-registry 5 `ENOSYS` checks, with
 reproducible patch-series rebuilds.
