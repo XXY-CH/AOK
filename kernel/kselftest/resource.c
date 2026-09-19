@@ -426,10 +426,13 @@ int main(int argc, char **argv)
 	close(result.pidfd);
 	close(fd2);
 
-	/* RSS is sampled independently and converted from pages to bytes. */
+	/* RSS is sampled independently and converted from pages to bytes.
+	 * A freshly forked task reports zero until it is first scheduled,
+	 * so let the child settle before observing it. */
 	fd2 = create_living(&first, &result);
 	if (fd2 < 0)
 		finish(1);
+	usleep(150000);
 	memset(&budget, 0, sizeof(budget));
 	budget.cpu_usec_limit = UINT64_MAX;
 	budget.memory_bytes_limit = 0;

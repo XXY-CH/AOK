@@ -68,8 +68,11 @@ failed  -> restart worker, restore checkpoint, replay pending events
 当前用户态 v0 只实现 timer 和 LSFS artifact commit 的持久 mailbox 投递。LSFS binding
 与 scan cursor 随 supervisor 恢复，runner 的 append/checkpoint 不产生唤醒事件。
 manual/frozen Application 会积累 pending，必须按现有管理流程处理或 resume。
-`0009` 已单独实现内核 timer/port 恢复显式授权的 frozen aproc；它尚未连接用户态
-Application registry，dormant 创建与上述持久恢复链路仍待集成。用户态 mailbox 满载时，LSFS 保留受阻事件前的
+`0009` 已单独实现内核 timer/port 恢复显式授权的 frozen aproc；`0010` 加入 boot 内
+durable 的 Application registry：内核队列按 `application_id` 跨 source fd 与进程
+replay，supervisor 以幂等键 drain 进 durable mailbox 并在关停/启动时 snapshot/
+restore。dormant aproc 创建、按持久 owner 的内核侧隔离与完整恢复链路仍待集成。
+用户态 mailbox 满载时，LSFS 保留受阻事件前的
 cursor、timer 保留原 due，确认消息释放容量后续投；retire 将未确认消息标为 expired。
 具体控制契约见 [control-api.md](control-api.md)。
 

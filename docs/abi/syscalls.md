@@ -40,6 +40,9 @@
 | `aok_event_bind(source_fd, application_ref, policy)` | 将事件源绑定到持久 `application_id` 和 wake policy | `WRITE` on source |
 | `aok_event_ack(source_fd, event_id)` | 幂等确认事件；未确认事件可 replay | `WRITE` on source |
 | `aok_event_read(source_fd, from_seq)` | 读取完整事件记录，支持 overflow 后重放 | `READ` |
+| `aok_application_create(attr, info)` | 注册或幂等重开一个 application，返回 durable 队列 fd | `MANAGE_CHILD` |
+| `aok_application_snapshot(app_fd, buf, count)` | 拷出全部未确认事件，返回总数 | `INSPECT` |
+| `aok_application_restore(app_fd, recs, count)` | 将快照回注入空队列并延续 id 空间 | `WRITE` |
 
 `freeze`、`resume`、`abort` 与 ACP `session/cancel` 不同：ACP cancel 只请求结束当前
 prompt turn；AOK freeze 停止所有绑定 task；abort 是内核对象上的取消操作。
@@ -69,6 +72,27 @@ timer/port 入队后通过 workqueue 恢复显式绑定的 `FROZEN` aproc；`ON_
 不自动恢复，failed/reaped 对象不会复活。显式授权 resume 保持原有语义。
 该路径不创建 dormant Application、不恢复 checkpoint、不消费或 ack 事件，也不提供跨
 进程/VM 的 durable replay。timer 满队列继续使用已有 coalesce 语义。
+
+### 已实现的 Application registry 切片
+
+`0010-aok-application-registry.patch` 加入 boot 内 durable 的 application 队列与
+LSFS 事件源。syscall 编号 487–489，权限与边界如下：
+
+| 操作 | 当前行为与权限 |
+|---|---|
+| `aok_application_create(&attr, &info)` (487) | `MANAGE_CHILD` parent；非零 `application_id` 幂等注册/重开，fd 权利为 `INSPECT\|DUPLICATE\|READ\|WRITE`。registry 条目整个 boot 存活，未确认事件跨 source fd 释放与进程退出 replay。 |
+| `ioctl(source_fd, AOK_EVENT_ATTACH_APP, &attach)` (`0xa022`) | source `WRITE` + app fd `READ\|WRITE`；id 必须匹配 fd。挂接后事件进入 application 队列（128 深，全局 id/sequence），记录携带触发 source koid。volatile 积压时 `EBUSY`。 |
+| `AOK_EVENT_SOURCE_LSFS` (`kind=3`) | 与 port 一样禁止 timer 参数；`AOK_EVENT_POST` 以 arg 携带 u64 commit cursor。满队列 `EAGAIN` 不消耗 identity，ack 后重试。 |
+| `ioctl(app_fd, AOK_APP_ACK, event_id)` (`0xa030`) | `WRITE`；确认本队列事件，可与挂接 source 的 `aok_event_ack` 互换，域限于该 application。 |
+| `read/poll(app_fd)` | `READ`；per-open cursor replay，duplicate 打开新 cursor。 |
+| `aok_application_snapshot` (488) | `INSPECT`；返回未确认总数并拷贝有序记录（reserved 清零，可原样回注）。 |
+| `aok_application_restore` (489) | `WRITE`；要求空队列、id 匹配且记录严格递增；id/sequence 计数推进到 max(现有, 回注)，boot 内不复用。 |
+
+挂接中的 source 换绑到其他 application 后，已打开 handle 的读取游标按队列归属惰性
+重置，从新队列头部重放；detach 要求 `application_id==0` 并清除 volatile 标签。
+`aok_object_inspect` 支持 application fd（`state` 为未确认条数）。按持久 owner 的
+application 隔离属于 supervisor 策略层；内核授权来自 parent capability。
+
 
 ## Budget
 

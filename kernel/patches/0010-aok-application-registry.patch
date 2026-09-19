@@ -1,5 +1,5 @@
 diff --git a/include/linux/aok.h b/include/linux/aok.h
-index aa4a1dd..d91dba1 100644
+index aa4a1dd..c376c7e 100644
 --- a/include/linux/aok.h
 +++ b/include/linux/aok.h
 @@ -74,6 +74,7 @@ struct aok_event_node {
@@ -18,7 +18,7 @@ index aa4a1dd..d91dba1 100644
  	struct delayed_work wake_work;
  	u64 event_seq;			/* last assigned */
  	u64 event_id;			/* last issued, never reused */
-@@ -98,6 +100,43 @@ struct aok_event_source {
+@@ -98,10 +100,49 @@ struct aok_event_source {
  	bool periodic;
  };
  
@@ -33,6 +33,7 @@ index aa4a1dd..d91dba1 100644
 +	bool used;
 +	u64 event_id;
 +	u64 event_seq;
++	u64 source_koid;		/* firing source, 0 when merged/restored */
 +	u32 kind;
 +	u32 coalesced;
 +	u64 data;
@@ -62,6 +63,11 @@ index aa4a1dd..d91dba1 100644
  struct aok_event_file {
  	struct aok_event_source *source;	/* pinned by this open */
  	u64 rights;
+ 	u64 read_seq;
++	struct aok_application *cursor_app;	/* queue the cursor indexes */
+ };
+ 
+ /* Handoff between aok syscalls and the copy_process() hook. */
 diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
 index 82e8a31..7c54c19 100644
 --- a/include/uapi/asm-generic/unistd.h
@@ -86,19 +92,25 @@ index 82e8a31..7c54c19 100644
  /*
   * 32 bit systems traditionally used different
 diff --git a/include/uapi/linux/aok.h b/include/uapi/linux/aok.h
-index eb43cec..6545841 100644
+index eb43cec..2eac787 100644
 --- a/include/uapi/linux/aok.h
 +++ b/include/uapi/linux/aok.h
-@@ -153,6 +153,8 @@ struct aok_budget_status {
+@@ -153,8 +153,13 @@ struct aok_budget_status {
  #define AOK_EVENT_KIND_TIMER 1U
  #define AOK_EVENT_SOURCE_PORT 2U
  #define AOK_EVENT_KIND_PORT 2U
 +#define AOK_EVENT_SOURCE_LSFS 3U
 +#define AOK_EVENT_KIND_LSFS 3U
  
- /* Event-source fd ioctls; SET_TARGET requires SIGNAL on the aproc fd. */
+-/* Event-source fd ioctls; SET_TARGET requires SIGNAL on the aproc fd. */
++/* Event-source fd ioctls; SET_TARGET requires SIGNAL on the aproc fd.
++ * POST enqueues one notification: port must pass 0, LSFS passes the
++ * commit cursor as arg. A full durable queue returns EAGAIN without
++ * consuming an event id; the sender retries after an ack frees a slot. */
  #define AOK_EVENT_SET_TARGET 0xa020U
-@@ -164,6 +166,36 @@ struct aok_event_target {
+ #define AOK_EVENT_POST 0xa021U
+ 
+@@ -164,6 +169,36 @@ struct aok_event_target {
  	__u32 wake_policy;
  };
  
@@ -135,7 +147,14 @@ index eb43cec..6545841 100644
  #define AOK_TIMER_ONESHOT 0U
  #define AOK_TIMER_PERIODIC 1U
  
-@@ -224,7 +256,8 @@ struct aok_event_record {
+@@ -218,13 +253,14 @@ struct aok_event_source_attr {
+ 
+ struct aok_event_record {
+ 	__u64 size;
+-	__u64 source_koid;
++	__u64 source_koid;	/* firing source; 0 for merged/restored events */
+ 	__u64 application_id;
+ 	__u64 event_id;
  	__u64 event_seq;
  	__u32 kind;
  	__u32 coalesced;
@@ -146,10 +165,10 @@ index eb43cec..6545841 100644
  
  /* Capability/inference control ABI. All handles are close-on-exec. */
 diff --git a/kernel/aok.c b/kernel/aok.c
-index 7a3dfc5..56e5d75 100644
+index 7a3dfc5..90d7ded 100644
 --- a/kernel/aok.c
 +++ b/kernel/aok.c
-@@ -1193,7 +1193,86 @@ SYSCALL_DEFINE2(aok_token_usage, int, fd,
+@@ -1193,7 +1193,72 @@ SYSCALL_DEFINE2(aok_token_usage, int, fd,
   * into a single pending count, flushed as one event when an ack recycles
   * a slot.
   */
@@ -164,7 +183,7 @@ index 7a3dfc5..56e5d75 100644
 +static LIST_HEAD(aok_apps);
 +
 +static void aok_app_fire_locked(struct aok_application *app, u32 kind,
-+				u64 data)
++				u64 data, u64 source_koid)
 +{
 +	struct aok_app_node *node = NULL;
 +	int i;
@@ -184,6 +203,7 @@ index 7a3dfc5..56e5d75 100644
 +	node->used = true;
 +	node->event_id = ++app->event_id;
 +	node->event_seq = ++app->event_seq;
++	node->source_koid = source_koid;
 +	node->kind = kind;
 +	node->coalesced = 1;
 +	node->data = data;
@@ -209,6 +229,7 @@ index 7a3dfc5..56e5d75 100644
 +	node->used = true;
 +	node->event_id = ++app->event_id;
 +	node->event_seq = ++app->event_seq;
++	node->source_koid = 0;
 +	node->kind = AOK_EVENT_KIND_TIMER;
 +	node->coalesced = app->coalesced;
 +	node->data = 0;
@@ -217,27 +238,11 @@ index 7a3dfc5..56e5d75 100644
 +	app->coalesced = 0;
 +}
 +
-+/* Registry entries are never freed, so a looked-up entry needs no pin. */
-+static struct aok_application *aok_app_find(u64 application_id)
-+{
-+	struct aok_application *app;
-+
-+	mutex_lock(&aok_apps_lock);
-+	list_for_each_entry(app, &aok_apps, list) {
-+		if (app->application_id == application_id) {
-+			mutex_unlock(&aok_apps_lock);
-+			return app;
-+		}
-+	}
-+	mutex_unlock(&aok_apps_lock);
-+	return NULL;
-+}
-+
 +static void aok_source_fire_locked(struct aok_event_source *source, u64 data)
  {
  	struct aok_event_node *node = NULL;
  	int i;
-@@ -1214,10 +1293,29 @@ static void aok_source_fire_locked(struct aok_event_source *source)
+@@ -1214,10 +1279,30 @@ static void aok_source_fire_locked(struct aok_event_source *source)
  	node->event_id = ++source->event_id;
  	node->event_seq = ++source->event_seq;
  	node->coalesced = 1;
@@ -257,7 +262,8 @@ index 7a3dfc5..56e5d75 100644
 +{
 +	if (source->app) {
 +		spin_lock(&source->app->lock);
-+		aok_app_fire_locked(source->app, source->kind, data);
++		aok_app_fire_locked(source->app, source->kind, data,
++				    source->koid);
 +		spin_unlock(&source->app->lock);
 +	} else {
 +		aok_source_fire_locked(source, data);
@@ -267,7 +273,7 @@ index 7a3dfc5..56e5d75 100644
  static void aok_source_wake_work(struct work_struct *work)
  {
  	struct aok_event_source *source = container_of(to_delayed_work(work),
-@@ -1228,7 +1326,16 @@ static void aok_source_wake_work(struct work_struct *work)
+@@ -1228,7 +1313,16 @@ static void aok_source_wake_work(struct work_struct *work)
  
  	mutex_lock(&source->bind_lock);
  	spin_lock_irq(&source->lock);
@@ -285,7 +291,7 @@ index 7a3dfc5..56e5d75 100644
  	spin_unlock_irq(&source->lock);
  	if (wake && source->wake_target) {
  		target = source->wake_target->private_data;
-@@ -1242,10 +1349,27 @@ static void aok_source_wake_work(struct work_struct *work)
+@@ -1242,10 +1336,27 @@ static void aok_source_wake_work(struct work_struct *work)
  
  static void aok_source_notify(struct aok_event_source *source)
  {
@@ -313,7 +319,7 @@ index 7a3dfc5..56e5d75 100644
  static enum hrtimer_restart aok_timer_fn(struct hrtimer *timer)
  {
  	struct aok_event_source *source =
-@@ -1253,7 +1377,7 @@ static enum hrtimer_restart aok_timer_fn(struct hrtimer *timer)
+@@ -1253,7 +1364,7 @@ static enum hrtimer_restart aok_timer_fn(struct hrtimer *timer)
  	unsigned long flags;
  
  	spin_lock_irqsave(&source->lock, flags);
@@ -322,7 +328,7 @@ index 7a3dfc5..56e5d75 100644
  	spin_unlock_irqrestore(&source->lock, flags);
  	aok_source_notify(source);
  
-@@ -1283,6 +1407,7 @@ static void aok_source_flush_locked(struct aok_event_source *source)
+@@ -1283,6 +1394,7 @@ static void aok_source_flush_locked(struct aok_event_source *source)
  	node->event_id = ++source->event_id;
  	node->event_seq = ++source->event_seq;
  	node->coalesced = source->coalesced;
@@ -330,7 +336,7 @@ index 7a3dfc5..56e5d75 100644
  	list_add_tail(&node->list, &source->pending);
  	source->live++;
  	source->coalesced = 0;
-@@ -1298,6 +1423,8 @@ static int aok_event_release(struct inode *inode, struct file *file)
+@@ -1298,6 +1410,8 @@ static int aok_event_release(struct inode *inode, struct file *file)
  		cancel_delayed_work_sync(&source->wake_work);
  		if (source->wake_target)
  			fput(source->wake_target);
@@ -339,15 +345,23 @@ index 7a3dfc5..56e5d75 100644
  		kfree(source);
  	}
  	kfree(handle);
-@@ -1308,6 +1435,7 @@ static int aok_event_release(struct inode *inode, struct file *file)
-  * One record per call from the per-open cursor. Unacked events stay in the
-  * queue, so duplicating the fd yields a fresh cursor and replays them; the
-  * cursor advances before copyout (consume semantics, matching aproc read).
-+ * An attached source reads from the application's durable queue.
+@@ -1305,9 +1419,12 @@ static int aok_event_release(struct inode *inode, struct file *file)
+ }
+ 
+ /*
+- * One record per call from the per-open cursor. Unacked events stay in the
+- * queue, so duplicating the fd yields a fresh cursor and replays them; the
+- * cursor advances before copyout (consume semantics, matching aproc read).
++ * One record per call from the per-open cursor. Unacked events stay in
++ * the queue, so duplicating the fd yields a fresh cursor and replays them;
++ * the cursor advances before copyout (consume semantics, matching aproc
++ * read). An attached source reads from the application's durable queue;
++ * the cursor tracks which queue it indexes, so an attach change replays
++ * the new queue from its start instead of skipping its low sequences.
   */
  static ssize_t aok_event_read(struct file *file, char __user *buf,
  			      size_t count, loff_t *ppos)
-@@ -1315,7 +1443,8 @@ static ssize_t aok_event_read(struct file *file, char __user *buf,
+@@ -1315,7 +1432,8 @@ static ssize_t aok_event_read(struct file *file, char __user *buf,
  	struct aok_event_file *handle = file->private_data;
  	struct aok_event_source *source = handle->source;
  	struct aok_event_record rec = { .size = sizeof(rec), };
@@ -357,7 +371,7 @@ index 7a3dfc5..56e5d75 100644
  	unsigned long flags;
  
  	if (!(handle->rights & AOK_RIGHT_READ))
-@@ -1324,26 +1453,49 @@ static ssize_t aok_event_read(struct file *file, char __user *buf,
+@@ -1324,26 +1442,53 @@ static ssize_t aok_event_read(struct file *file, char __user *buf,
  		return -EINVAL;
  
  	spin_lock_irqsave(&source->lock, flags);
@@ -366,6 +380,10 @@ index 7a3dfc5..56e5d75 100644
 -		if (iter->event_seq > handle->read_seq) {
 -			node = iter;
 -			break;
++	if (handle->cursor_app != source->app) {
++		handle->read_seq = 0;
++		handle->cursor_app = source->app;
++	}
 +	if (source->app) {
 +		struct aok_app_node *aiter;
 +
@@ -377,7 +395,7 @@ index 7a3dfc5..56e5d75 100644
 +			}
 +		}
 +		if (app_node) {
-+			rec.source_koid = source->koid;
++			rec.source_koid = app_node->source_koid;
 +			rec.application_id = source->app->application_id;
 +			rec.event_id = app_node->event_id;
 +			rec.event_seq = app_node->event_seq;
@@ -423,7 +441,7 @@ index 7a3dfc5..56e5d75 100644
  	if (copy_to_user(buf, &rec, sizeof(rec)))
  		return -EFAULT;
  	return sizeof(rec);
-@@ -1353,20 +1505,37 @@ static __poll_t aok_event_poll(struct file *file, poll_table *wait)
+@@ -1353,20 +1498,41 @@ static __poll_t aok_event_poll(struct file *file, poll_table *wait)
  {
  	struct aok_event_file *handle = file->private_data;
  	struct aok_event_source *source = handle->source;
@@ -440,6 +458,10 @@ index 7a3dfc5..56e5d75 100644
 -		if (node->event_seq > handle->read_seq) {
 -			mask = EPOLLIN | EPOLLRDNORM;
 -			break;
++	if (handle->cursor_app != source->app) {
++		handle->read_seq = 0;
++		handle->cursor_app = source->app;
++	}
 +	if (source->app) {
 +		/* Registry entries persist, so registering is always safe. */
 +		poll_wait(file, &source->app->wait, wait);
@@ -465,7 +487,7 @@ index 7a3dfc5..56e5d75 100644
  	return mask;
  }
  
-@@ -1375,14 +1544,27 @@ static __poll_t aok_event_poll(struct file *file, poll_table *wait)
+@@ -1375,14 +1541,27 @@ static __poll_t aok_event_poll(struct file *file, poll_table *wait)
  static int aok_source_bind(struct aok_event_source *source, u64 application_id,
  			   u32 policy, struct file *target)
  {
@@ -496,7 +518,7 @@ index 7a3dfc5..56e5d75 100644
  		ret = -EBUSY;
  		goto out;
  	}
-@@ -1403,33 +1585,120 @@ static int aok_source_bind(struct aok_event_source *source, u64 application_id,
+@@ -1403,33 +1582,124 @@ static int aok_source_bind(struct aok_event_source *source, u64 application_id,
  	return ret;
  }
  
@@ -527,6 +549,9 @@ index 7a3dfc5..56e5d75 100644
 +	if (app) {
 +		refcount_inc(&app->refs);
 +		source->application_id = application_id;
++	} else {
++		/* Volatile records must not carry a stale registry label. */
++		source->application_id = 0;
 +	}
 +	spin_unlock_irq(&source->lock);
 +	if (old)
@@ -578,7 +603,8 @@ index 7a3dfc5..56e5d75 100644
 +				spin_unlock_irqrestore(&source->lock, flags);
 +				return -EAGAIN;
 +			}
-+			aok_app_fire_locked(source->app, source->kind, arg);
++			aok_app_fire_locked(source->app, source->kind, arg,
++					    source->koid);
 +			spin_unlock(&source->app->lock);
 +		} else {
 +			if (source->live == AOK_EVENT_SOURCE_DEPTH) {
@@ -625,7 +651,7 @@ index 7a3dfc5..56e5d75 100644
  	if (copy_from_user(&attr, (void __user *)arg, sizeof(attr)))
  		return -EFAULT;
  	if (attr.wake_policy > AOK_WAKE_ON_QUIESCENT || attr.aproc_fd < -1)
-@@ -1483,7 +1752,8 @@ static int aok_copy_source_attr(struct aok_event_source_attr *attr,
+@@ -1483,7 +1753,8 @@ static int aok_copy_source_attr(struct aok_event_source_attr *attr,
  	if (attr->size != size ||
  	    attr->reserved || attr->reserved2[0] || attr->reserved2[1])
  		return -EINVAL;
@@ -635,7 +661,7 @@ index 7a3dfc5..56e5d75 100644
  		return attr->flags || attr->first_ns || attr->interval_ns ?
  		       -EINVAL : 0;
  	if (attr->kind != AOK_EVENT_SOURCE_TIMER)
-@@ -1632,6 +1902,7 @@ SYSCALL_DEFINE2(aok_event_ack, int, fd, u64, event_id)
+@@ -1632,6 +1903,7 @@ SYSCALL_DEFINE2(aok_event_ack, int, fd, u64, event_id)
  	struct aok_event_file *handle;
  	struct aok_event_source *source;
  	struct aok_event_node *node;
@@ -643,7 +669,7 @@ index 7a3dfc5..56e5d75 100644
  	struct fd f;
  	bool flushed = false;
  
-@@ -1649,28 +1920,458 @@ SYSCALL_DEFINE2(aok_event_ack, int, fd, u64, event_id)
+@@ -1649,28 +1921,464 @@ SYSCALL_DEFINE2(aok_event_ack, int, fd, u64, event_id)
  		return -EACCES;
  	}
  	spin_lock_irq(&source->lock);
@@ -738,9 +764,8 @@ index 7a3dfc5..56e5d75 100644
 +	if (!node) {
 +		spin_unlock_irqrestore(&app->lock, flags);
 +		return 0;
- 	}
--	list_for_each_entry(node, &source->pending, list) {
-+	rec.source_koid = app->koid;
++	}
++	rec.source_koid = node->source_koid;
 +	rec.application_id = app->application_id;
 +	rec.event_id = node->event_id;
 +	rec.event_seq = node->event_seq;
@@ -771,7 +796,8 @@ index 7a3dfc5..56e5d75 100644
 +			mask = EPOLLIN | EPOLLRDNORM;
 +			break;
 +		}
-+	}
+ 	}
+-	list_for_each_entry(node, &source->pending, list) {
 +	spin_unlock_irq(&app->lock);
 +	return mask;
 +}
@@ -990,8 +1016,9 @@ index 7a3dfc5..56e5d75 100644
 +		return -EACCES;
 +	}
 +	app = handle->app;
-+	records = kvmalloc_array(AOK_APP_QUEUE_DEPTH, sizeof(*records),
-+				 GFP_KERNEL);
++	/* Zeroed storage: reserved fields must not leak kernel memory and a
++	 * snapshot must round-trip through restore unchanged. */
++	records = kvcalloc(AOK_APP_QUEUE_DEPTH, sizeof(*records), GFP_KERNEL);
 +	if (!records) {
 +		fdput(f);
 +		return -ENOMEM;
@@ -1001,7 +1028,7 @@ index 7a3dfc5..56e5d75 100644
 +		struct aok_event_record *rec = &records[filled++];
 +
 +		rec->size = sizeof(*rec);
-+		rec->source_koid = app->koid;
++		rec->source_koid = node->source_koid;
 +		rec->application_id = app->application_id;
 +		rec->event_id = node->event_id;
 +		rec->event_seq = node->event_seq;
@@ -1093,14 +1120,19 @@ index 7a3dfc5..56e5d75 100644
 +		node->used = true;
 +		node->event_id = records[i].event_id;
 +		node->event_seq = records[i].event_seq;
++		node->source_koid = records[i].source_koid;
 +		node->kind = records[i].kind;
 +		node->coalesced = records[i].coalesced;
 +		node->data = records[i].data;
 +		list_add_tail(&node->list, &app->pending);
 +	}
 +	app->live = count;
-+	app->event_id = records[count - 1].event_id;
-+	app->event_seq = records[count - 1].event_seq;
++	/* Ids are never reused within a boot: continue past both the restored
++	 * records and anything this boot already issued, whichever is larger. */
++	if (records[count - 1].event_id > app->event_id)
++		app->event_id = records[count - 1].event_id;
++	if (records[count - 1].event_seq > app->event_seq)
++		app->event_seq = records[count - 1].event_seq;
 +	spin_unlock_irq(&app->lock);
 +	aok_app_notify(app);
 +	ret = 0;
@@ -1113,7 +1145,31 @@ index 7a3dfc5..56e5d75 100644
  SYSCALL_DEFINE2(aok_object_inspect, int, fd,
  		struct aok_object_info __user *, uinfo)
  {
-@@ -1706,10 +2407,37 @@ SYSCALL_DEFINE2(aok_handle_duplicate, int, fd, u64, rights)
+@@ -1681,6 +2389,23 @@ SYSCALL_DEFINE2(aok_object_inspect, int, fd,
+ 
+ 	if (fd_empty(f))
+ 		return -EBADF;
++	if (fd_file(f)->f_op == &aok_app_fops) {
++		struct aok_app_file *app_handle = fd_file(f)->private_data;
++		struct aok_application *app = app_handle->app;
++
++		if (!(app_handle->rights & AOK_RIGHT_INSPECT)) {
++			fdput(f);
++			return -EACCES;
++		}
++		spin_lock(&app->lock);
++		info.aid = app->koid;
++		info.state = app->live;
++		spin_unlock(&app->lock);
++		info.type = AOK_OBJECT_APPLICATION;
++		info.rights = app_handle->rights;
++		fdput(f);
++		return aok_copy_info(uinfo, &info);
++	}
+ 	if (fd_file(f)->f_op != &aok_aproc_fops) {
+ 		fdput(f);
+ 		return -EINVAL;
+@@ -1706,10 +2431,37 @@ SYSCALL_DEFINE2(aok_handle_duplicate, int, fd, u64, rights)
  	struct fd f = fdget(fd);
  	struct aok_handle *old, *handle;
  	struct aok_event_file *ev_old, *ev_handle;
@@ -1151,6 +1207,20 @@ index 7a3dfc5..56e5d75 100644
  	if (fd_file(f)->f_op == &aok_event_fops) {
  		ev_old = fd_file(f)->private_data;
  		if (!(ev_old->rights & AOK_RIGHT_DUPLICATE) ||
+@@ -1722,10 +2474,12 @@ SYSCALL_DEFINE2(aok_handle_duplicate, int, fd, u64, rights)
+ 			fdput(f);
+ 			return -ENOMEM;
+ 		}
+-		/* A duplicate opens a fresh cursor: unacked events replay. */
++		/* A duplicate opens a fresh cursor: unacked events replay. The
++		 * first read re-checks the cursor's queue assignment. */
+ 		ev_handle->source = ev_old->source;
+ 		ev_handle->rights = rights;
+ 		ev_handle->read_seq = 0;
++		ev_handle->cursor_app = NULL;
+ 		refcount_inc(&ev_handle->source->refs);
+ 		ret = anon_inode_getfd("aok-event-source", &aok_event_fops,
+ 				       ev_handle, O_RDWR | O_CLOEXEC);
 diff --git a/kernel/sys_ni.c b/kernel/sys_ni.c
 index 817d5bc..be2aa4c 100644
 --- a/kernel/sys_ni.c

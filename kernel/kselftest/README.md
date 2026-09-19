@@ -55,3 +55,12 @@ manual policy, detach, resource freeze, terminal states and repeated freeze/wake
 `make aok-eventwake-test` (optionally with `AOK_OBJECT_OUTPUT` for a separate build).
 See [event wake validation](../../docs/KERNEL-EVENT-WAKE-VALIDATION.md) for results
 and the boundary between this volatile kernel source and the durable supervisor.
+
+`appregistry.c` exercises the `0010` application registry: idempotent
+registration, LSFS posts with a commit cursor, the shared id/sequence space,
+replay across source fd release and across processes, application fd read/poll/
+ack rights, ack isolation per application, bounded-queue EAGAIN, snapshot and
+restore round-trips and rebind cursor reset. `make aok-appregistry-test` and
+`make aok-appregistry-test-disabled` run it; results and the mutation check are
+in [application registry validation](../../docs/KERNEL-APP-REGISTRY-VALIDATION.md).
+All `aok-*-test` targets honor `AOK_OBJECT_OUTPUT` to select a build directory.

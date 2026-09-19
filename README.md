@@ -82,11 +82,12 @@ capability, resource domains, cache compatibility, and usage reconciliation.
 
 ## Core capabilities
 
-- **AOK Linux kernel patch series** (`0001`–`0009`, on top of `linux-6.18.y`):
+- **AOK Linux kernel patch series** (`0001`–`0010`, on top of `linux-6.18.y`):
   object handles, PID1 root capability bootstrap, aproc/task/pidfd lifecycle,
   resource budget narrowing with CPU/RSS observation and token accounting,
-  timer/port event sources with poll, ack/replay, authorized aproc wake, and the
-  inference capability.
+  timer/port event sources with poll, ack/replay, authorized aproc wake, the
+  inference capability, and the within-boot durable application registry (LSFS
+  event source, per-application ack isolation, snapshot/restore).
 - **Durable Go supervisor**: SQLite WAL state, application lifecycle, mailbox
   replay, timers, checkpoints, context CAS, and an audit hash chain.
 - **Inference backends**: llama.cpp, the Anthropic Messages API, a loopback
@@ -108,20 +109,23 @@ save/restore, the Metal adapter, the Anthropic adapter, routing, the vsock API,
 PID1/initfs, and the capability sandbox.
 
 Kernel-side validation totals for the enabled build are: object 44, task 64,
-resource 53, event-source 38, event-wake 37, and core 46 kselftests passing.
-The disabled build separately passes object 4, task 11, resource 8, and
-event-source 6 `ENOSYS` checks, with reproducible patch-series rebuilds.
+resource 53, event-source 38, event-wake 37, app-registry 45, and core 46
+kselftests passing. The disabled build separately passes object 4, task 11,
+resource 8, event-source 6, and app-registry 5 `ENOSYS` checks, with
+reproducible patch-series rebuilds.
 
 Known boundaries remain explicit: `ANTHROPIC_API_KEY` is not configured on the
 development machine, so live Anthropic service verification is blocked; the
 current QEMU setup has no usable virtio-vsock device model; native AOK
-sched_ext/memcg enforcement, amem/LSFS, system-wide taint/unotify/witness
-integration, and cross-process engine session replay are still pending. The
-runtime does provide bounded in-process session suspend/resume and durable
-Application generation/checkpoint/mailbox recovery.
+sched_ext/memcg enforcement, amem/LSFS storage, and cross-process engine
+session replay are still pending. The runtime provides bounded in-process
+session suspend/resume, durable Application generation/checkpoint/mailbox
+recovery, and the kernel application-registry drain/snapshot/restore wiring.
 
-Detailed status: [docs/IMPLEMENTATION-STATUS.md](docs/IMPLEMENTATION-STATUS.md)
-and [docs/AOK-CORE-VALIDATION.md](docs/AOK-CORE-VALIDATION.md)
+Detailed status: [docs/IMPLEMENTATION-STATUS.md](docs/IMPLEMENTATION-STATUS.md),
+[docs/AOK-CORE-VALIDATION.md](docs/AOK-CORE-VALIDATION.md),
+[docs/KERNEL-EVENT-WAKE-VALIDATION.md](docs/KERNEL-EVENT-WAKE-VALIDATION.md), and
+[docs/KERNEL-APP-REGISTRY-VALIDATION.md](docs/KERNEL-APP-REGISTRY-VALIDATION.md)
 
 ## Roadmap
 
@@ -163,6 +167,7 @@ make aok-task-test
 make aok-resource-test
 make aok-eventsrc-test
 make aok-eventwake-test
+make aok-appregistry-test
 make aok-core-test
 ```
 
@@ -208,6 +213,7 @@ The generated archive contains `/init`, `/sbin/aok-supervisor`,
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | layering, application model, ABI boundaries |
 | [docs/IMPLEMENTATION-STATUS.md](docs/IMPLEMENTATION-STATUS.md) | frozen decisions and current boundaries |
 | [docs/KERNEL-EVENT-WAKE-VALIDATION.md](docs/KERNEL-EVENT-WAKE-VALIDATION.md) | kernel timer/port poll and aproc wake evidence |
+| [docs/KERNEL-APP-REGISTRY-VALIDATION.md](docs/KERNEL-APP-REGISTRY-VALIDATION.md) | kernel application registry, durable replay and supervisor wiring evidence |
 | [docs/PLAN-L0-AGENT-KERNEL.md](docs/PLAN-L0-AGENT-KERNEL.md) | L0 agent-kernel design plan |
 | [docs/PLAN-AOK-DEEP.md](docs/PLAN-AOK-DEEP.md) | deep design decisions with research sources |
 | [docs/abi/](docs/abi/) | fd ABI, engine protocol, control API, application/context models |

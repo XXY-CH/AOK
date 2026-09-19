@@ -140,7 +140,8 @@ int main(int argc, char **argv)
 	     ev.kind == AOK_EVENT_KIND_TIMER && ev.event_seq == 1 &&
 	     ev.event_id == 1 && ev.coalesced == 1 &&
 	     ev.application_id == 0 && ev.source_koid == info.aid &&
-	     ev.size == sizeof(ev) && !ev.reserved[0] && !ev.reserved[2];
+	     ev.size == sizeof(ev) && !ev.reserved[0] && !ev.reserved[1] &&
+	     !ev.data;
 	ksft_test_result(ok, "timer expiry produces one event\n");
 	EXPECT_ERR(read(fd, &ev, sizeof(ev) - 1), EINVAL, "short event buffer");
 	/* A fresh cursor sees the unacked event again; a faulting buffer

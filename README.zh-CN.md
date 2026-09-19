@@ -74,10 +74,12 @@ Application 不属于某一个 Linux task。它由持久身份、版本化 contr
 
 ## 核心能力
 
-- **AOK Linux kernel patch series**（`0001`–`0009`，基于 `linux-6.18.y`）：
+- **AOK Linux kernel patch series**（`0001`–`0010`，基于 `linux-6.18.y`）：
   object handles、PID1 root capability bootstrap、aproc/task/pidfd 生命周期、
   资源预算收窄与 CPU/RSS 观测及 token 台账、带 ack/replay 的 timer 事件源、
-  可 poll 的 port 事件源、授权 aproc 唤醒，以及推理 capability。
+  可 poll 的 port 事件源、授权 aproc 唤醒、推理 capability，以及 boot 内
+  durable 的 Application registry（LSFS 事件源、按 application 隔离的 ack、
+  snapshot/restore）。
 - **Durable Go supervisor**：SQLite WAL 状态、application 生命周期、mailbox
   replay、timer、checkpoint、context CAS 和 audit hash chain。
 - **推理后端**：llama.cpp、Anthropic Messages API、loopback Metal llama.cpp
@@ -98,18 +100,21 @@ llama.cpp CPU probe、带崩溃回放的 durable supervisor、被监督的 engin
 vsock API、PID1/initfs 和 capability sandbox。
 
 启用构建的内核验证为：object 44、task 64、resource 53、event-source 38、
-event-wake 37、core 46 项 kselftest。禁用构建另有 object 4、task 11、resource 8、
-event-source 6 项 `ENOSYS` 检查通过，均来自可复现的 patch series 重建。
+event-wake 37、app-registry 45、core 46 项 kselftest。禁用构建另有 object 4、
+task 11、resource 8、event-source 6、app-registry 5 项 `ENOSYS` 检查通过，均来自
+可复现的 patch series 重建。
 
 已知边界保持显式：本机未配置 `ANTHROPIC_API_KEY`，因此没有真实 Anthropic
 service verification；当前 QEMU 没有可用 virtio-vsock device model；AOK 内核
-原生 sched_ext/memcg 强制、amem/LSFS、全系统污点/unotify/witness 和跨进程
-engine session replay 仍未完成。runtime 已提供有界的进程内 session
-suspend/resume，以及持久 Application generation/checkpoint/mailbox 恢复。
+原生 sched_ext/memcg 强制、amem/LSFS 存储和跨进程 engine session replay 仍未完成。
+runtime 已提供有界的进程内 session suspend/resume、持久 Application
+generation/checkpoint/mailbox 恢复，以及内核 Application registry 的 drain/
+snapshot/restore 接线。
 
 详细状态：[docs/IMPLEMENTATION-STATUS.md](docs/IMPLEMENTATION-STATUS.md)、
-[docs/AOK-CORE-VALIDATION.md](docs/AOK-CORE-VALIDATION.md) 和
-[docs/KERNEL-EVENT-WAKE-VALIDATION.md](docs/KERNEL-EVENT-WAKE-VALIDATION.md)
+[docs/AOK-CORE-VALIDATION.md](docs/AOK-CORE-VALIDATION.md)、
+[docs/KERNEL-EVENT-WAKE-VALIDATION.md](docs/KERNEL-EVENT-WAKE-VALIDATION.md) 和
+[docs/KERNEL-APP-REGISTRY-VALIDATION.md](docs/KERNEL-APP-REGISTRY-VALIDATION.md)
 
 ## 路线
 
@@ -150,6 +155,8 @@ make aok-object-test
 make aok-task-test
 make aok-resource-test
 make aok-eventsrc-test
+make aok-eventwake-test
+make aok-appregistry-test
 make aok-core-test
 ```
 

@@ -4,7 +4,7 @@ LINUX_URL := https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
 LINUX_BRANCH := linux-6.18.y
 LINUX_DIR := kernel/linux
 
-.PHONY: linux-mount linux-fetch linux-status kernel-config-probe qemu-initramfs aok-initramfs qemu-boot linux-clean-prep aok-object-build aok-object-test aok-object-test-disabled aok-patch-check aok-candidate-check aok-task-test aok-task-test-disabled aok-resource-test aok-resource-test-disabled aok-eventsrc-test aok-eventsrc-test-disabled
+.PHONY: linux-mount linux-fetch linux-status kernel-config-probe qemu-initramfs aok-initramfs qemu-boot linux-clean-prep aok-object-build aok-object-test aok-object-test-disabled aok-patch-check aok-candidate-check aok-task-test aok-task-test-disabled aok-resource-test aok-resource-test-disabled aok-eventsrc-test aok-eventsrc-test-disabled aok-appregistry-test-disabled
 
 linux-mount:
 	@if [ -d "$(LINUX_DIR)/.git" ]; then \
@@ -57,49 +57,53 @@ aok-object-build:
 	@sh kernel/kselftest/build-object.sh
 
 aok-object-test:
-	@sh kernel/kselftest/run-object.sh
+	@AOK_INITRD="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/initramfs.cpio.gz" \
+	 AOK_SERIAL_LOG="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/serial.log" \
+	 AOK_TEST_MARKER=AOK_OBJECT_TEST sh kernel/kselftest/run-object.sh
 
 aok-object-test-disabled:
-	@AOK_OBJECT_IMAGE="$(CURDIR)/kernel/.build/qemu-arm64-object/Image.disabled" \
-	 AOK_SERIAL_LOG="$(CURDIR)/kernel/.build/qemu-arm64-object/serial.disabled.log" \
+	@AOK_OBJECT_IMAGE="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/Image.disabled" \
+	 AOK_INITRD="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/initramfs.cpio.gz" \
+	 AOK_SERIAL_LOG="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/serial.disabled.log" \
+	 AOK_TEST_MARKER=AOK_OBJECT_TEST \
 	 AOK_TEST_ARGS=--expect-disabled sh kernel/kselftest/run-object.sh
 
 aok-patch-check:
 	@sh kernel/patches/check-series.sh
 
 aok-task-test:
-	@AOK_INITRD="$(CURDIR)/kernel/.build/qemu-arm64-object/task-initramfs.cpio.gz" \
-	 AOK_SERIAL_LOG="$(CURDIR)/kernel/.build/qemu-arm64-object/serial-task.log" \
+	@AOK_INITRD="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/task-initramfs.cpio.gz" \
+	 AOK_SERIAL_LOG="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/serial-task.log" \
 	 AOK_TEST_MARKER=AOK_TASK_TEST sh kernel/kselftest/run-object.sh
 
 aok-task-test-disabled:
-	@AOK_OBJECT_IMAGE="$(CURDIR)/kernel/.build/qemu-arm64-object/Image.disabled" \
-	 AOK_INITRD="$(CURDIR)/kernel/.build/qemu-arm64-object/task-initramfs.cpio.gz" \
-	 AOK_SERIAL_LOG="$(CURDIR)/kernel/.build/qemu-arm64-object/serial-task.disabled.log" \
+	@AOK_OBJECT_IMAGE="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/Image.disabled" \
+	 AOK_INITRD="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/task-initramfs.cpio.gz" \
+	 AOK_SERIAL_LOG="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/serial-task.disabled.log" \
 	 AOK_TEST_MARKER=AOK_TASK_TEST \
 	 AOK_TEST_ARGS=--expect-disabled sh kernel/kselftest/run-object.sh
 
 aok-resource-test:
-	@AOK_INITRD="$(CURDIR)/kernel/.build/qemu-arm64-object/resource-initramfs.cpio.gz" \
-	 AOK_SERIAL_LOG="$(CURDIR)/kernel/.build/qemu-arm64-object/serial-resource.log" \
+	@AOK_INITRD="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/resource-initramfs.cpio.gz" \
+	 AOK_SERIAL_LOG="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/serial-resource.log" \
 	 AOK_TEST_MARKER=AOK_RESOURCE_TEST sh kernel/kselftest/run-object.sh
 
 aok-resource-test-disabled:
-	@AOK_OBJECT_IMAGE="$(CURDIR)/kernel/.build/qemu-arm64-object/Image.disabled" \
-	 AOK_INITRD="$(CURDIR)/kernel/.build/qemu-arm64-object/resource-initramfs.cpio.gz" \
-	 AOK_SERIAL_LOG="$(CURDIR)/kernel/.build/qemu-arm64-object/serial-resource.disabled.log" \
+	@AOK_OBJECT_IMAGE="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/Image.disabled" \
+	 AOK_INITRD="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/resource-initramfs.cpio.gz" \
+	 AOK_SERIAL_LOG="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/serial-resource.disabled.log" \
 	 AOK_TEST_MARKER=AOK_RESOURCE_TEST \
 	 AOK_TEST_ARGS=--expect-disabled sh kernel/kselftest/run-object.sh
 
 aok-eventsrc-test:
-	@AOK_INITRD="$(CURDIR)/kernel/.build/qemu-arm64-object/eventsrc-initramfs.cpio.gz" \
-	 AOK_SERIAL_LOG="$(CURDIR)/kernel/.build/qemu-arm64-object/serial-eventsrc.log" \
+	@AOK_INITRD="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/eventsrc-initramfs.cpio.gz" \
+	 AOK_SERIAL_LOG="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/serial-eventsrc.log" \
 	 AOK_TEST_MARKER=AOK_EVENTSRC_TEST sh kernel/kselftest/run-object.sh
 
 aok-eventsrc-test-disabled:
-	@AOK_OBJECT_IMAGE="$(CURDIR)/kernel/.build/qemu-arm64-object/Image.disabled" \
-	 AOK_INITRD="$(CURDIR)/kernel/.build/qemu-arm64-object/eventsrc-initramfs.cpio.gz" \
-	 AOK_SERIAL_LOG="$(CURDIR)/kernel/.build/qemu-arm64-object/serial-eventsrc.disabled.log" \
+	@AOK_OBJECT_IMAGE="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/Image.disabled" \
+	 AOK_INITRD="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/eventsrc-initramfs.cpio.gz" \
+	 AOK_SERIAL_LOG="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/serial-eventsrc.disabled.log" \
 	 AOK_TEST_MARKER=AOK_EVENTSRC_TEST \
 	 AOK_TEST_ARGS=--expect-disabled sh kernel/kselftest/run-object.sh
 
@@ -108,6 +112,19 @@ aok-eventwake-test:
 	@AOK_INITRD="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/eventwake-initramfs.cpio.gz" \
 	 AOK_SERIAL_LOG="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/serial-eventwake.log" \
 	 AOK_TEST_MARKER=AOK_EVENTWAKE_TEST sh kernel/kselftest/run-object.sh
+
+.PHONY: aok-appregistry-test aok-appregistry-test-disabled
+aok-appregistry-test:
+	@AOK_INITRD="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/appregistry-initramfs.cpio.gz" \
+	 AOK_SERIAL_LOG="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/serial-appregistry.log" \
+	 AOK_TEST_MARKER=AOK_APPREG_TEST sh kernel/kselftest/run-object.sh
+
+aok-appregistry-test-disabled:
+	@AOK_OBJECT_IMAGE="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/Image.disabled" \
+	 AOK_INITRD="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/appregistry-initramfs.cpio.gz" \
+	 AOK_SERIAL_LOG="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/serial-appregistry.disabled.log" \
+	 AOK_TEST_MARKER=AOK_APPREG_TEST \
+	 AOK_TEST_ARGS=--expect-disabled sh kernel/kselftest/run-object.sh
 
 aok-candidate-check:
 	@test -n "$(PATCH)" || { echo 'usage: make aok-candidate-check PATCH=kernel/patches/0003-...patch' >&2; exit 2; }
@@ -130,6 +147,6 @@ runtime-core-smoke:
 	@python3 runtime/scripts/core-smoke.py
 
 aok-core-test:
-	@AOK_INITRD="$(CURDIR)/kernel/.build/qemu-arm64-object/core-initramfs.cpio.gz" \
-	 AOK_SERIAL_LOG="$(CURDIR)/kernel/.build/qemu-arm64-object/serial-core.log" \
+	@AOK_INITRD="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/core-initramfs.cpio.gz" \
+	 AOK_SERIAL_LOG="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/serial-core.log" \
 	 AOK_TEST_MARKER=AOK_CORE_TEST sh kernel/kselftest/run-object.sh

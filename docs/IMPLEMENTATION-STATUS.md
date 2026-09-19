@@ -43,8 +43,19 @@
   目标绑定必须持有 aproc `SIGNAL`；自动恢复不能绕过资源冻结，未确认事件阻止换绑。
   37 项实际 task 心跳/唤醒测试和 object 44、task 64、resource 53、event-source 38、
   core 46 项 QEMU 回归通过，见 [KERNEL-EVENT-WAKE-VALIDATION.md](KERNEL-EVENT-WAKE-VALIDATION.md)。
-  内核 source 仍无 durable replay、LSFS 源或 Application registry 接线；ack 仍按 source
-  handle 授权，尚未按 application_id 独立隔离。
+- `0010` 加入 Application registry、durable replay、LSFS source 与 supervisor 接线：
+  application fd 按 `application_id` 幂等注册（boot 内存活），未确认事件跨 source fd
+  释放与进程退出 replay；`AOK_EVENT_ATTACH_APP` 把 timer/port/LSFS 源挂入 128 深的
+  durable 队列，LSFS post 携带 commit cursor；ack 按 application 隔离；
+  snapshot/restore 交接 supervisor 实现跨 VM 恢复。appregistry 45 项 + 全部六套
+  enabled（object 44、task 64、resource 53、event-source 38、event-wake 37、
+  core 46）与五套 disabled ENOSYS 回归通过，含一项游标重置 mutation 验证，见
+  [KERNEL-APP-REGISTRY-VALIDATION.md](KERNEL-APP-REGISTRY-VALIDATION.md)。
+  runtime 侧 `kernelbridge` 绑定 0010 ABI，supervisor 以 `kernel:<app>:<event_id>`
+  幂等键先持久后 ack 地 drain 内核队列，满载丢弃 handle 重放，关停 snapshot/启动
+  restore；`go test -race`、vet（含 linux/arm64 交叉）、smoke 与 core-smoke 通过。
+  内核 registry 仍不落盘，跨 VM 持久性由 supervisor 承接；按持久 owner 的隔离属于
+  supervisor 策略层。
 - 用户态 `runtime` 已有 JSON-RPC 消息编解码、离线 Echo provider、多 session/turn、
   prompt replay、abort/close、事件序列和 session 独立 token 台账。
   2026-09-16 本轮验证 `go test -race ./...` 与 `go vet ./...` 通过；
@@ -78,9 +89,12 @@
 
 ## 当前未实现
 
-- 内核 amem/LSFS、内核持久事件源与 supervisor 唤醒集成、sched_ext Agent 调度、ainf 内核设备化、Web capability、HostFS bridge
-  和消息 gateway 尚未实现。`runtime/cmd/aok-init` 与 `kernel/initramfs/build-aok.sh` 已提供 supervisor
-  PID1/initfs 基础闭环；QEMU kernel probe 仍是独立验证程序，不能替代完整 guest 服务编排。
+- 内核 amem/LSFS 存储、sched_ext Agent 调度、ainf 内核设备化、Web capability、HostFS bridge
+  和消息 gateway 尚未实现。`0009` 的 wake target 仍是 source 私有，dormant aproc 创建与
+  `ON_QUIESCENT` 语义不完整；内核 registry 不落盘，跨 VM 持久性由 supervisor snapshot/
+  restore 承接；fsd 尚未真实接入 LSFS source。`runtime/cmd/aok-init` 与
+  `kernel/initramfs/build-aok.sh` 已提供 supervisor PID1/initfs 基础闭环；QEMU kernel probe
+  仍是独立验证程序，不能替代完整 guest 服务编排。
 - `kernel/linux` 保持干净的上游基线；AOK 代码位于外层 patch，构建时应用到独立源码目录。
 - 本机 QEMU 构建没有 virtio-vsock device model，当前只完成内核配置检查，未完成 guest↔host
   vsock 心跳；该项转移到 Apple Container 或支持 vsock 的 Linux/QEMU runner。
