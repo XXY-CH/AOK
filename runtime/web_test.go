@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -77,5 +78,56 @@ func TestWebLadderAndCapabilityChecks(t *testing.T) {
 	}
 	if found != 2 {
 		t.Fatalf("expected 2 audited web calls, got %d", found)
+	}
+}
+
+// Redirects and host-boundary tricks must not escape the granted prefixes;
+// MaxResponseBytes must actually bind.
+func TestWebRedirectAndBoundaryEnforcement(t *testing.T) {
+	s := newKernelTestSupervisor(t)
+	app, err := s.CreateApplication("tester", "owner", "on_event")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var secret string
+	outside := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secret = "LEAKED"
+		w.Write([]byte("SECRET-EVIL-CONTENT"))
+	}))
+	defer outside.Close()
+	inside := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/redirect" {
+			http.Redirect(w, r, outside.URL+"/x", http.StatusFound)
+			return
+		}
+		w.Write([]byte("ok"))
+	}))
+	defer inside.Close()
+	cap := WebCapability{Kind: "web.fetch", URLPrefixes: []string{inside.URL + "/"}}
+	// A redirect out of the prefix fails closed.
+	if _, _, err := s.WebExecute("tester", app.ApplicationID, cap, WebRequest{Kind: "web.fetch", URL: inside.URL + "/redirect"}); err == nil {
+		t.Fatal("redirect out of the granted prefix was followed")
+	}
+	if secret == "LEAKED" {
+		t.Fatal("out-of-scope content was fetched via redirect")
+	}
+	// Host-boundary: a sibling host sharing the string prefix is denied.
+	_, host, _ := net.SplitHostPort(strings.TrimPrefix(inside.URL, "http://"))
+	evil := "http://" + host + ".evil.example/x"
+	if _, _, err := s.WebExecute("tester", app.ApplicationID, cap, WebRequest{Kind: "web.fetch", URL: evil}); err == nil {
+		t.Fatal("host-boundary prefix bypass accepted")
+	}
+	// MaxResponseBytes is enforced in both directions.
+	big := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(make([]byte, 4096))
+	}))
+	defer big.Close()
+	small := WebCapability{Kind: "web.fetch", URLPrefixes: []string{big.URL + "/"}, MaxResponseBytes: 100}
+	if _, _, err := s.WebExecute("tester", app.ApplicationID, small, WebRequest{Kind: "web.fetch", URL: big.URL + "/b"}); err == nil {
+		t.Fatal("response above MaxResponseBytes accepted")
+	}
+	generous := WebCapability{Kind: "web.fetch", URLPrefixes: []string{big.URL + "/"}, MaxResponseBytes: 1 << 20}
+	if _, _, err := s.WebExecute("tester", app.ApplicationID, generous, WebRequest{Kind: "web.fetch", URL: big.URL + "/b"}); err != nil {
+		t.Fatalf("response under MaxResponseBytes rejected: %v", err)
 	}
 }

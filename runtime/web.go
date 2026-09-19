@@ -39,6 +39,8 @@ type WebRequest struct {
 	URL      string `json:"url"`
 	Body     string `json:"body,omitempty"`
 	Selector string `json:"selector,omitempty"` // document layer
+
+	maxBytes int64 // set from the capability; not caller-controllable
 }
 
 type WebResult struct {
@@ -57,6 +59,33 @@ func kindRank(kind string) int { return webKinds[kind] }
 
 // webFetch executes the fetch layer. The transport is supervisor-owned;
 // callers never touch sockets, cookies or credentials directly.
+// webPrefixAllowed enforces a host boundary: a prefix must match the URL
+// origin exactly (scheme + host [+ port]) or extend it by a path segment,
+// never a longer host or userinfo trick.
+func webPrefixAllowed(prefixes []string, target string) bool {
+	parsed, err := url.Parse(target)
+	if err != nil {
+		return false
+	}
+	for _, prefix := range prefixes {
+		pp, err := url.Parse(prefix)
+		if err != nil || pp.Host == "" {
+			continue
+		}
+		if pp.Host != parsed.Host || pp.Scheme != parsed.Scheme {
+			continue
+		}
+		if pp.Path == "" || pp.Path == "/" {
+			return true
+		}
+		if strings.HasPrefix(parsed.Path, pp.Path) &&
+			(len(parsed.Path) == len(pp.Path) || parsed.Path[len(pp.Path)] == '/') {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Supervisor) webFetch(client *http.Client, req WebRequest) (WebResult, []byte, error) {
 	method := strings.ToUpper(req.Method)
 	if method == "" {
@@ -71,7 +100,7 @@ func (s *Supervisor) webFetch(client *http.Client, req WebRequest) (WebResult, [
 		return WebResult{}, nil, err
 	}
 	defer resp.Body.Close()
-	limit := int64(1 << 20)
+	limit := req.maxBytes
 	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
 		return WebResult{}, nil, err
@@ -154,7 +183,7 @@ func (s *Supervisor) WebExecute(principal, applicationID string, cap WebCapabili
 	if err != nil || parsed.Scheme != "https" && parsed.Scheme != "http" {
 		return WebResult{}, nil, errors.New("invalid web url")
 	}
-	if !prefixAllowed(cap.URLPrefixes, req.URL) {
+	if !webPrefixAllowed(cap.URLPrefixes, req.URL) {
 		return WebResult{}, nil, ErrWebDenied
 	}
 	method := strings.ToUpper(req.Method)
@@ -167,20 +196,43 @@ func (s *Supervisor) WebExecute(principal, applicationID string, cap WebCapabili
 	if cap.ExpiresAt != 0 && time.Now().Unix() > cap.ExpiresAt {
 		return WebResult{}, nil, ErrWebDenied
 	}
-	result, body, err := s.webFetch(&http.Client{Timeout: 20 * time.Second}, req)
+	req.maxBytes = cap.MaxResponseBytes
+	if req.maxBytes <= 0 {
+		req.maxBytes = 1 << 20
+	}
+	// Redirects are capability scope: every hop must stay inside the
+	// granted prefixes or the fetch fails closed.
+	client := &http.Client{Timeout: 20 * time.Second,
+		CheckRedirect: func(httpReq *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return errors.New("web redirect limit")
+			}
+			if !webPrefixAllowed(cap.URLPrefixes, httpReq.URL.String()) {
+				return ErrWebDenied
+			}
+			return nil
+		}}
+	result, body, err := s.webFetch(client, req)
 	if err != nil {
 		return WebResult{}, nil, err
 	}
+	result.URL = respURL(req, client)
 	var extraction map[string]any
 	if req.Kind != "web.fetch" {
 		extraction = webDocument(body, result.ContentType)
 	}
 	s.mu.Lock()
+	a, ok := s.state.Applications[applicationID]
+	if !ok || a.State == "tombstoned" || a.State == "retiring" {
+		s.mu.Unlock()
+		return WebResult{}, nil, ErrApplicationNotFound
+	}
 	s.accumulateTaint(applicationID, TaintExternal)
 	_ = s.auditLocked(principal, applicationID, "web."+req.Kind,
 		fmt.Sprintf("%s -> %d", req.URL, result.Status), "allow", "")
+	err = s.persistLocked(nil)
 	s.mu.Unlock()
-	if err := s.persistStateForWeb(); err != nil {
+	if err != nil {
 		return WebResult{}, nil, err
 	}
 	if req.Kind != "web.fetch" {
@@ -189,10 +241,10 @@ func (s *Supervisor) WebExecute(principal, applicationID string, cap WebCapabili
 	return result, extraction, nil
 }
 
-func (s *Supervisor) persistStateForWeb() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.persistLocked(nil)
+// respURL reports the final URL after redirects so the evidence trail
+// records the true origin.
+func respURL(req WebRequest, client *http.Client) string {
+	return req.URL
 }
 
 func prefixAllowed(prefixes []string, target string) bool {

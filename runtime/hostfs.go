@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -88,6 +89,12 @@ func (s *Supervisor) UnmountHostfs(principal, mountID string) error {
 func (s *Supervisor) CheckHostfs(applicationID, guestPath, operation string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Traversal must die at the gate: normalize before matching so ../
+	// sequences cannot walk out of a granted prefix.
+	if filepath.Clean(guestPath) != guestPath || !filepath.IsAbs(guestPath) ||
+		strings.Contains(guestPath, "\x00") {
+		return ErrMountDenied
+	}
 	for _, mount := range s.state.HostfsMounts {
 		if mount.ApplicationID != applicationID || !mount.Enabled {
 			continue
@@ -151,6 +158,16 @@ type ArtifactTransfer struct {
 
 var ErrTransferDenied = errors.New("artifact transfer denied")
 
+// dropOldestTransfersLocked bounds the transfer history; committed entries
+// at the head are the oldest, so both directions share one policy.
+func (s *Supervisor) dropOldestTransfersLocked(cap int) {
+	if len(s.state.Transfers) <= cap {
+		return
+	}
+	s.state.Transfers = append([]ArtifactTransfer(nil),
+		s.state.Transfers[len(s.state.Transfers)-cap:]...)
+}
+
 const maxTransfers = 256
 
 // ExportArtifact stages an application payload as a durable outbound
@@ -185,18 +202,7 @@ func (s *Supervisor) ExportArtifact(principal, applicationID, key string, payloa
 		CreatedAt:      time.Now().UnixNano(),
 	}
 	s.state.Transfers = append(s.state.Transfers, transfer)
-	if overflow := len(s.state.Transfers) - maxTransfers; overflow > 0 {
-		kept := s.state.Transfers[:0]
-		dropped := 0
-		for _, candidate := range s.state.Transfers {
-			if dropped < overflow && candidate.Status != "committed" {
-				dropped++
-				continue
-			}
-			kept = append(kept, candidate)
-		}
-		s.state.Transfers = kept
-	}
+	s.dropOldestTransfersLocked(maxTransfers)
 	_ = s.auditLocked(principal, applicationID, "artifact.transfer.export",
 		transfer.TransferID, "allow", key)
 	return transfer, s.persistLocked(nil)
@@ -229,10 +235,10 @@ func (s *Supervisor) CommitImport(principal, applicationID, key string, payload 
 		Payload:        append(json.RawMessage(nil), payload...),
 		CreatedAt:      time.Now().UnixNano(),
 	}
+	// Host-imported data is externally tainted by contract (hostfs-model).
+	s.accumulateTaint(applicationID, TaintExternal)
 	s.state.Transfers = append(s.state.Transfers, transfer)
-	if overflow := len(s.state.Transfers) - maxTransfers; overflow > 0 {
-		s.state.Transfers = append([]ArtifactTransfer(nil), s.state.Transfers[overflow:]...)
-	}
+	s.dropOldestTransfersLocked(maxTransfers)
 	_ = s.auditLocked(principal, applicationID, "artifact.transfer.import",
 		transfer.TransferID, "allow", key)
 	return transfer, s.persistLocked(nil)

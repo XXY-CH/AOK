@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -36,12 +37,17 @@ type OutboxEntry struct {
 	ConversationID string          `json:"conversation_id"` // channel:external
 	IdempotencyKey string          `json:"idempotency_key"`
 	Payload        json.RawMessage `json:"payload"`
-	Status         string          `json:"status"` // pending | sent | failed
+	Status         string          `json:"status"` // pending | sent
 	Attempts       uint32          `json:"attempts"`
 	CreatedAt      int64           `json:"created_at"`
 	SentAt         int64           `json:"sent_at,omitempty"`
 	Receipt        string          `json:"receipt,omitempty"`
 }
+
+// sourcedConversation records which conversation delivered the mailbox
+// message a result answers, so replies route to the origin, never to an
+// arbitrary conversation that happens to share the application.
+var sourcedConversation sync.Map // messageID -> conversation key
 
 var (
 	ErrChannelNotFound      = errors.New("message channel not found")
@@ -111,6 +117,12 @@ func (s *Supervisor) BindConversation(principal, channelID, externalID, applicat
 		existing.ApplicationID != applicationID {
 		return MessageConversation{}, ErrConversationBound
 	}
+	if existing, ok := s.state.Conversations[key]; ok {
+		// Re-binding the same identity to the same application preserves
+		// the cursor and creation time; wiping them would make already
+		// routed sequences deliverable again.
+		return existing, s.persistLocked(nil)
+	}
 	conversation := MessageConversation{ChannelID: channelID, ExternalID: externalID,
 		ApplicationID: applicationID, CreatedAt: time.Now().UnixNano()}
 	s.state.Conversations[key] = conversation
@@ -147,13 +159,25 @@ func (s *Supervisor) DeliverInbound(channelID, externalID string, sequence int64
 		}
 		return MailboxMessage{}, errors.New("sequence already routed but record missing")
 	}
+	// The envelope keeps the runner's flat {"text": ...} contract (the
+	// model must see the body) and always declares external taint: the
+	// gateway is outside the trust domain regardless of what the sender
+	// claims.
+	// Flat text contract: extract the body's text field so the model sees
+	// exactly what the sender wrote (nested payload kept for provenance).
+	var inner struct {
+		Text string `json:"text"`
+	}
+	_ = json.Unmarshal(payload, &inner)
 	wrapped, err := json.Marshal(struct {
+		Text      string          `json:"text"`
+		Taint     uint64          `json:"taint"`
 		Source    string          `json:"source"`
 		Channel   string          `json:"channel"`
 		Principal string          `json:"external_id"`
 		Sequence  int64           `json:"sequence"`
 		Payload   json.RawMessage `json:"payload"`
-	}{"gateway", channelID, externalID, sequence, payload})
+	}{inner.Text, TaintExternal, "gateway", channelID, externalID, sequence, payload})
 	if err != nil {
 		return MailboxMessage{}, err
 	}
@@ -162,6 +186,7 @@ func (s *Supervisor) DeliverInbound(channelID, externalID string, sequence int64
 	if err != nil {
 		return MailboxMessage{}, err
 	}
+	sourcedConversation.Store(message.MessageID, key)
 	// Cursor advances only with the mailbox accept: a mail-rollback keeps
 	// the old cursor, so the retry re-routes the same sequence idempotently.
 	conversation.LastSequence = sequence
@@ -219,14 +244,15 @@ func (s *Supervisor) Reply(principal, applicationID, messageID string) (OutboxEn
 	if !ok || result.ApplicationID != applicationID {
 		return OutboxEntry{}, errors.New("result not found")
 	}
-	var conversationKey string
-	for key, conversation := range s.state.Conversations {
-		if conversation.ApplicationID == applicationID {
-			conversationKey = key
-			break
-		}
+	// Replies route to the conversation that sourced the message; with
+	// several conversations bound to one application an arbitrary pick
+	// would leak one principal's output to another.
+	conversationKeyAny, ok := sourcedConversation.Load(messageID)
+	conversationKey, _ := conversationKeyAny.(string)
+	if !ok || conversationKey == "" {
+		return OutboxEntry{}, ErrConversationNotFound
 	}
-	if conversationKey == "" {
+	if _, ok := s.state.Conversations[conversationKey]; !ok {
 		return OutboxEntry{}, ErrConversationNotFound
 	}
 	payload, err := json.Marshal(struct {

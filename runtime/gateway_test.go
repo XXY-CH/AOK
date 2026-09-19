@@ -1,9 +1,11 @@
 package runtime
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 )
 
 // The P4 gateway acceptance: a message enters the durable mailbox and
@@ -153,4 +155,62 @@ func (s *Supervisor) finishTurnForGateway(t *testing.T, applicationID string, m 
 	}
 	return s.finishTurn(id, claimed, "hello", Usage{InputTokens: 5, OutputTokens: 5},
 		RouteInfo{Provider: "echo", CompatKey: "echo|std|plain|f32|1|cpu"}, nil)
+}
+
+// Two conversations on one application: the runner drives the turn from a
+// gateway message (flat payload contract), the reply lands in the SOURCING
+// conversation, and the ingress folded external taint.
+func TestGatewayHeadlessRunAndSourcing(t *testing.T) {
+	s := newKernelTestSupervisor(t)
+	app, err := s.CreateApplication("tester", "owner", "on_event")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ch := range []string{"hook", "im"} {
+		if _, err := s.CreateChannel("tester", ch, ch); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.BindConversation("tester", ch, "user-1", app.ApplicationID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sent, err := s.DeliverInbound("im", "user-1", 1, json.RawMessage(`{"text":"the body"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	if err := s.Run(ctx, EchoProvider{}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Result(app.ApplicationID, sent.MessageID)
+	if err != nil || result.Status != "completed" {
+		t.Fatalf("headless gateway turn failed: %+v %v", result, err)
+	}
+	// The flat-payload contract: the model saw the actual body.
+	if result.Text != "the body" {
+		t.Fatalf("runner did not unwrap the gateway payload: %q", result.Text)
+	}
+	// The reply routes to the sourcing conversation, not the other one.
+	entry, err := s.Reply("tester", app.ApplicationID, sent.MessageID)
+	if err != nil || entry.ConversationID != "im:user-1" {
+		t.Fatalf("reply misrouted: %+v %v", entry, err)
+	}
+	if other, _ := s.ClaimOutbox("hook", "user-1"); len(other) != 0 {
+		t.Fatalf("reply leaked to the non-sourcing conversation: %+v", other)
+	}
+	// Gateway ingress is externally tainted by contract.
+	inspected, _ := s.InspectApplication(app.ApplicationID)
+	if inspected.TaintBits&TaintExternal == 0 {
+		t.Fatal("gateway ingress folded no external taint")
+	}
+	// Re-binding the same identity preserves the cursor (no replay window).
+	before := s.ListConversations("im")
+	if _, err := s.BindConversation("tester", "im", "user-1", app.ApplicationID); err != nil {
+		t.Fatal(err)
+	}
+	after := s.ListConversations("im")
+	if after[0].LastSequence != before[0].LastSequence || after[0].CreatedAt != before[0].CreatedAt {
+		t.Fatalf("re-bind wiped the cursor: %+v -> %+v", before[0], after[0])
+	}
 }

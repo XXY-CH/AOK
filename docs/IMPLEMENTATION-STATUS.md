@@ -135,10 +135,18 @@
   控制面 `capability.revoke`。见
   [RUNTIME-REVOCATION-VALIDATION.md](RUNTIME-REVOCATION-VALIDATION.md)。
 
+- 2026-09-19 P4 独立审查修复：网关回复按**来源会话**路由（多会话应用不再随机
+  误投/跨 principal 泄漏）、入站信封展平 text 字段（runner 真正读到正文）并**强制
+  external taint**（网关入口不再绕过污点台账）、重绑保留游标（无重放窗口）；web
+  重定向逐跳校验前缀（scope 外 fail-closed）、前缀匹配改 host 边界（同串前缀的
+  兄弟域/userinfo 技巧被拒）、`MaxResponseBytes` 真实生效、taint/audit/persist
+  合一临界区；hostfs 路径归一化（`..`/`//` 穿越被拒）、import 折 external taint、
+  transfer 淘汰统一策略。回归测试覆盖：headless Run 展平路由、重定向/边界/双向
+  大小、穿越/五模式矩阵/重启。
 - 2026-09-19 P4 切片：hostfs bridge 与 artifact transfer——持久版本化 mount
   授权（ro/rw/append-only/dropbox 双向、guest 路径前缀匹配、TTL、unmount 收紧），
   路径字符串本身不授权；artifact export 先过污点门控（未掩蔽污点拒绝）、import/
-  export 均幂等并审计；五个控制面方法，跨重启保留。
+  export 均幂等并审计；六个 supervisor 方法（控制面接线属后续），跨重启保留。
 - 2026-09-19 P4 切片：web capability 阶梯的 fetch/document 两层——capability
   按 URL 前缀/method/大小/TTL 收窄，越层请求被拒（`ErrWebLayerMismatch`），
   transport 由 supervisor 持有，响应携带 external-content taint 并折入应用台账

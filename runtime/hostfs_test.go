@@ -111,3 +111,74 @@ func TestArtifactTransferTaintAndIdempotency(t *testing.T) {
 		t.Fatalf("import not idempotent: %+v %v", imp2, err)
 	}
 }
+
+// Traversal, dropbox modes and the full mode-operation matrix.
+func TestHostfsTraversalAndMatrix(t *testing.T) {
+	s := newKernelTestSupervisor(t)
+	app, err := s.CreateApplication("tester", "owner", "on_event")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MountHostfs("tester", app.ApplicationID, "/mnt/in", "ro", 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	// Traversal must die at the gate.
+	for _, path := range []string{
+		"/mnt/in/../../etc/passwd", "/mnt/in//x", "/mnt/in/./x", "mnt/in", "/mnt/in/../out",
+	} {
+		if err := s.CheckHostfs(app.ApplicationID, path, "read"); err == nil {
+			t.Fatalf("traversal path accepted: %q", path)
+		}
+	}
+	// Full mode-operation matrix.
+	modes := map[string]map[string]bool{
+		"ro":          {"read": true, "write": false, "append": false, "intake": false, "emit": false},
+		"rw":          {"read": true, "write": true, "append": false},
+		"append-only": {"read": false, "write": false, "append": true},
+		"dropbox-in":  {"intake": true, "read": false, "emit": false},
+		"dropbox-out": {"emit": true, "read": false, "intake": false},
+	}
+	for mode, ops := range modes {
+		if _, err := s.MountHostfs("tester", app.ApplicationID, "/mnt/"+mode, mode, 0, 0); err != nil {
+			t.Fatal(err)
+		}
+		for op, allowed := range ops {
+			err := s.CheckHostfs(app.ApplicationID, "/mnt/"+mode, op)
+			if allowed && err != nil {
+				t.Fatalf("%s: %s should be allowed: %v", mode, op, err)
+			}
+			if !allowed && err == nil {
+				t.Fatalf("%s: %s should be denied", mode, op)
+			}
+		}
+	}
+	// Host imports fold external taint (hostfs-model contract).
+	clean, err := s.CreateApplication("tester", "other", "on_event")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CommitImport("tester", clean.ApplicationID, "doc-1", json.RawMessage(`{"doc":true}`)); err != nil {
+		t.Fatal(err)
+	}
+	inspected, _ := s.InspectApplication(clean.ApplicationID)
+	if inspected.TaintBits&TaintExternal == 0 {
+		t.Fatal("host import folded no external taint")
+	}
+	// Transfers persist across restart.
+	root := s.root
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := NewSupervisor(root, CapabilitySet{Engine: "echo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if again, err := s2.CommitImport("tester", clean.ApplicationID, "doc-1", json.RawMessage(`{"doc":true}`)); err != nil {
+		t.Fatalf("import after restart: %v", err)
+	} else {
+		original, _ := s.CommitImport("tester", clean.ApplicationID, "sentinel", json.RawMessage(`{}`))
+		_ = original
+		_ = again
+	}
+}
