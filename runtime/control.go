@@ -112,6 +112,7 @@ func (s *ControlServer) handle(req Message, principal string) Message {
 		Backends      []string        `json:"backends"`
 		Text          string          `json:"text"`
 		Confirm       bool            `json:"confirm"`
+		Reason        string          `json:"reason"`
 	}
 	if len(req.Params) > 0 && json.Unmarshal(req.Params, &p) != nil {
 		resp.Error = &RPCError{Code: -32602, Message: "invalid params"}
@@ -293,6 +294,21 @@ func (s *ControlServer) handle(req Message, principal string) Message {
 			resp.Error = &RPCError{Code: -32004, Message: err.Error()}
 		} else {
 			resp.Result = json.RawMessage(`{"acked":true}`)
+		}
+	case "capability.revoke":
+		var token CapabilityToken
+		if p.Token != "" {
+			parsed, perr := ParseCapabilityToken(p.Token)
+			if perr != nil {
+				resp.Error = &RPCError{Code: -32002, Message: perr.Error()}
+				break
+			}
+			token = parsed
+		}
+		if err := s.Supervisor.RevokeCapabilityToken(p.Principal, token, p.Reason); err != nil {
+			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
+		} else {
+			resp.Result = json.RawMessage(`{"revoked":true}`)
 		}
 	case "capability.check":
 		if p.Path != "" {

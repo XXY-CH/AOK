@@ -54,6 +54,7 @@ type supervisorState struct {
 	NextKernelID  uint64                      `json:"next_kernel_id,omitempty"`
 	KernelPending map[string][]KernelEvent    `json:"kernel_pending,omitempty"`
 	RouteRecords  []RouteRecord               `json:"route_records,omitempty"`
+	RevokedTokens []RevokedToken              `json:"revoked_tokens,omitempty"`
 }
 
 // RoutePolicy is the per-application routing policy: the allowed backend
@@ -676,6 +677,10 @@ func (s *Supervisor) checkToken(principal, applicationID, object, action string,
 	defer s.mu.Unlock()
 	allowed := s.authorizer.Evaluate(principal, object, action, token) == nil
 	reason := "policy"
+	if token != nil && s.tokenRevokedLocked(*token) {
+		allowed = false
+		reason = "capability revoked"
+	}
 	if object != "net" && object != "tool" && object != "fs.read" && object != "fs.write" {
 		reason = "unknown object"
 	}

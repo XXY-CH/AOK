@@ -129,6 +129,12 @@
   `LastTaint()` 回流台账，外发门控同时看到 payload 与内核两类标记。unotify 慢路径、
   两级撤销与 witness 联签仍属后续。
 
+- 2026-09-19 P3 切片：撤销两级生效——内核级为既有 0006 revoke（probe 验证）；
+  runtime 级新增 capability token 撤销注册表（digest 持久化、caveat 前缀链式波及
+  全部后代、只接受可验证 token、幂等、审计），`capability.check` 查注册表、
+  控制面 `capability.revoke`。见
+  [RUNTIME-REVOCATION-VALIDATION.md](RUNTIME-REVOCATION-VALIDATION.md)。
+
 ## 当前未实现
 
 - 内核 amem/LSFS 存储、sched_ext Agent 调度、ainf 内核设备化、Web capability、HostFS bridge
