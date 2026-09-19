@@ -135,6 +135,11 @@
   控制面 `capability.revoke`。见
   [RUNTIME-REVOCATION-VALIDATION.md](RUNTIME-REVOCATION-VALIDATION.md)。
 
+- 2026-09-19 P3 末片：witness 联签——审计检查点（链头/条数/时间）经独立 ed25519
+  witness 密钥签名后持久锚定，`witness.head/cosign/verify` 上控制面；伪造链头、
+  错误密钥与本地自洽重造链全部被拒（`-32008`），跨重启保留。见
+  [RUNTIME-WITNESS-VALIDATION.md](RUNTIME-WITNESS-VALIDATION.md)。外部 witness
+  服务本体属后续。
 - 2026-09-19 P3 切片：人工确认慢路径——未掩蔽污点导出可 `escalate` 为 pending
   确认（request_id/TTL 5 分钟），`confirmation.list/settle` 审批，approved 请求
   单次放行（consumed），全部状态迁移入审计并跨重启保留；控制面

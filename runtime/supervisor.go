@@ -43,19 +43,20 @@ type Supervisor struct {
 }
 
 type supervisorState struct {
-	Applications  map[string]*Application        `json:"applications"`
-	Mailbox       map[string][]MailboxMessage    `json:"mailbox"`
-	Audit         []AuditRecord                  `json:"audit"`
-	NextSequence  uint64                         `json:"next_sequence"`
-	Results       map[string]TurnResult          `json:"results"`
-	Prepared      map[string]TurnResult          `json:"prepared"`
-	Timers        map[string]ApplicationTimer    `json:"timers"`
-	Bindings      map[string]WakeBinding         `json:"bindings"`
-	NextKernelID  uint64                         `json:"next_kernel_id,omitempty"`
-	KernelPending map[string][]KernelEvent       `json:"kernel_pending,omitempty"`
-	RouteRecords  []RouteRecord                  `json:"route_records,omitempty"`
-	RevokedTokens []RevokedToken                 `json:"revoked_tokens,omitempty"`
-	Confirmations map[string]ConfirmationRequest `json:"confirmations,omitempty"`
+	Applications       map[string]*Application        `json:"applications"`
+	Mailbox            map[string][]MailboxMessage    `json:"mailbox"`
+	Audit              []AuditRecord                  `json:"audit"`
+	NextSequence       uint64                         `json:"next_sequence"`
+	Results            map[string]TurnResult          `json:"results"`
+	Prepared           map[string]TurnResult          `json:"prepared"`
+	Timers             map[string]ApplicationTimer    `json:"timers"`
+	Bindings           map[string]WakeBinding         `json:"bindings"`
+	NextKernelID       uint64                         `json:"next_kernel_id,omitempty"`
+	KernelPending      map[string][]KernelEvent       `json:"kernel_pending,omitempty"`
+	RouteRecords       []RouteRecord                  `json:"route_records,omitempty"`
+	RevokedTokens      []RevokedToken                 `json:"revoked_tokens,omitempty"`
+	Confirmations      map[string]ConfirmationRequest `json:"confirmations,omitempty"`
+	WitnessCheckpoints []WitnessCheckpoint            `json:"witness_checkpoints,omitempty"`
 }
 
 // RoutePolicy is the per-application routing policy: the allowed backend

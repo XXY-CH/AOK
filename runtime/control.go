@@ -115,6 +115,11 @@ func (s *ControlServer) handle(req Message, principal string) Message {
 		Escalate      bool            `json:"escalate"`
 		RequestID     string          `json:"request_id"`
 		Approve       bool            `json:"approve"`
+		HeadHash      string          `json:"head_hash"`
+		Count         uint64          `json:"count"`
+		Time          int64           `json:"time"`
+		PublicKey     json.RawMessage `json:"public_key"`
+		Signature     json.RawMessage `json:"signature"`
 		Reason        string          `json:"reason"`
 	}
 	if len(req.Params) > 0 && json.Unmarshal(req.Params, &p) != nil {
@@ -192,6 +197,44 @@ func (s *ControlServer) handle(req Message, principal string) Message {
 			resp.Error = &RPCError{Code: code, Message: err.Error()}
 		} else {
 			resp.Result = json.RawMessage(`{"exported":true}`)
+		}
+	case "witness.head":
+		head, count, err := s.Supervisor.WitnessHead()
+		if err != nil {
+			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
+			break
+		}
+		if raw, merr := json.Marshal(map[string]any{"head_hash": head, "count": count}); merr != nil {
+			resp.Error = &RPCError{Code: -32000, Message: merr.Error()}
+		} else {
+			resp.Result = raw
+		}
+	case "witness.cosign":
+		var cp WitnessCheckpoint
+		if raw, merr := json.Marshal(map[string]any{
+			"head_hash": p.HeadHash, "count": p.Count, "time": p.Time,
+			"public_key": p.PublicKey, "signature": p.Signature, "signer": p.Reason,
+		}); merr != nil {
+			resp.Error = &RPCError{Code: -32000, Message: merr.Error()}
+			break
+		} else if uerr := json.Unmarshal(raw, &cp); uerr != nil {
+			resp.Error = &RPCError{Code: -32002, Message: uerr.Error()}
+			break
+		}
+		if err := s.Supervisor.RecordCosignature(p.Principal, cp); err != nil {
+			code := -32000
+			if errors.Is(err, ErrWitnessMismatch) {
+				code = -32008
+			}
+			resp.Error = &RPCError{Code: code, Message: err.Error()}
+		} else {
+			resp.Result = json.RawMessage(`{"witnessed":true}`)
+		}
+	case "witness.verify":
+		if err := s.Supervisor.VerifyWitness(); err != nil {
+			resp.Error = &RPCError{Code: -32008, Message: err.Error()}
+		} else {
+			resp.Result = json.RawMessage(`{"verified":true}`)
 		}
 	case "confirmation.list":
 		requests := s.Supervisor.ListConfirmations(p.ApplicationID)
