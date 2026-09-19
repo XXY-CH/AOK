@@ -122,6 +122,12 @@
   满载时保留源状态，ack 后继续投递，支持重启续投。claim 仍占额度，retire 释放执行额度。
   这不限制已确认历史、context commit 或审计的保留量；磁盘配额仍未实现。
 
+- 2026-09-19 P3 首切片：supervisor 污点网关——payload 声明污点位、claim 时累计进
+  Application 持久台账、`application.export` 按 manifest `export_mask` 拒绝未掩蔽
+  污点（`-32006`）或降级为已审计的人工确认；门控决策全部进 hash chain。见
+  [RUNTIME-TAINT-VALIDATION.md](RUNTIME-TAINT-VALIDATION.md)。unotify 慢路径、
+  两级撤销与 witness 联签仍属后续。
+
 ## 当前未实现
 
 - 内核 amem/LSFS 存储、sched_ext Agent 调度、ainf 内核设备化、Web capability、HostFS bridge

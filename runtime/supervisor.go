@@ -104,6 +104,7 @@ type Application struct {
 	LastProvider    string      `json:"last_provider,omitempty"`
 	LastCompat      string      `json:"last_compat,omitempty"`
 	RoutePolicy     RoutePolicy `json:"route_policy,omitempty"`
+	TaintBits       uint64      `json:"taint_bits,omitempty"`
 }
 
 type MailboxMessage struct {
@@ -117,13 +118,14 @@ type MailboxMessage struct {
 }
 
 type CapabilitySet struct {
-	Engine  string   `json:"engine"`
-	MemMiB  int      `json:"mem_mib,omitempty"`
-	CPUs    int      `json:"cpus,omitempty"`
-	FSRead  []string `json:"fs_read,omitempty"`
-	FSWrite []string `json:"fs_write,omitempty"`
-	Net     bool     `json:"net"`
-	Tools   []string `json:"tools,omitempty"`
+	Engine     string   `json:"engine"`
+	MemMiB     int      `json:"mem_mib,omitempty"`
+	CPUs       int      `json:"cpus,omitempty"`
+	FSRead     []string `json:"fs_read,omitempty"`
+	FSWrite    []string `json:"fs_write,omitempty"`
+	Net        bool     `json:"net"`
+	Tools      []string `json:"tools,omitempty"`
+	ExportMask uint64   `json:"export_mask,omitempty"`
 }
 
 type AuditRecord struct {
@@ -741,13 +743,14 @@ func LoadCapabilitySet(path string) (CapabilitySet, error) {
 			MemMiB int `yaml:"mem_mib"`
 			CPUs   int `yaml:"cpus"`
 		} `yaml:"resources"`
+		ExportMask uint64 `yaml:"export_mask"`
 	}
 	d := yaml.NewDecoder(f)
 	d.KnownFields(true)
 	if err = d.Decode(&m); err != nil {
 		return CapabilitySet{}, err
 	}
-	c := CapabilitySet{Engine: m.Engine, MemMiB: m.Resources.MemMiB, CPUs: m.Resources.CPUs, FSRead: m.Capabilities.FS.Read, FSWrite: m.Capabilities.FS.Write, Net: m.Capabilities.Net, Tools: m.Capabilities.Tools}
+	c := CapabilitySet{Engine: m.Engine, MemMiB: m.Resources.MemMiB, CPUs: m.Resources.CPUs, FSRead: m.Capabilities.FS.Read, FSWrite: m.Capabilities.FS.Write, Net: m.Capabilities.Net, Tools: m.Capabilities.Tools, ExportMask: m.ExportMask}
 	if c.Engine == "" {
 		return c, errors.New("manifest engine is required")
 	}

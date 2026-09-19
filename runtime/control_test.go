@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -157,5 +158,53 @@ func TestControlSocketLifecycle(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("shutdown retained idle connections")
+	}
+}
+
+func TestControlServerExportsTaintGate(t *testing.T) {
+	s := newKernelTestSupervisor(t)
+	app, err := s.CreateApplication("root", "owner", "on_event")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Enqueue("root", app.ApplicationID, "t",
+		json.RawMessage(`{"text":"x","taint":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.claimTurn(); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.MkdirTemp("/tmp", "aok-taint")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := NewControlListener(filepath.Join(dir, "control.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	server := &ControlServer{Supervisor: s, Listener: listener}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = server.Serve(ctx) }()
+	_ = listener.Addr()
+	client, err := DialControl(filepath.Join(dir, "control.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	params := map[string]any{"application_id": app.ApplicationID, "text": "leak"}
+	var result json.RawMessage
+	err = client.Call(ctx, "application.export", params, &result)
+	if err == nil || !strings.Contains(err.Error(), "tainted data blocked") {
+		t.Fatalf("expected taint block over RPC, got %v", err)
+	}
+	params["confirm"] = true
+	if err = client.Call(ctx, "application.export", params, &result); err != nil {
+		t.Fatalf("confirmed export over RPC: %v", err)
 	}
 }

@@ -110,6 +110,8 @@ func (s *ControlServer) handle(req Message, principal string) Message {
 		BindingID     string          `json:"binding_id"`
 		AfterCursor   int64           `json:"after_cursor"`
 		Backends      []string        `json:"backends"`
+		Text          string          `json:"text"`
+		Confirm       bool            `json:"confirm"`
 	}
 	if len(req.Params) > 0 && json.Unmarshal(req.Params, &p) != nil {
 		resp.Error = &RPCError{Code: -32602, Message: "invalid params"}
@@ -173,6 +175,16 @@ func (s *ControlServer) handle(req Message, principal string) Message {
 			resp.Error = &RPCError{Code: -32000, Message: merr.Error()}
 		} else {
 			resp.Result = raw
+		}
+	case "application.export":
+		if _, err := s.Supervisor.exportApplication(p.Principal, p.ApplicationID, p.Text, p.Confirm); err != nil {
+			code := -32000
+			if errors.Is(err, ErrTaintBlocked) {
+				code = -32006
+			}
+			resp.Error = &RPCError{Code: code, Message: err.Error()}
+		} else {
+			resp.Result = json.RawMessage(`{"exported":true}`)
 		}
 	case "budget.set":
 		if err := s.Supervisor.SetTokenLimit(p.Principal, p.ApplicationID, p.TokenLimit); err != nil {

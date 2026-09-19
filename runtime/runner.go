@@ -219,6 +219,9 @@ func (s *Supervisor) claimTurn() (string, MailboxMessage, error) {
 	if chosen == "" {
 		return "", MailboxMessage{}, nil
 	}
+	// Dataflow taint: a turn that consumes tainted input taints the
+	// application context from here on, so its outputs inherit the label.
+	s.accumulateTaint(chosen, taintedPayload(chosenMessage.Payload))
 	chosenMessage.Status = "claimed"
 	chosenMessage.Attempts++
 	copy := *chosenMessage
