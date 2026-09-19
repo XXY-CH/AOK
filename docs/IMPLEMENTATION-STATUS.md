@@ -135,6 +135,10 @@
   控制面 `capability.revoke`。见
   [RUNTIME-REVOCATION-VALIDATION.md](RUNTIME-REVOCATION-VALIDATION.md)。
 
+- 2026-09-19 P4 切片：web capability 阶梯的 fetch/document 两层——capability
+  按 URL 前缀/method/大小/TTL 收窄，越层请求被拒（`ErrWebLayerMismatch`），
+  transport 由 supervisor 持有，响应携带 external-content taint 并折入应用台账
+  （与污点门控闭环），每次调用审计；session/browser 层待 JS runtime。
 - 2026-09-19 P4 首切片：消息网关——持久 channel/conversation 绑定外部身份到
   application，入站以 `gw:<channel>:<id>:<seq>` 幂等键进 durable mailbox 并按
   wake policy 驱动（on_event headless / manual 离线累积），出站 outbox 以
