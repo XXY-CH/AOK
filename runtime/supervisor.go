@@ -35,6 +35,8 @@ type Supervisor struct {
 	committed    []byte
 	contexts     *ContextStore
 	authorizer   CapabilityAuthorizer
+	kernel       KernelEventBridge
+	kernelApps   map[string]KernelApplication
 }
 
 type supervisorState struct {
@@ -46,6 +48,8 @@ type supervisorState struct {
 	Prepared     map[string]TurnResult       `json:"prepared"`
 	Timers       map[string]ApplicationTimer `json:"timers"`
 	Bindings     map[string]WakeBinding      `json:"bindings"`
+	NextKernelID uint64                      `json:"next_kernel_id,omitempty"`
+	KernelPending map[string][]KernelEvent   `json:"kernel_pending,omitempty"`
 }
 
 type Application struct {
@@ -62,6 +66,7 @@ type Application struct {
 	TokenLimit      uint64 `json:"token_limit"`
 	Failures        uint32 `json:"failures"`
 	ContextID       string `json:"context_id"`
+	KernelID        uint64 `json:"kernel_id,omitempty"`
 }
 
 type MailboxMessage struct {
@@ -184,6 +189,18 @@ func (s *Supervisor) load() error {
 	if s.state.Bindings == nil {
 		s.state.Bindings = map[string]WakeBinding{}
 	}
+	if s.state.KernelPending == nil {
+		s.state.KernelPending = map[string][]KernelEvent{}
+	}
+	for _, a := range s.state.Applications {
+		if a == nil {
+			continue
+		}
+		if a.KernelID == 0 {
+			s.state.NextKernelID++
+			a.KernelID = s.state.NextKernelID
+		}
+	}
 	if err = VerifyAudit(s.state.Audit); err != nil {
 		return err
 	}
@@ -246,6 +263,7 @@ func (s *Supervisor) restoreLocked() {
 }
 
 func (s *Supervisor) Close() error {
+	s.snapshotKernel()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var err error
@@ -314,6 +332,8 @@ func (s *Supervisor) CreateApplication(principal, owner, wake string) (Applicati
 	idBytes[8] = (idBytes[8] & 0x3f) | 0x80
 	id := fmt.Sprintf("%x-%x-%x-%x-%x", idBytes[0:4], idBytes[4:6], idBytes[6:8], idBytes[8:10], idBytes[10:16])
 	a := Application{ApplicationID: id, OwnerAgent: owner, ContractVersion: 1, State: "serving", WakePolicy: wake, Generation: 1, CreatedAt: time.Now().UnixNano()}
+	s.state.NextKernelID++
+	a.KernelID = s.state.NextKernelID
 	contextID, err := s.contexts.Create(owner, nil)
 	if err != nil {
 		return Application{}, err
@@ -410,6 +430,11 @@ func (s *Supervisor) RetireApplication(principal, id string) error {
 	}
 	a.State = "tombstoned"
 	s.expireMailboxLocked(id)
+	if h, ok := s.kernelApps[id]; ok {
+		h.Close()
+		delete(s.kernelApps, id)
+	}
+	delete(s.state.KernelPending, id)
 	for key, b := range s.state.Bindings {
 		if b.ApplicationID == id {
 			b.Enabled = false
@@ -422,7 +447,8 @@ func (s *Supervisor) RetireApplication(principal, id string) error {
 func (s *Supervisor) Enqueue(principal, id, key string, payload json.RawMessage) (MailboxMessage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if strings.HasPrefix(key, "lsfs:") || strings.HasPrefix(key, "timer:") {
+	if strings.HasPrefix(key, "lsfs:") || strings.HasPrefix(key, "timer:") ||
+		strings.HasPrefix(key, "kernel:") {
 		return MailboxMessage{}, errors.New("reserved event idempotency key")
 	}
 	if len(payload) > maxTextBytes {

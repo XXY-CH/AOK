@@ -298,6 +298,9 @@ func (s *Supervisor) Run(ctx context.Context, provider Provider) error {
 	}
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
+	if err := s.attachKernel(); err != nil {
+		return err
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -308,6 +311,9 @@ func (s *Supervisor) Run(ctx context.Context, provider Provider) error {
 			return err
 		}
 		if err := s.deliverLSFS(); err != nil {
+			return err
+		}
+		if err := s.deliverKernel(); err != nil {
 			return err
 		}
 		id, m, err := s.claimTurn()
