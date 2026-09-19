@@ -16,6 +16,9 @@ type TurnResult struct {
 	Usage         Usage  `json:"usage"`
 	Status        string `json:"status"`
 	Checkpoint    string `json:"checkpoint"`
+	Provider      string `json:"provider,omitempty"`
+	Fallbacks     uint32 `json:"fallbacks,omitempty"`
+	CacheHitKind  string `json:"cache_hit_kind,omitempty"`
 }
 
 type ApplicationTimer struct {
@@ -164,6 +167,15 @@ func (s *Supervisor) claimTurn() (string, MailboxMessage, error) {
 		}
 		return a.TokensUsed < b.TokensUsed
 	})
+	chosen := ""
+	var chosenMessage *MailboxMessage
+	minTokens := ^uint64(0)
+	type candidate struct {
+		id      string
+		message *MailboxMessage
+		affine  bool
+	}
+	var candidates []candidate
 	for _, id := range ids {
 		a := s.state.Applications[id]
 		if a.State != "serving" || a.WakePolicy == "manual" {
@@ -176,27 +188,73 @@ func (s *Supervisor) claimTurn() (string, MailboxMessage, error) {
 			now.Sub(s.lastClaim[id]) < throttleClaimInterval {
 			continue
 		}
+		if a.TokensUsed < minTokens {
+			minTokens = a.TokensUsed
+		}
 		for i := range s.state.Mailbox[id] {
 			m := &s.state.Mailbox[id][i]
 			if m.Status != "pending" {
 				continue
 			}
-			m.Status = "claimed"
-			m.Attempts++
-			copy := *m
-			copy.Payload = append(json.RawMessage(nil), m.Payload...)
-			_ = s.auditLocked("supervisor", id, "turn.claim", m.MessageID, "allow", "")
-			if err := s.persistLocked(nil); err != nil {
-				return "", MailboxMessage{}, err
-			}
-			s.lastClaim[id] = now
-			return id, copy, nil
+			candidates = append(candidates, candidate{id: id, message: m,
+				affine: s.lastPrefix != "" && promptPrefix(m.Payload) == s.lastPrefix})
+			break
 		}
 	}
-	return "", MailboxMessage{}, nil
+	for _, c := range candidates {
+		// Prefix affinity: among candidates within the fairness band of
+		// the least-charged application, prefer one sharing the last
+		// executed prefix so the backend KV stays warm. The band keeps
+		// token fairness intact and bounds starvation.
+		if c.affine && s.state.Applications[c.id].TokensUsed <=
+			minTokens+maxThrottleBand(minTokens) {
+			chosen, chosenMessage = c.id, c.message
+			break
+		}
+		if chosen == "" {
+			chosen, chosenMessage = c.id, c.message
+		}
+	}
+	if chosen == "" {
+		return "", MailboxMessage{}, nil
+	}
+	chosenMessage.Status = "claimed"
+	chosenMessage.Attempts++
+	copy := *chosenMessage
+	copy.Payload = append(json.RawMessage(nil), chosenMessage.Payload...)
+	_ = s.auditLocked("supervisor", chosen, "turn.claim", chosenMessage.MessageID, "allow", "")
+	if err := s.persistLocked(nil); err != nil {
+		return "", MailboxMessage{}, err
+	}
+	s.lastClaim[chosen] = now
+	return chosen, copy, nil
 }
 
-func (s *Supervisor) finishTurn(id string, m MailboxMessage, text string, usage Usage, providerErr error) error {
+// maxThrottleBand bounds how far prefix affinity may jump past the
+// least-charged candidate: never more than 25% or 64 tokens.
+func maxThrottleBand(minTokens uint64) uint64 {
+	band := minTokens / 4
+	if band < 64 {
+		band = 64
+	}
+	return band
+}
+
+// promptPrefix extracts the stable leading text a turn shares with fan-out
+// siblings; it feeds both affinity scheduling and cache-hit accounting.
+func promptPrefix(payload json.RawMessage) string {
+	var p struct {
+		Text string `json:"text"`
+	}
+	_ = json.Unmarshal(payload, &p)
+	const prefixLen = 64
+	if len(p.Text) <= prefixLen {
+		return p.Text
+	}
+	return p.Text[:prefixLen]
+}
+
+func (s *Supervisor) finishTurn(id string, m MailboxMessage, text string, usage Usage, route RouteInfo, providerErr error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	a := s.state.Applications[id]
@@ -206,6 +264,7 @@ func (s *Supervisor) finishTurn(id string, m MailboxMessage, text string, usage 
 	if _, ok := s.state.Results[m.MessageID]; ok {
 		return nil
 	}
+	cacheHit := cacheHitKind(usage, a.LastCompat, route.CompatKey)
 	prepared, ok := s.state.Prepared[m.MessageID]
 	if !ok {
 		status := "completed"
@@ -213,7 +272,8 @@ func (s *Supervisor) finishTurn(id string, m MailboxMessage, text string, usage 
 			status = "failed"
 			text = ""
 		}
-		prepared = TurnResult{ApplicationID: id, MessageID: m.MessageID, Text: text, Usage: usage, Status: status}
+		prepared = TurnResult{ApplicationID: id, MessageID: m.MessageID, Text: text, Usage: usage, Status: status,
+			Provider: route.Provider, Fallbacks: route.Fallbacks, CacheHitKind: cacheHit}
 		s.state.Prepared[m.MessageID] = prepared
 		if err := s.persistLocked(nil); err != nil {
 			return err
@@ -261,7 +321,8 @@ func (s *Supervisor) finishTurn(id string, m MailboxMessage, text string, usage 
 		status = "failed"
 		text = ""
 	}
-	s.state.Results[m.MessageID] = TurnResult{ApplicationID: id, MessageID: m.MessageID, Text: text, Usage: usage, Status: status, Checkpoint: checkpoint}
+	s.state.Results[m.MessageID] = TurnResult{ApplicationID: id, MessageID: m.MessageID, Text: text, Usage: usage, Status: status, Checkpoint: checkpoint,
+		Provider: route.Provider, Fallbacks: route.Fallbacks, CacheHitKind: cacheHit}
 	delete(s.state.Prepared, m.MessageID)
 	for i := range s.state.Mailbox[id] {
 		if s.state.Mailbox[id][i].MessageID == m.MessageID {
@@ -271,8 +332,28 @@ func (s *Supervisor) finishTurn(id string, m MailboxMessage, text string, usage 
 	// The prepared result fixes nondeterministic model output before idempotent
 	// context writes. Recovery finishes that result without running the model.
 	a.Checkpoint = checkpoint
+	if status != "failed" {
+		a.LastProvider = route.Provider
+		a.LastCompat = route.CompatKey
+		s.lastPrefix = promptPrefix(m.Payload)
+	}
 	_ = s.auditLocked("supervisor", id, "turn."+status, m.MessageID, "allow", "")
 	return s.persistLocked(nil)
+}
+
+// cacheHitKind classifies one turn against the route model's recovery
+// levels: a backend-reported cache hit is kv_exact; the same compatibility
+// key without a hit re-evaluates the prefix; a changed key forces
+// text-level replay.
+func cacheHitKind(usage Usage, lastCompat, currentCompat string) string {
+	switch {
+	case usage.CachedTokens > 0:
+		return "kv_exact"
+	case lastCompat != "" && lastCompat == currentCompat:
+		return "prefix_replay"
+	default:
+		return "text_replay"
+	}
 }
 
 // requeueClaim returns an in-flight delivery to the durable mailbox when the
@@ -348,11 +429,15 @@ func (s *Supervisor) Run(ctx context.Context, provider Provider) error {
 		s.mu.Lock()
 		_, prepared := s.state.Prepared[m.MessageID]
 		s.mu.Unlock()
+		route := RouteInfo{Provider: provider.Name(), CompatKey: compatKeyOf(provider)}
 		if !prepared {
 			if err = json.Unmarshal(m.Payload, &p); err == nil {
 				turnCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 				text, usage, err = provider.Complete(turnCtx, p.Text)
 				cancel()
+			}
+			if tracker, ok := provider.(interface{ LastRoute() RouteInfo }); ok && err == nil {
+				route = tracker.LastRoute()
 			}
 		}
 		if ctx.Err() != nil {
@@ -361,7 +446,7 @@ func (s *Supervisor) Run(ctx context.Context, provider Provider) error {
 			}
 			return nil
 		} // Recovery requeues the unacknowledged claim.
-		if err = s.finishTurn(id, m, text, usage, err); err != nil {
+		if err = s.finishTurn(id, m, text, usage, route, err); err != nil {
 			if requeueErr := s.requeueClaim(id, m.MessageID); requeueErr != nil {
 				return fmt.Errorf("%w (requeue failed: %v)", err, requeueErr)
 			}

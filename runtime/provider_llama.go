@@ -149,6 +149,10 @@ func (p *LlamaProvider) slotAction(ctx context.Context, endpoint string, slot in
 
 func (*LlamaProvider) Name() string { return "llama.cpp" }
 
+// CompatKey identifies the deployment: one llama.cpp endpoint serves one
+// model/tokenizer/quantization, so the endpoint is the compatibility key.
+func (p *LlamaProvider) CompatKey() string { return "llama.cpp|" + p.endpoint }
+
 func (p *LlamaProvider) Complete(ctx context.Context, prompt string) (string, Usage, error) {
 	if len(prompt) > maxTextBytes {
 		return "", Usage{}, errors.New("llama prompt exceeds engine limit")

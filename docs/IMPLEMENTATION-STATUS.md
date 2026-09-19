@@ -65,6 +65,11 @@
   不变，resource kselftest 扩到 56 项；runtime `claimTurn` 在同一压力带做准入节流
   （每应用每秒一个 turn）。同轮修复 runner 对容器挂载路径的陈旧页缓存问题：QEMU
   一律从本地临时副本引导。见 [KERNEL-P8-VALIDATION.md](KERNEL-P8-VALIDATION.md)。
+- 2026-09-19 P2 切片：router 记录每 turn 的 provider/fallbacks/compat key 并按
+  后端回报分类 cache_hit_kind（kv_exact/prefix_replay/text_replay）；调度带前缀
+  亲和（公平带内优先共享前缀的 turn）。真实 llama 证明：无干扰命中 87/88，且在
+  会逐出缓存的干扰 turn 排队在前时，亲和仍保住 87/88 命中。见
+  [RUNTIME-ROUTE-AFFINITY-VALIDATION.md](RUNTIME-ROUTE-AFFINITY-VALIDATION.md)。
 - 2026-09-19 P2 切片：前缀命中率按后端 usage 可复算——llama provider 强制
   `cache_n` 一致性，supervisor 累计 `tokens_cached` 并经 inspect/result 暴露；
   真实 llama.cpp smoke 实测命中率 0.00→0.99（87/88 前缀复用），见

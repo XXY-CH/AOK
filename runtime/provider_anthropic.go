@@ -79,6 +79,10 @@ func isLoopbackHost(host string) bool {
 
 func (*AnthropicProvider) Name() string { return "anthropic" }
 
+func (p *AnthropicProvider) CompatKey() string {
+	return "anthropic|" + p.config.Model + "|messages"
+}
+
 func (p *AnthropicProvider) Complete(ctx context.Context, prompt string) (string, Usage, error) {
 	if len(prompt) > maxTextBytes {
 		return "", Usage{}, errors.New("anthropic prompt exceeds engine limit")

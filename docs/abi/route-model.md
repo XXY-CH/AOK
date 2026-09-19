@@ -59,3 +59,16 @@ kernel 先按 token 配额预留；turn 完成后使用 backend usage 回报对�
 
 路由切换、cache miss、预算拒绝和 backend 不健康都必须产生日志事件。backend 私有日志
 不能替代 kernel 可读取的对账记录。
+
+## 当前用户态实现（2026-09-19）
+
+runtime 已实现契约的可验证子集：`RouterProvider` 按声明顺序显式 fallback 并为每个
+turn 记录 `RouteInfo`（serving provider、`fallbacks` 计数、compatibility key）；
+provider 通过 `CompatKey` 声明部署级兼容键（llama 系按 endpoint、anthropic 按
+model）。`TurnResult` 携带 `provider/fallbacks/cache_hit_kind`，Application 持久化
+`last_provider/last_compat`；`cache_hit_kind` 按后端回报分类为
+`kv_exact`（cache_n>0）/`prefix_replay`（同键未命中）/`text_replay`（键变更）。
+supervisor 调度带前缀亲和：在与最少计费候选的公平带（25% 或 64 token）内优先
+共享上一执行前缀的 turn，保证同源 fan-out 连续执行以保住热 KV。证据见
+[RUNTIME-ROUTE-AFFINITY-VALIDATION.md](../RUNTIME-ROUTE-AFFINITY-VALIDATION.md)。
+`route_policy`/`route_handle` 对象、跨 backend 的 KV 迁移与 `ainf` 校验闭环仍属后续。

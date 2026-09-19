@@ -22,7 +22,7 @@ func TestFinishTurnAccountsCachedTokens(t *testing.T) {
 		t.Fatalf("claim: %v %v", id, err)
 	}
 	usage := Usage{InputTokens: 100, OutputTokens: 10, CachedTokens: 60}
-	if err := s.finishTurn(id, m, "done", usage, nil); err != nil {
+	if err := s.finishTurn(id, m, "done", usage, RouteInfo{Provider: "echo", CompatKey: "echo|std|plain|f32|1|cpu"}, nil); err != nil {
 		t.Fatalf("finishTurn: %v", err)
 	}
 	inspected, err := s.InspectApplication(app.ApplicationID)

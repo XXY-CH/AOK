@@ -35,6 +35,10 @@ func NewMetalProvider(config MetalConfig) (*MetalProvider, error) {
 
 func (p *MetalProvider) Name() string { return "metal" }
 
+// The Metal adapter fronts the same llama.cpp deployment as the llama
+// provider, so it shares that deployment's compatibility key.
+func (p *MetalProvider) CompatKey() string { return p.llama.CompatKey() }
+
 func (p *MetalProvider) Complete(ctx context.Context, prompt string) (string, Usage, error) {
 	if p == nil || p.llama == nil {
 		return "", Usage{}, errors.New("metal provider is unavailable")

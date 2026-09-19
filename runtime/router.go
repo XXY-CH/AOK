@@ -5,12 +5,39 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 )
+
+// RouteInfo records one routed turn: which provider served it, how many
+// earlier candidates failed, and the serving provider's compatibility key.
+// It is the runtime side of the route_record contract in docs/abi/route-model.md.
+type RouteInfo struct {
+	Provider  string `json:"provider"`
+	Fallbacks uint32 `json:"fallbacks"`
+	CompatKey string `json:"compat_key"`
+}
+
+// CompatKeyer lets a provider declare its KV compatibility key
+// (model | tokenizer | template | quantization | version | device). KV may
+// only be reused across turns whose keys match exactly; any change forces
+// the recovery level to degrade per the route model.
+type CompatKeyer interface {
+	CompatKey() string
+}
 
 // RouterProvider tries supervisor-selected providers in order. The prompt is
 // never allowed to select a provider; route order comes from trusted policy.
 type RouterProvider struct {
+	mu        sync.Mutex
 	providers []Provider
+	last      RouteInfo
+}
+
+// LastRoute returns the routing decision of the most recent Complete call.
+func (r *RouterProvider) LastRoute() RouteInfo {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.last
 }
 
 func NewRouterProvider(providers ...Provider) (*RouterProvider, error) {
@@ -36,12 +63,16 @@ func (r *RouterProvider) Name() string { return "router" }
 
 func (r *RouterProvider) Complete(ctx context.Context, prompt string) (string, Usage, error) {
 	var failures []string
-	for _, provider := range r.providers {
+	for index, provider := range r.providers {
 		if err := ctx.Err(); err != nil {
 			return "", Usage{}, err
 		}
 		text, usage, err := provider.Complete(ctx, prompt)
 		if err == nil {
+			r.mu.Lock()
+			r.last = RouteInfo{Provider: provider.Name(),
+				Fallbacks: uint32(index), CompatKey: compatKeyOf(provider)}
+			r.mu.Unlock()
 			return text, usage, nil
 		}
 		if ctx.Err() != nil {
@@ -49,5 +80,15 @@ func (r *RouterProvider) Complete(ctx context.Context, prompt string) (string, U
 		}
 		failures = append(failures, provider.Name()+": "+err.Error())
 	}
+	r.mu.Lock()
+	r.last = RouteInfo{}
+	r.mu.Unlock()
 	return "", Usage{}, errors.New("all routed providers failed: " + strings.Join(failures, "; "))
+}
+
+func compatKeyOf(provider Provider) string {
+	if keyed, ok := provider.(CompatKeyer); ok {
+		return keyed.CompatKey()
+	}
+	return provider.Name()
 }

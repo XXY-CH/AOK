@@ -39,3 +39,43 @@ func TestRouterRejectsDuplicateOrEmptyProviders(t *testing.T) {
 		t.Fatal("accepted duplicate provider")
 	}
 }
+
+type keyedProvider struct {
+	name, text, key string
+}
+
+func (p keyedProvider) Name() string { return p.name }
+func (p keyedProvider) Complete(context.Context, string) (string, Usage, error) {
+	return p.text, Usage{InputTokens: 2, OutputTokens: 1}, nil
+}
+func (p keyedProvider) CompatKey() string { return p.key }
+
+func TestRouterRecordsRouteAndFallbackCount(t *testing.T) {
+	r, err := NewRouterProvider(failingProvider{"llama.cpp"},
+		keyedProvider{name: "anthropic", text: "ok", key: "anthropic|m|messages"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = r.Complete(context.Background(), "prompt"); err != nil {
+		t.Fatal(err)
+	}
+	route := r.LastRoute()
+	if route.Provider != "anthropic" || route.Fallbacks != 1 ||
+		route.CompatKey != "anthropic|m|messages" {
+		t.Fatalf("unexpected route record: %+v", route)
+	}
+	r2, _ := NewRouterProvider(keyedProvider{name: "echo", text: "x", key: "echo|std"})
+	if _, _, err = r2.Complete(context.Background(), "p"); err != nil {
+		t.Fatal(err)
+	}
+	if route = r2.LastRoute(); route.Fallbacks != 0 || route.Provider != "echo" {
+		t.Fatalf("first-choice route wrong: %+v", route)
+	}
+	r3, _ := NewRouterProvider(failingProvider{"a"}, failingProvider{"b"})
+	if _, _, err = r3.Complete(context.Background(), "p"); err == nil {
+		t.Fatal("expected failure")
+	}
+	if route = r3.LastRoute(); route.Provider != "" {
+		t.Fatalf("failed route must be empty: %+v", route)
+	}
+}

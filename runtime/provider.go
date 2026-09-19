@@ -18,6 +18,8 @@ type Provider interface {
 type EchoProvider struct{}
 
 func (EchoProvider) Name() string { return "echo" }
+
+func (EchoProvider) CompatKey() string { return "echo|std|plain|f32|1|cpu" }
 func (EchoProvider) Complete(ctx context.Context, prompt string) (string, Usage, error) {
 	select {
 	case <-ctx.Done():

@@ -39,6 +39,7 @@ type Supervisor struct {
 	kernelApps   map[string]KernelApplication
 	kernelSrcs   map[string]KernelEventSource
 	lastClaim    map[string]time.Time
+	lastPrefix   string
 }
 
 type supervisorState struct {
@@ -70,6 +71,8 @@ type Application struct {
 	Failures        uint32 `json:"failures"`
 	ContextID       string `json:"context_id"`
 	KernelID        uint64 `json:"kernel_id,omitempty"`
+	LastProvider    string `json:"last_provider,omitempty"`
+	LastCompat      string `json:"last_compat,omitempty"`
 }
 
 type MailboxMessage struct {

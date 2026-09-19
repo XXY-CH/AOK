@@ -156,6 +156,10 @@ runtime-core-smoke:
 runtime-hitrate-smoke:
 	@python3 runtime/scripts/hitrate-smoke.py
 
+.PHONY: runtime-affinity-smoke
+runtime-affinity-smoke:
+	@python3 runtime/scripts/affinity-smoke.py
+
 aok-core-test:
 	@AOK_INITRD="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/core-initramfs.cpio.gz" \
 	 AOK_SERIAL_LOG="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/serial-core.log" \
