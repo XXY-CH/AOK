@@ -60,6 +60,8 @@ type supervisorState struct {
 	Channels           map[string]MessageChannel      `json:"channels,omitempty"`
 	Conversations      map[string]MessageConversation `json:"conversations,omitempty"`
 	Outbox             []OutboxEntry                  `json:"outbox,omitempty"`
+	HostfsMounts       map[string]HostfsMount         `json:"hostfs_mounts,omitempty"`
+	Transfers          []ArtifactTransfer             `json:"artifact_transfers,omitempty"`
 }
 
 // RoutePolicy is the per-application routing policy: the allowed backend
@@ -245,6 +247,9 @@ func (s *Supervisor) load() error {
 	}
 	if s.state.Conversations == nil {
 		s.state.Conversations = map[string]MessageConversation{}
+	}
+	if s.state.HostfsMounts == nil {
+		s.state.HostfsMounts = map[string]HostfsMount{}
 	}
 	for _, a := range s.state.Applications {
 		if a == nil {
