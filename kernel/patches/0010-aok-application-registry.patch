@@ -1,0 +1,1175 @@
+diff --git a/include/linux/aok.h b/include/linux/aok.h
+index aa4a1dd..d91dba1 100644
+--- a/include/linux/aok.h
++++ b/include/linux/aok.h
+@@ -74,6 +74,7 @@ struct aok_event_node {
+ 	u64 event_id;
+ 	u64 event_seq;
+ 	u32 coalesced;
++	u64 data;			/* LSFS commit cursor */
+ };
+ 
+ struct aok_event_source {
+@@ -89,6 +90,7 @@ struct aok_event_source {
+ 	wait_queue_head_t wait;
+ 	struct mutex bind_lock; /* target lifetime and binding changes */
+ 	struct file *wake_target;
++	struct aok_application *app;	/* ref held while attached */
+ 	struct delayed_work wake_work;
+ 	u64 event_seq;			/* last assigned */
+ 	u64 event_id;			/* last issued, never reused */
+@@ -98,6 +100,43 @@ struct aok_event_source {
+ 	bool periodic;
+ };
+ 
++/*
++ * Application registry entry: the within-boot durable owner of unacked
++ * events for one application_id. The registry list itself holds a
++ * permanent reference, so entries outlive every fd and stale waitqueue
++ * registrations stay valid; identity is never reused within a boot.
++ */
++struct aok_app_node {
++	struct list_head list;
++	bool used;
++	u64 event_id;
++	u64 event_seq;
++	u32 kind;
++	u32 coalesced;
++	u64 data;
++};
++
++struct aok_application {
++	refcount_t refs;		/* registry + open handles + attached sources */
++	spinlock_t lock;		/* guards queue/counters */
++	struct list_head list;		/* aok_apps linkage under aok_apps_lock */
++	u64 koid;
++	u64 application_id;
++	u64 event_seq;			/* last assigned, registry-wide */
++	u64 event_id;			/* last issued, never reused */
++	unsigned int live;
++	unsigned long coalesced;	/* merged posts awaiting a free slot */
++	struct list_head pending;	/* unacked events in seq order */
++	struct aok_app_node nodes[AOK_APP_QUEUE_DEPTH];
++	wait_queue_head_t wait;
++};
++
++struct aok_app_file {
++	struct aok_application *app;	/* pinned by this open */
++	u64 rights;
++	u64 read_seq;
++};
++
+ struct aok_event_file {
+ 	struct aok_event_source *source;	/* pinned by this open */
+ 	u64 rights;
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index 82e8a31..7c54c19 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -909,8 +909,17 @@ __SYSCALL(__NR_aok_event_bind, sys_aok_event_bind)
+ #define __NR_aok_event_ack 486
+ __SYSCALL(__NR_aok_event_ack, sys_aok_event_ack)
+ 
++#define __NR_aok_application_create 487
++__SYSCALL(__NR_aok_application_create, sys_aok_application_create)
++
++#define __NR_aok_application_snapshot 488
++__SYSCALL(__NR_aok_application_snapshot, sys_aok_application_snapshot)
++
++#define __NR_aok_application_restore 489
++__SYSCALL(__NR_aok_application_restore, sys_aok_application_restore)
++
+ #undef __NR_syscalls
+-#define __NR_syscalls 487
++#define __NR_syscalls 490
+ 
+ /*
+  * 32 bit systems traditionally used different
+diff --git a/include/uapi/linux/aok.h b/include/uapi/linux/aok.h
+index eb43cec..6545841 100644
+--- a/include/uapi/linux/aok.h
++++ b/include/uapi/linux/aok.h
+@@ -153,6 +153,8 @@ struct aok_budget_status {
+ #define AOK_EVENT_KIND_TIMER 1U
+ #define AOK_EVENT_SOURCE_PORT 2U
+ #define AOK_EVENT_KIND_PORT 2U
++#define AOK_EVENT_SOURCE_LSFS 3U
++#define AOK_EVENT_KIND_LSFS 3U
+ 
+ /* Event-source fd ioctls; SET_TARGET requires SIGNAL on the aproc fd. */
+ #define AOK_EVENT_SET_TARGET 0xa020U
+@@ -164,6 +166,36 @@ struct aok_event_target {
+ 	__u32 wake_policy;
+ };
+ 
++/*
++ * Application-registry slice. An application fd owns the durable unacked
++ * queue for one registered application_id: events attached to it survive
++ * the release of every source fd within the boot, and snapshot/restore
++ * hand the queue to the supervisor across VM reboots.
++ */
++#define AOK_OBJECT_APPLICATION 4U
++
++#define AOK_APP_QUEUE_DEPTH 128U
++
++/* Application-fd ioctl: arg is the event_id being acknowledged. */
++#define AOK_APP_ACK 0xa030U
++
++/* Event-source fd ioctl: route fired events into a registered application. */
++#define AOK_EVENT_ATTACH_APP 0xa022U
++
++struct aok_event_app {
++	__u64 application_id; /* must match the application fd */
++	__s32 app_fd; /* -1 detaches and requires application_id == 0 */
++	__u32 reserved;
++};
++
++struct aok_application_attr {
++	__u64 size;
++	__s32 parent_job_fd;
++	__u32 reserved;
++	__u64 application_id; /* non-zero; create is idempotent per boot */
++	__u64 reserved2[2];
++};
++
+ #define AOK_TIMER_ONESHOT 0U
+ #define AOK_TIMER_PERIODIC 1U
+ 
+@@ -224,7 +256,8 @@ struct aok_event_record {
+ 	__u64 event_seq;
+ 	__u32 kind;
+ 	__u32 coalesced;
+-	__u64 reserved[3];
++	__u64 data; /* LSFS commit cursor; 0 for timer/port */
++	__u64 reserved[2];
+ };
+ 
+ /* Capability/inference control ABI. All handles are close-on-exec. */
+diff --git a/kernel/aok.c b/kernel/aok.c
+index 7a3dfc5..56e5d75 100644
+--- a/kernel/aok.c
++++ b/kernel/aok.c
+@@ -1193,7 +1193,86 @@ SYSCALL_DEFINE2(aok_token_usage, int, fd,
+  * into a single pending count, flushed as one event when an ack recycles
+  * a slot.
+  */
+-static void aok_source_fire_locked(struct aok_event_source *source)
++/*
++ * Application registry: one entry per registered application_id for the
++ * whole boot. The registry list owns a permanent reference, so entries and
++ * their waitqueues stay valid even after every fd is closed; a fresh
++ * application fd or an attached source replays the durable queue.
++ */
++static DEFINE_MUTEX(aok_apps_lock);
++static LIST_HEAD(aok_apps);
++
++static void aok_app_fire_locked(struct aok_application *app, u32 kind,
++				u64 data)
++{
++	struct aok_app_node *node = NULL;
++	int i;
++
++	if (app->live >= AOK_APP_QUEUE_DEPTH) {
++		app->coalesced++;
++		return;
++	}
++	for (i = 0; i < AOK_APP_QUEUE_DEPTH; i++) {
++		if (!app->nodes[i].used) {
++			node = &app->nodes[i];
++			break;
++		}
++	}
++	if (WARN_ON_ONCE(!node))
++		return;
++	node->used = true;
++	node->event_id = ++app->event_id;
++	node->event_seq = ++app->event_seq;
++	node->kind = kind;
++	node->coalesced = 1;
++	node->data = data;
++	list_add_tail(&node->list, &app->pending);
++	app->live++;
++}
++
++static void aok_app_flush_locked(struct aok_application *app)
++{
++	struct aok_app_node *node = NULL;
++	int i;
++
++	if (!app->coalesced || app->live >= AOK_APP_QUEUE_DEPTH)
++		return;
++	for (i = 0; i < AOK_APP_QUEUE_DEPTH; i++) {
++		if (!app->nodes[i].used) {
++			node = &app->nodes[i];
++			break;
++		}
++	}
++	if (WARN_ON_ONCE(!node))
++		return;
++	node->used = true;
++	node->event_id = ++app->event_id;
++	node->event_seq = ++app->event_seq;
++	node->kind = AOK_EVENT_KIND_TIMER;
++	node->coalesced = app->coalesced;
++	node->data = 0;
++	list_add_tail(&node->list, &app->pending);
++	app->live++;
++	app->coalesced = 0;
++}
++
++/* Registry entries are never freed, so a looked-up entry needs no pin. */
++static struct aok_application *aok_app_find(u64 application_id)
++{
++	struct aok_application *app;
++
++	mutex_lock(&aok_apps_lock);
++	list_for_each_entry(app, &aok_apps, list) {
++		if (app->application_id == application_id) {
++			mutex_unlock(&aok_apps_lock);
++			return app;
++		}
++	}
++	mutex_unlock(&aok_apps_lock);
++	return NULL;
++}
++
++static void aok_source_fire_locked(struct aok_event_source *source, u64 data)
+ {
+ 	struct aok_event_node *node = NULL;
+ 	int i;
+@@ -1214,10 +1293,29 @@ static void aok_source_fire_locked(struct aok_event_source *source)
+ 	node->event_id = ++source->event_id;
+ 	node->event_seq = ++source->event_seq;
+ 	node->coalesced = 1;
++	node->data = data;
+ 	list_add_tail(&node->list, &source->pending);
+ 	source->live++;
+ }
+ 
++/*
++ * Deliver one event: into the attached application's durable queue when
++ * the source is attached, else into the source's volatile queue. Called
++ * with source->lock held (hardirq-safe for the timer path); nesting
++ * app->lock inside source->lock is the fixed lock order.
++ */
++static void aok_source_deliver_locked(struct aok_event_source *source,
++				      u64 data)
++{
++	if (source->app) {
++		spin_lock(&source->app->lock);
++		aok_app_fire_locked(source->app, source->kind, data);
++		spin_unlock(&source->app->lock);
++	} else {
++		aok_source_fire_locked(source, data);
++	}
++}
++
+ static void aok_source_wake_work(struct work_struct *work)
+ {
+ 	struct aok_event_source *source = container_of(to_delayed_work(work),
+@@ -1228,7 +1326,16 @@ static void aok_source_wake_work(struct work_struct *work)
+ 
+ 	mutex_lock(&source->bind_lock);
+ 	spin_lock_irq(&source->lock);
+-	wake = source->live && source->wake_policy != AOK_WAKE_MANUAL;
++	wake = source->wake_policy != AOK_WAKE_MANUAL;
++	if (wake) {
++		if (source->app) {
++			spin_lock(&source->app->lock);
++			wake = source->app->live != 0;
++			spin_unlock(&source->app->lock);
++		} else {
++			wake = source->live != 0;
++		}
++	}
+ 	spin_unlock_irq(&source->lock);
+ 	if (wake && source->wake_target) {
+ 		target = source->wake_target->private_data;
+@@ -1242,10 +1349,27 @@ static void aok_source_wake_work(struct work_struct *work)
+ 
+ static void aok_source_notify(struct aok_event_source *source)
+ {
++	struct aok_application *app;
++	unsigned long flags;
++
+ 	wake_up_interruptible_poll(&source->wait, EPOLLIN | EPOLLRDNORM);
++	/* Registry entries persist, so a detached app pointer stays valid. */
++	spin_lock_irqsave(&source->lock, flags);
++	app = source->app;
++	if (app) {
++		spin_lock(&app->lock);
++		wake_up_interruptible_poll(&app->wait, EPOLLIN | EPOLLRDNORM);
++		spin_unlock(&app->lock);
++	}
++	spin_unlock_irqrestore(&source->lock, flags);
+ 	schedule_delayed_work(&source->wake_work, 0);
+ }
+ 
++static void aok_app_notify(struct aok_application *app)
++{
++	wake_up_interruptible_poll(&app->wait, EPOLLIN | EPOLLRDNORM);
++}
++
+ static enum hrtimer_restart aok_timer_fn(struct hrtimer *timer)
+ {
+ 	struct aok_event_source *source =
+@@ -1253,7 +1377,7 @@ static enum hrtimer_restart aok_timer_fn(struct hrtimer *timer)
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&source->lock, flags);
+-	aok_source_fire_locked(source);
++	aok_source_deliver_locked(source, 0);
+ 	spin_unlock_irqrestore(&source->lock, flags);
+ 	aok_source_notify(source);
+ 
+@@ -1283,6 +1407,7 @@ static void aok_source_flush_locked(struct aok_event_source *source)
+ 	node->event_id = ++source->event_id;
+ 	node->event_seq = ++source->event_seq;
+ 	node->coalesced = source->coalesced;
++	node->data = 0;
+ 	list_add_tail(&node->list, &source->pending);
+ 	source->live++;
+ 	source->coalesced = 0;
+@@ -1298,6 +1423,8 @@ static int aok_event_release(struct inode *inode, struct file *file)
+ 		cancel_delayed_work_sync(&source->wake_work);
+ 		if (source->wake_target)
+ 			fput(source->wake_target);
++		if (source->app)
++			refcount_dec(&source->app->refs);
+ 		kfree(source);
+ 	}
+ 	kfree(handle);
+@@ -1308,6 +1435,7 @@ static int aok_event_release(struct inode *inode, struct file *file)
+  * One record per call from the per-open cursor. Unacked events stay in the
+  * queue, so duplicating the fd yields a fresh cursor and replays them; the
+  * cursor advances before copyout (consume semantics, matching aproc read).
++ * An attached source reads from the application's durable queue.
+  */
+ static ssize_t aok_event_read(struct file *file, char __user *buf,
+ 			      size_t count, loff_t *ppos)
+@@ -1315,7 +1443,8 @@ static ssize_t aok_event_read(struct file *file, char __user *buf,
+ 	struct aok_event_file *handle = file->private_data;
+ 	struct aok_event_source *source = handle->source;
+ 	struct aok_event_record rec = { .size = sizeof(rec), };
+-	struct aok_event_node *node, *iter;
++	struct aok_app_node *app_node = NULL;
++	struct aok_event_node *node = NULL, *iter;
+ 	unsigned long flags;
+ 
+ 	if (!(handle->rights & AOK_RIGHT_READ))
+@@ -1324,26 +1453,49 @@ static ssize_t aok_event_read(struct file *file, char __user *buf,
+ 		return -EINVAL;
+ 
+ 	spin_lock_irqsave(&source->lock, flags);
+-	node = NULL;
+-	list_for_each_entry(iter, &source->pending, list) {
+-		if (iter->event_seq > handle->read_seq) {
+-			node = iter;
+-			break;
++	if (source->app) {
++		struct aok_app_node *aiter;
++
++		spin_lock(&source->app->lock);
++		list_for_each_entry(aiter, &source->app->pending, list) {
++			if (aiter->event_seq > handle->read_seq) {
++				app_node = aiter;
++				break;
++			}
++		}
++		if (app_node) {
++			rec.source_koid = source->koid;
++			rec.application_id = source->app->application_id;
++			rec.event_id = app_node->event_id;
++			rec.event_seq = app_node->event_seq;
++			rec.kind = app_node->kind;
++			rec.coalesced = app_node->coalesced;
++			rec.data = app_node->data;
++			handle->read_seq = app_node->event_seq;
++		}
++		spin_unlock(&source->app->lock);
++	} else {
++		list_for_each_entry(iter, &source->pending, list) {
++			if (iter->event_seq > handle->read_seq) {
++				node = iter;
++				break;
++			}
++		}
++		if (node) {
++			rec.source_koid = source->koid;
++			rec.application_id = source->application_id;
++			rec.event_id = node->event_id;
++			rec.event_seq = node->event_seq;
++			rec.kind = source->kind;
++			rec.coalesced = node->coalesced;
++			rec.data = node->data;
++			handle->read_seq = node->event_seq;
+ 		}
+ 	}
+-	if (!node) {
+-		spin_unlock_irqrestore(&source->lock, flags);
+-		return 0;
+-	}
+-	rec.source_koid = source->koid;
+-	rec.application_id = source->application_id;
+-	rec.event_id = node->event_id;
+-	rec.event_seq = node->event_seq;
+-	rec.kind = source->kind;
+-	rec.coalesced = node->coalesced;
+-	handle->read_seq = node->event_seq;
+ 	spin_unlock_irqrestore(&source->lock, flags);
+ 
++	if (!node && !app_node)
++		return 0;
+ 	if (copy_to_user(buf, &rec, sizeof(rec)))
+ 		return -EFAULT;
+ 	return sizeof(rec);
+@@ -1353,20 +1505,37 @@ static __poll_t aok_event_poll(struct file *file, poll_table *wait)
+ {
+ 	struct aok_event_file *handle = file->private_data;
+ 	struct aok_event_source *source = handle->source;
++	struct aok_app_node *app_node;
+ 	struct aok_event_node *node;
++	bool ready = false;
+ 	__poll_t mask = 0;
+ 
+ 	if (!(handle->rights & AOK_RIGHT_READ))
+ 		return EPOLLERR;
+ 	poll_wait(file, &source->wait, wait);
+ 	spin_lock_irq(&source->lock);
+-	list_for_each_entry(node, &source->pending, list) {
+-		if (node->event_seq > handle->read_seq) {
+-			mask = EPOLLIN | EPOLLRDNORM;
+-			break;
++	if (source->app) {
++		/* Registry entries persist, so registering is always safe. */
++		poll_wait(file, &source->app->wait, wait);
++		spin_lock(&source->app->lock);
++		list_for_each_entry(app_node, &source->app->pending, list) {
++			if (app_node->event_seq > handle->read_seq) {
++				ready = true;
++				break;
++			}
++		}
++		spin_unlock(&source->app->lock);
++	} else {
++		list_for_each_entry(node, &source->pending, list) {
++			if (node->event_seq > handle->read_seq) {
++				ready = true;
++				break;
++			}
+ 		}
+ 	}
+ 	spin_unlock_irq(&source->lock);
++	if (ready)
++		mask = EPOLLIN | EPOLLRDNORM;
+ 	return mask;
+ }
+ 
+@@ -1375,14 +1544,27 @@ static __poll_t aok_event_poll(struct file *file, poll_table *wait)
+ static int aok_source_bind(struct aok_event_source *source, u64 application_id,
+ 			   u32 policy, struct file *target)
+ {
++	struct aok_application *app;
+ 	struct file *old;
++	bool busy;
+ 	int ret = 0;
+ 
+ 	mutex_lock(&source->bind_lock);
+ 	spin_lock_irq(&source->lock);
+-	if ((source->live || source->coalesced) &&
+-	    (target || application_id != source->application_id ||
+-	     policy != AOK_WAKE_MANUAL)) {
++	app = source->app;
++	if (app) {
++		if (application_id != app->application_id) {
++			ret = -EINVAL;
++			goto out;
++		}
++		spin_lock(&app->lock);
++		busy = app->live || app->coalesced;
++		spin_unlock(&app->lock);
++	} else {
++		busy = source->live || source->coalesced;
++	}
++	if (busy && (target || application_id != source->application_id ||
++		     policy != AOK_WAKE_MANUAL)) {
+ 		ret = -EBUSY;
+ 		goto out;
+ 	}
+@@ -1403,33 +1585,120 @@ static int aok_source_bind(struct aok_event_source *source, u64 application_id,
+ 	return ret;
+ }
+ 
++/*
++ * Attach routes every event the source fires into the application's
++ * durable queue. Volatile (unattached) pending events cannot migrate and
++ * block the attach; switching between applications is allowed because the
++ * durable events belong to their application, not to the source.
++ */
++static int aok_source_attach(struct aok_event_source *source,
++			     struct aok_application *app, u64 application_id)
++{
++	struct aok_application *old;
++	int ret = 0;
++
++	mutex_lock(&source->bind_lock);
++	spin_lock_irq(&source->lock);
++	if (!app && application_id) {
++		ret = -EINVAL; /* detach clears the label; nothing else valid */
++		goto out;
++	}
++	if (source->live || source->coalesced) {
++		ret = -EBUSY;
++		goto out;
++	}
++	old = source->app;
++	source->app = app;
++	if (app) {
++		refcount_inc(&app->refs);
++		source->application_id = application_id;
++	}
++	spin_unlock_irq(&source->lock);
++	if (old)
++		refcount_dec(&old->refs);
++	mutex_unlock(&source->bind_lock);
++	return 0;
++out:
++	spin_unlock_irq(&source->lock);
++	mutex_unlock(&source->bind_lock);
++	return ret;
++}
++
++static const struct file_operations aok_app_fops;
++
+ static long aok_event_ioctl(struct file *file, unsigned int cmd,
+ 			    unsigned long arg)
+ {
+ 	struct aok_event_file *handle = file->private_data;
+ 	struct aok_event_source *source = handle->source;
+ 	struct aok_event_target attr;
++	struct aok_event_app attach;
+ 	struct aok_handle *target;
++	struct aok_app_file *app_handle;
++	struct aok_application *app;
+ 	struct fd f;
++	unsigned long flags;
+ 	int ret;
+ 
+-	if (cmd != AOK_EVENT_SET_TARGET && cmd != AOK_EVENT_POST)
++	if (cmd != AOK_EVENT_SET_TARGET && cmd != AOK_EVENT_POST &&
++	    cmd != AOK_EVENT_ATTACH_APP)
+ 		return -ENOTTY;
+ 	if (!(handle->rights & AOK_RIGHT_WRITE))
+ 		return -EACCES;
+ 	if (cmd == AOK_EVENT_POST) {
+-		if (arg || source->kind != AOK_EVENT_SOURCE_PORT)
++		if (source->kind == AOK_EVENT_SOURCE_TIMER ||
++		    (source->kind == AOK_EVENT_SOURCE_PORT && arg))
+ 			return -EINVAL;
+-		spin_lock_irq(&source->lock);
+-		if (source->live == AOK_EVENT_SOURCE_DEPTH) {
+-			spin_unlock_irq(&source->lock);
+-			return -EAGAIN;
++		spin_lock_irqsave(&source->lock, flags);
++		if (source->app) {
++			spin_lock(&source->app->lock);
++			if (source->app->live == AOK_APP_QUEUE_DEPTH) {
++				spin_unlock(&source->app->lock);
++				spin_unlock_irqrestore(&source->lock, flags);
++				return -EAGAIN;
++			}
++			aok_app_fire_locked(source->app, source->kind, arg);
++			spin_unlock(&source->app->lock);
++		} else {
++			if (source->live == AOK_EVENT_SOURCE_DEPTH) {
++				spin_unlock_irqrestore(&source->lock, flags);
++				return -EAGAIN;
++			}
++			aok_source_fire_locked(source, arg);
+ 		}
+-		aok_source_fire_locked(source);
+-		spin_unlock_irq(&source->lock);
++		spin_unlock_irqrestore(&source->lock, flags);
+ 		aok_source_notify(source);
+ 		return 0;
+ 	}
++	if (cmd == AOK_EVENT_ATTACH_APP) {
++		if (copy_from_user(&attach, (void __user *)arg, sizeof(attach)))
++			return -EFAULT;
++		if (attach.reserved)
++			return -EINVAL;
++		if (attach.app_fd == -1)
++			return attach.application_id ? -EINVAL :
++			       aok_source_attach(source, NULL, 0);
++		f = fdget(attach.app_fd);
++		if (fd_empty(f))
++			return -EBADF;
++		if (fd_file(f)->f_op != &aok_app_fops) {
++			ret = -EINVAL;
++			goto out_fd;
++		}
++		app_handle = fd_file(f)->private_data;
++		if ((app_handle->rights & (AOK_RIGHT_READ | AOK_RIGHT_WRITE)) !=
++		    (AOK_RIGHT_READ | AOK_RIGHT_WRITE)) {
++			ret = -EACCES;
++			goto out_fd;
++		}
++		app = app_handle->app;
++		if (app->application_id != attach.application_id) {
++			ret = -EINVAL;
++			goto out_fd;
++		}
++		ret = aok_source_attach(source, app, attach.application_id);
++		goto out_fd;
++	}
+ 	if (copy_from_user(&attr, (void __user *)arg, sizeof(attr)))
+ 		return -EFAULT;
+ 	if (attr.wake_policy > AOK_WAKE_ON_QUIESCENT || attr.aproc_fd < -1)
+@@ -1483,7 +1752,8 @@ static int aok_copy_source_attr(struct aok_event_source_attr *attr,
+ 	if (attr->size != size ||
+ 	    attr->reserved || attr->reserved2[0] || attr->reserved2[1])
+ 		return -EINVAL;
+-	if (attr->kind == AOK_EVENT_SOURCE_PORT)
++	if (attr->kind == AOK_EVENT_SOURCE_PORT ||
++	    attr->kind == AOK_EVENT_SOURCE_LSFS)
+ 		return attr->flags || attr->first_ns || attr->interval_ns ?
+ 		       -EINVAL : 0;
+ 	if (attr->kind != AOK_EVENT_SOURCE_TIMER)
+@@ -1632,6 +1902,7 @@ SYSCALL_DEFINE2(aok_event_ack, int, fd, u64, event_id)
+ 	struct aok_event_file *handle;
+ 	struct aok_event_source *source;
+ 	struct aok_event_node *node;
++	struct aok_application *app;
+ 	struct fd f;
+ 	bool flushed = false;
+ 
+@@ -1649,28 +1920,458 @@ SYSCALL_DEFINE2(aok_event_ack, int, fd, u64, event_id)
+ 		return -EACCES;
+ 	}
+ 	spin_lock_irq(&source->lock);
+-	if (event_id > source->event_id) {
+-		spin_unlock_irq(&source->lock);
+-		fdput(f);
++	/* An attached source acknowledges inside its application's queue. */
++	app = source->app;
++	if (app) {
++		struct aok_app_node *app_node;
++
++		spin_lock(&app->lock);
++		if (event_id > app->event_id) {
++			spin_unlock(&app->lock);
++			spin_unlock_irq(&source->lock);
++			fdput(f);
++			return -EINVAL;
++		}
++		list_for_each_entry(app_node, &app->pending, list) {
++			if (app_node->event_id != event_id)
++				continue;
++			list_del_init(&app_node->list);
++			app_node->used = false;
++			app->live--;
++			flushed = app->coalesced != 0;
++			aok_app_flush_locked(app);
++			break;
++		}
++		spin_unlock(&app->lock);
++	} else {
++		if (event_id > source->event_id) {
++			spin_unlock_irq(&source->lock);
++			fdput(f);
++			return -EINVAL;
++		}
++		list_for_each_entry(node, &source->pending, list) {
++			if (node->event_id != event_id)
++				continue;
++			list_del_init(&node->list);
++			node->used = false;
++			source->live--;
++			flushed = source->coalesced != 0;
++			aok_source_flush_locked(source);
++			break;
++		}
++	}
++	spin_unlock_irq(&source->lock);
++	if (flushed)
++		aok_source_notify(source);
++	fdput(f);
++	return 0;
++}
++
++/*
++ * Application-registry slice. The application fd is the durable view over
++ * one registered application's unacked queue: read/poll replay it with a
++ * per-open cursor, AOK_APP_ACK retires events, and snapshot/restore hand
++ * the queue to the supervisor across a VM reboot. Entries persist for the
++ * whole boot, which is what makes replay survive source fd release and
++ * process exit.
++ */
++static int aok_app_release(struct inode *inode, struct file *file)
++{
++	struct aok_app_file *handle = file->private_data;
++
++	refcount_dec(&handle->app->refs);
++	kfree(handle);
++	return 0;
++}
++
++static ssize_t aok_app_read(struct file *file, char __user *buf,
++			    size_t count, loff_t *ppos)
++{
++	struct aok_app_file *handle = file->private_data;
++	struct aok_application *app = handle->app;
++	struct aok_event_record rec = { .size = sizeof(rec), };
++	struct aok_app_node *node = NULL, *iter;
++	unsigned long flags;
++
++	if (!(handle->rights & AOK_RIGHT_READ))
++		return -EACCES;
++	if (count < sizeof(rec))
+ 		return -EINVAL;
++
++	spin_lock_irqsave(&app->lock, flags);
++	list_for_each_entry(iter, &app->pending, list) {
++		if (iter->event_seq > handle->read_seq) {
++			node = iter;
++			break;
++		}
++	}
++	if (!node) {
++		spin_unlock_irqrestore(&app->lock, flags);
++		return 0;
+ 	}
+-	list_for_each_entry(node, &source->pending, list) {
++	rec.source_koid = app->koid;
++	rec.application_id = app->application_id;
++	rec.event_id = node->event_id;
++	rec.event_seq = node->event_seq;
++	rec.kind = node->kind;
++	rec.coalesced = node->coalesced;
++	rec.data = node->data;
++	handle->read_seq = node->event_seq;
++	spin_unlock_irqrestore(&app->lock, flags);
++
++	if (copy_to_user(buf, &rec, sizeof(rec)))
++		return -EFAULT;
++	return sizeof(rec);
++}
++
++static __poll_t aok_app_poll(struct file *file, poll_table *wait)
++{
++	struct aok_app_file *handle = file->private_data;
++	struct aok_application *app = handle->app;
++	struct aok_app_node *node;
++	__poll_t mask = 0;
++
++	if (!(handle->rights & AOK_RIGHT_READ))
++		return EPOLLERR;
++	poll_wait(file, &app->wait, wait);
++	spin_lock_irq(&app->lock);
++	list_for_each_entry(node, &app->pending, list) {
++		if (node->event_seq > handle->read_seq) {
++			mask = EPOLLIN | EPOLLRDNORM;
++			break;
++		}
++	}
++	spin_unlock_irq(&app->lock);
++	return mask;
++}
++
++static int aok_app_ack_locked(struct aok_application *app, u64 event_id)
++{
++	struct aok_app_node *node;
++
++	if (event_id > app->event_id)
++		return -EINVAL;
++	list_for_each_entry(node, &app->pending, list) {
+ 		if (node->event_id != event_id)
+ 			continue;
+ 		list_del_init(&node->list);
+ 		node->used = false;
+-		source->live--;
+-		flushed = source->coalesced != 0;
+-		aok_source_flush_locked(source);
+-		break;
++		app->live--;
++		return app->coalesced ? -EAGAIN : 0;
+ 	}
+-	spin_unlock_irq(&source->lock);
++	return 0;
++}
++
++static long aok_app_ioctl(struct file *file, unsigned int cmd,
++			  unsigned long arg)
++{
++	struct aok_app_file *handle = file->private_data;
++	struct aok_application *app = handle->app;
++	bool flushed;
++	long ret;
++
++	if (cmd != AOK_APP_ACK)
++		return -ENOTTY;
++	if (!(handle->rights & AOK_RIGHT_WRITE))
++		return -EACCES;
++	spin_lock_irq(&app->lock);
++	ret = aok_app_ack_locked(app, arg);
++	flushed = ret == -EAGAIN;
++	if (flushed) {
++		aok_app_flush_locked(app);
++		ret = 0;
++	}
++	spin_unlock_irq(&app->lock);
+ 	if (flushed)
+-		aok_source_notify(source);
+-	fdput(f);
++		aok_app_notify(app);
++	return ret;
++}
++
++static const struct file_operations aok_app_fops = {
++	.owner = THIS_MODULE,
++	.release = aok_app_release,
++	.read = aok_app_read,
++	.poll = aok_app_poll,
++	.unlocked_ioctl = aok_app_ioctl,
++};
++
++static int aok_copy_app_attr(struct aok_application_attr *attr,
++			     const struct aok_application_attr __user *uattr)
++{
++	u64 size;
++	int ret;
++
++	if (get_user(size, &uattr->size))
++		return -EFAULT;
++	if (size < sizeof(*attr) || size > PAGE_SIZE)
++		return -EINVAL;
++	ret = copy_struct_from_user(attr, sizeof(*attr), uattr, size);
++	if (ret)
++		return ret;
++	if (attr->size != size || !attr->application_id ||
++	    attr->reserved || attr->reserved2[0] || attr->reserved2[1])
++		return -EINVAL;
+ 	return 0;
+ }
+ 
++/*
++ * Create is idempotent per boot: an existing registry entry with the same
++ * application_id is re-opened with a fresh cursor, which is the recovery
++ * path after a supervisor restart. New ids allocate a registry entry whose
++ * permanent reference keeps the durable queue alive until reboot.
++ */
++SYSCALL_DEFINE2(aok_application_create,
++		const struct aok_application_attr __user *, uattr,
++		struct aok_object_info __user *, uinfo)
++{
++	struct aok_object_info info = {
++		.size = sizeof(info),
++		.type = AOK_OBJECT_APPLICATION,
++	};
++	struct aok_application_attr attr;
++	struct aok_app_file *handle;
++	struct aok_application *app = NULL, *iter;
++	struct fd parent;
++	struct file *file;
++	int fd, ret, i;
++
++	ret = aok_copy_app_attr(&attr, uattr);
++	if (ret)
++		return ret;
++	parent = fdget(attr.parent_job_fd);
++	if (fd_empty(parent))
++		return -EBADF;
++	if (fd_file(parent)->f_op != &aok_root_fops &&
++	    fd_file(parent)->f_op != &aok_aproc_fops) {
++		fdput(parent);
++		return -EINVAL;
++	}
++	if (!(fd_file(parent)->private_data &&
++	      ((struct aok_handle *)fd_file(parent)->private_data)->rights &
++	      AOK_RIGHT_MANAGE_CHILD)) {
++		fdput(parent);
++		return -EACCES;
++	}
++	fdput(parent);
++
++	mutex_lock(&aok_apps_lock);
++	list_for_each_entry(iter, &aok_apps, list) {
++		if (iter->application_id == attr.application_id) {
++			app = iter;
++			break;
++		}
++	}
++	if (!app) {
++		app = kzalloc(sizeof(*app), GFP_KERNEL);
++		if (!app) {
++			mutex_unlock(&aok_apps_lock);
++			return -ENOMEM;
++		}
++		ret = aok_alloc_id(&aok_next_koid, &app->koid);
++		if (ret) {
++			kfree(app);
++			mutex_unlock(&aok_apps_lock);
++			return ret;
++		}
++		refcount_set(&app->refs, 1); /* the registry itself */
++		spin_lock_init(&app->lock);
++		init_waitqueue_head(&app->wait);
++		INIT_LIST_HEAD(&app->pending);
++		for (i = 0; i < AOK_APP_QUEUE_DEPTH; i++)
++			INIT_LIST_HEAD(&app->nodes[i].list);
++		app->application_id = attr.application_id;
++		list_add(&app->list, &aok_apps);
++	}
++	refcount_inc(&app->refs);
++	mutex_unlock(&aok_apps_lock);
++
++	handle = kzalloc(sizeof(*handle), GFP_KERNEL);
++	if (!handle) {
++		refcount_dec(&app->refs);
++		return -ENOMEM;
++	}
++	handle->app = app;
++	handle->rights = AOK_RIGHT_INSPECT | AOK_RIGHT_DUPLICATE |
++			 AOK_RIGHT_READ | AOK_RIGHT_WRITE;
++	spin_lock(&app->lock);
++	info.aid = app->koid;
++	info.state = app->live;
++	spin_unlock(&app->lock);
++	info.rights = handle->rights;
++	fd = get_unused_fd_flags(O_CLOEXEC);
++	if (fd < 0) {
++		ret = fd;
++		goto err_handle;
++	}
++	file = anon_inode_getfile("aok-application", &aok_app_fops, handle,
++				  O_RDWR);
++	if (IS_ERR(file)) {
++		ret = PTR_ERR(file);
++		goto err_put_fd;
++	}
++	/* Publish only after the copyout succeeds; no installed fd on failure. */
++	ret = aok_copy_info(uinfo, &info);
++	if (ret) {
++		fput(file);
++		put_unused_fd(fd);
++		return ret;
++	}
++	fd_install(fd, file);
++	return fd;
++
++err_put_fd:
++	put_unused_fd(fd);
++err_handle:
++	kfree(handle);
++	refcount_dec(&app->refs);
++	return ret;
++}
++
++/* Copy the whole durable queue out for supervisor persistence. */
++SYSCALL_DEFINE3(aok_application_snapshot, int, fd,
++		struct aok_event_record __user *, ubuf, u64, count)
++{
++	struct aok_event_record *records;
++	struct aok_app_file *handle;
++	struct aok_application *app;
++	struct aok_app_node *node;
++	struct fd f;
++	u64 filled = 0;
++	int ret = 0;
++
++	f = fdget(fd);
++	if (fd_empty(f))
++		return -EBADF;
++	if (fd_file(f)->f_op != &aok_app_fops) {
++		fdput(f);
++		return -EINVAL;
++	}
++	handle = fd_file(f)->private_data;
++	if (!(handle->rights & AOK_RIGHT_INSPECT)) {
++		fdput(f);
++		return -EACCES;
++	}
++	app = handle->app;
++	records = kvmalloc_array(AOK_APP_QUEUE_DEPTH, sizeof(*records),
++				 GFP_KERNEL);
++	if (!records) {
++		fdput(f);
++		return -ENOMEM;
++	}
++	spin_lock_irq(&app->lock);
++	list_for_each_entry(node, &app->pending, list) {
++		struct aok_event_record *rec = &records[filled++];
++
++		rec->size = sizeof(*rec);
++		rec->source_koid = app->koid;
++		rec->application_id = app->application_id;
++		rec->event_id = node->event_id;
++		rec->event_seq = node->event_seq;
++		rec->kind = node->kind;
++		rec->coalesced = node->coalesced;
++		rec->data = node->data;
++	}
++	ret = filled;
++	spin_unlock_irq(&app->lock);
++	if (ubuf && filled) {
++		u64 copy = min(count, filled);
++
++		if (copy_to_user(ubuf, records, copy * sizeof(*records)))
++			ret = -EFAULT;
++	}
++	kvfree(records);
++	fdput(f);
++	return ret;
++}
++
++/*
++ * Reinject a persisted snapshot into an empty durable queue and continue
++ * the id/sequence space past the restored records. A non-empty queue, a
++ * mismatched application_id or non-monotonic records reject the restore.
++ */
++SYSCALL_DEFINE3(aok_application_restore, int, fd,
++		const struct aok_event_record __user *, urecs, u64, count)
++{
++	struct aok_event_record *records;
++	struct aok_app_file *handle;
++	struct aok_application *app;
++	struct fd f;
++	u64 i;
++	int ret;
++
++	if (count > AOK_APP_QUEUE_DEPTH)
++		return -EINVAL;
++	f = fdget(fd);
++	if (fd_empty(f))
++		return -EBADF;
++	if (fd_file(f)->f_op != &aok_app_fops) {
++		fdput(f);
++		return -EINVAL;
++	}
++	handle = fd_file(f)->private_data;
++	if (!(handle->rights & AOK_RIGHT_WRITE)) {
++		fdput(f);
++		return -EACCES;
++	}
++	app = handle->app;
++	if (!count) {
++		fdput(f);
++		return 0;
++	}
++	records = kvmalloc_array(count, sizeof(*records), GFP_KERNEL);
++	if (!records) {
++		fdput(f);
++		return -ENOMEM;
++	}
++	if (copy_from_user(records, urecs, count * sizeof(*records))) {
++		ret = -EFAULT;
++		goto out;
++	}
++	for (i = 0; i < count; i++) {
++		struct aok_event_record *rec = &records[i];
++
++		if (rec->size != sizeof(*rec) ||
++		    rec->application_id != app->application_id ||
++		    !rec->kind || rec->kind > AOK_EVENT_KIND_LSFS ||
++		    rec->reserved[0] || rec->reserved[1]) {
++			ret = -EINVAL;
++			goto out;
++		}
++		if (i && (rec->event_id <= records[i - 1].event_id ||
++			  rec->event_seq <= records[i - 1].event_seq)) {
++			ret = -EINVAL;
++			goto out;
++		}
++	}
++	spin_lock_irq(&app->lock);
++	if (app->live || app->coalesced) {
++		spin_unlock_irq(&app->lock);
++		ret = -EBUSY;
++		goto out;
++	}
++	for (i = 0; i < count; i++) {
++		struct aok_app_node *node = &app->nodes[i];
++
++		node->used = true;
++		node->event_id = records[i].event_id;
++		node->event_seq = records[i].event_seq;
++		node->kind = records[i].kind;
++		node->coalesced = records[i].coalesced;
++		node->data = records[i].data;
++		list_add_tail(&node->list, &app->pending);
++	}
++	app->live = count;
++	app->event_id = records[count - 1].event_id;
++	app->event_seq = records[count - 1].event_seq;
++	spin_unlock_irq(&app->lock);
++	aok_app_notify(app);
++	ret = 0;
++out:
++	kvfree(records);
++	fdput(f);
++	return ret;
++}
++
+ SYSCALL_DEFINE2(aok_object_inspect, int, fd,
+ 		struct aok_object_info __user *, uinfo)
+ {
+@@ -1706,10 +2407,37 @@ SYSCALL_DEFINE2(aok_handle_duplicate, int, fd, u64, rights)
+ 	struct fd f = fdget(fd);
+ 	struct aok_handle *old, *handle;
+ 	struct aok_event_file *ev_old, *ev_handle;
++	struct aok_app_file *app_old, *app_handle;
+ 	int ret;
+ 
+ 	if (fd_empty(f))
+ 		return -EBADF;
++	if (fd_file(f)->f_op == &aok_app_fops) {
++		app_old = fd_file(f)->private_data;
++		if (!(app_old->rights & AOK_RIGHT_DUPLICATE) ||
++		    (rights & ~app_old->rights)) {
++			fdput(f);
++			return -EACCES;
++		}
++		app_handle = kmalloc(sizeof(*app_handle), GFP_KERNEL);
++		if (!app_handle) {
++			fdput(f);
++			return -ENOMEM;
++		}
++		/* A duplicate opens a fresh cursor over the durable queue. */
++		app_handle->app = app_old->app;
++		app_handle->rights = rights;
++		app_handle->read_seq = 0;
++		refcount_inc(&app_handle->app->refs);
++		ret = anon_inode_getfd("aok-application", &aok_app_fops,
++				       app_handle, O_RDWR | O_CLOEXEC);
++		if (ret < 0) {
++			refcount_dec(&app_handle->app->refs);
++			kfree(app_handle);
++		}
++		fdput(f);
++		return ret;
++	}
+ 	if (fd_file(f)->f_op == &aok_event_fops) {
+ 		ev_old = fd_file(f)->private_data;
+ 		if (!(ev_old->rights & AOK_RIGHT_DUPLICATE) ||
+diff --git a/kernel/sys_ni.c b/kernel/sys_ni.c
+index 817d5bc..be2aa4c 100644
+--- a/kernel/sys_ni.c
++++ b/kernel/sys_ni.c
+@@ -411,3 +411,6 @@ COND_SYSCALL(aok_token_usage);
+ COND_SYSCALL(aok_event_source_create);
+ COND_SYSCALL(aok_event_bind);
+ COND_SYSCALL(aok_event_ack);
++COND_SYSCALL(aok_application_create);
++COND_SYSCALL(aok_application_snapshot);
++COND_SYSCALL(aok_application_restore);
+diff --git a/scripts/syscall.tbl b/scripts/syscall.tbl
+index 42b5834..6b22bc8 100644
+--- a/scripts/syscall.tbl
++++ b/scripts/syscall.tbl
+@@ -427,3 +427,6 @@
+ 484	common	aok_event_source_create		sys_aok_event_source_create
+ 485	common	aok_event_bind			sys_aok_event_bind
+ 486	common	aok_event_ack			sys_aok_event_ack
++487	common	aok_application_create		sys_aok_application_create
++488	common	aok_application_snapshot	sys_aok_application_snapshot
++489	common	aok_application_restore	sys_aok_application_restore
