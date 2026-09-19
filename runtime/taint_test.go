@@ -132,3 +132,28 @@ func TestProviderTaintFlowsToExportGate(t *testing.T) {
 		t.Fatalf("gate did not see provider taint: %v", err)
 	}
 }
+
+// The control-plane claim path must fold taint exactly like the runner:
+// consuming a tainted payload via message.claim gates later exports.
+func TestClaimMailboxFoldsTaint(t *testing.T) {
+	s := newKernelTestSupervisor(t)
+	app, err := s.CreateApplication("tester", "owner", "on_event")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Enqueue("tester", app.ApplicationID, "t",
+		json.RawMessage(`{"text":"x","taint":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := s.ClaimMailbox("tester", app.ApplicationID)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim: %+v %v", claimed, err)
+	}
+	inspected, _ := s.InspectApplication(app.ApplicationID)
+	if inspected.TaintBits != 1 {
+		t.Fatalf("control-plane claim skipped the taint fold: %d", inspected.TaintBits)
+	}
+	if _, err := s.exportApplication("tester", app.ApplicationID, "x", false, false, ""); !errors.Is(err, ErrTaintBlocked) {
+		t.Fatalf("RPC-claimed taint not gated: %v", err)
+	}
+}

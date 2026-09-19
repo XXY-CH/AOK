@@ -135,6 +135,11 @@
   控制面 `capability.revoke`。见
   [RUNTIME-REVOCATION-VALIDATION.md](RUNTIME-REVOCATION-VALIDATION.md)。
 
+- 2026-09-19 P3 独立审查修复：确认审批与升级 payload 绑定（防偷换）、pending
+  确认队列上限 64+终局清扫（防无界状态）、撤销按 Subject+严格前缀收紧（防兄弟链
+  误伤）、`message.claim` 控制面路径补污点折叠（防 RPC 绕过门控）、witness
+  `Count==0` 防崩、prepared 恢复不再误折他应用的内核污点；witness 的安全条件
+  （外部自留记录）已显式写入验证文档，落盘自洽重造链的拒绝有专测。
 - 2026-09-19 P3 末片：witness 联签——审计检查点（链头/条数/时间）经独立 ed25519
   witness 密钥签名后持久锚定，`witness.head/cosign/verify` 上控制面；伪造链头、
   错误密钥与本地自洽重造链全部被拒（`-32008`），跨重启保留。见

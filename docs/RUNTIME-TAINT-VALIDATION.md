@@ -41,5 +41,7 @@ python3 scripts/core-smoke.py
 - 两级撤销已完成（见 [RUNTIME-REVOCATION-VALIDATION.md](RUNTIME-REVOCATION-VALIDATION.md)）。
   人工确认慢路径已实现 runtime 侧（`escalate` 产生 pending 确认、
   `confirmation.settle` 审批、approved 请求单次放行、TTL 5 分钟、重启保留，
-  `confirmation_test.go` 全覆盖）；内核 seccomp unotify 监听器与宿主确认 UI 属
+  `confirmation_test.go` 全覆盖，且审批与升级时的 payload 绑定、pending 队列
+  上限 64+终局清扫、`message.claim` 控制面路径的污点折叠均由独立审查补齐并钉死；
+  内核 seccomp unotify 监听器与宿主确认 UI 属
   后续。Sigsum/witness 联签、全系统 LSM 仍属后续。

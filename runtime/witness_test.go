@@ -155,3 +155,59 @@ func mustApp(t *testing.T, s *Supervisor) string {
 	}
 	return app.ApplicationID
 }
+
+// The witness's reason to exist: a self-consistent rewrite of the PERSISTED
+// audit chain passes VerifyAudit but must fail VerifyWitness at the
+// anchored position. Rewrites state.db on disk and reopens.
+func TestWitnessDetectsOnDiskRewrite(t *testing.T) {
+	s := newKernelTestSupervisor(t)
+	if _, err := s.CreateApplication("tester", "owner", "on_event"); err != nil {
+		t.Fatal(err)
+	}
+	_, private := witnessFor(t)
+	head, count, err := s.WitnessHead()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordCosignature("witness", signCheckpoint(private, head, count, time.Now().Unix())); err != nil {
+		t.Fatal(err)
+	}
+	root := s.root
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Self-consistent rewrite: mutate a record, re-hash the whole chain,
+	// write back through the same persistence path.
+	s2, err := NewSupervisor(root, CapabilitySet{Engine: "echo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s2.VerifyWitness(); err != nil {
+		t.Fatalf("pristine reopen should verify: %v", err)
+	}
+	s2.mu.Lock()
+	s2.state.Audit[0].Reason = "rewritten"
+	previous := ""
+	for i := range s2.state.Audit {
+		s2.state.Audit[i].PreviousHash = previous
+		s2.state.Audit[i].Hash = auditHash(s2.state.Audit[i])
+		previous = s2.state.Audit[i].Hash
+	}
+	s2.mu.Unlock()
+	if err := s2.persistLocked(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s3, err := NewSupervisor(root, CapabilitySet{Engine: "echo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s3.Close()
+	// VerifyAudit accepts the self-consistent rewrite; VerifyWitness must
+	// not: the witnessed head no longer matches record `count`.
+	if err := s3.VerifyWitness(); !errors.Is(err, ErrWitnessMismatch) {
+		t.Fatalf("on-disk rewrite not caught by witness: %v", err)
+	}
+}

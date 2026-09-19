@@ -123,3 +123,91 @@ func TestRevocationRequiresVerifiableToken(t *testing.T) {
 		t.Fatal("expired token accepted for revocation")
 	}
 }
+
+// Sibling chains from one issuer key must not cross-revoke: independent
+// roots for different subjects, and branches sharing an early caveat
+// string, stay usable when the other branch is revoked.
+func TestRevocationSiblingsDoNotCrossRevoke(t *testing.T) {
+	root0 := t.TempDir()
+	if err := os.Chmod(root0, 0700); err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewSupervisor(root0, CapabilitySet{Engine: "echo", Net: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	app, err := s.CreateApplication("tester", "owner", "on_event")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, issuer, err := GenerateCapabilityKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant := []CapabilityGrant{{Object: "net", Action: "fetch"}}
+	// Two independent roots for different subjects from the same key.
+	alice, err := MintCapabilityToken(issuer, "supervisor", "alice", time.Now().Add(time.Hour), grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := MintCapabilityToken(issuer, "supervisor", "bob", time.Now().Add(time.Hour), grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Revoking alice's root-tier chain covers alice's subject only: bob
+	// (same key, different subject) stays usable — alice's own chain is
+	// expected to die with her root, which is the cascade working.
+	if err := s.RevokeCapabilityToken("tester", alice, "compromise"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CheckWithToken("bob", app.ApplicationID, "net", "fetch", bob); err != nil {
+		t.Fatalf("bob's independent root cross-revoked: %v", err)
+	}
+
+	// Coincident siblings: two branches of a NOT-yet-revoked root sharing
+	// the same caveat string. Revoking one digest leaves the other and its
+	// leaf intact (no lineage edge between coincident siblings).
+	carol, err := MintCapabilityToken(issuer, "supervisor", "carol", time.Now().Add(time.Hour), grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Sibling branches share the first caveat string but diverge after it;
+	// tokens with fully identical caveat lists are byte-identical authority
+	// (same digest), so divergence is what makes them siblings.
+	branchA, err := carol.Attenuate(issuer, "shared-first-caveat", grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	branchA, err = branchA.Attenuate(issuer, "path=a", grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	branchB, err := carol.Attenuate(issuer, "shared-first-caveat", grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafB, err := branchB.Attenuate(issuer, "domain=example.org", grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RevokeCapabilityToken("tester", branchA, "rotate"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CheckWithToken("carol", app.ApplicationID, "net", "fetch", branchB); err != nil {
+		t.Fatalf("coincident sibling branch cross-revoked: %v", err)
+	}
+	if _, err := s.CheckWithToken("carol", app.ApplicationID, "net", "fetch", leafB); err != nil {
+		t.Fatalf("sibling leaf cross-revoked: %v", err)
+	}
+	if _, err := s.CheckWithToken("carol", app.ApplicationID, "net", "fetch", branchA); !errors.Is(err, ErrCapabilityDenied) {
+		t.Fatalf("branchA survived its own revocation: %v", err)
+	}
+	// And revoking carol's root now takes her whole remaining chain.
+	if err := s.RevokeCapabilityToken("tester", carol, "offboard"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CheckWithToken("carol", app.ApplicationID, "net", "fetch", leafB); !errors.Is(err, ErrCapabilityDenied) {
+		t.Fatalf("root cascade did not reach the sibling leaf: %v", err)
+	}
+}

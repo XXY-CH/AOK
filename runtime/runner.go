@@ -513,7 +513,7 @@ func (s *Supervisor) Run(ctx context.Context, provider Provider) error {
 		// Kernel inference reports the session taint with each result;
 		// fold it into the application's dataflow ledger so the export
 		// gate sees kernel-side labels too.
-		if err == nil {
+		if err == nil && !prepared {
 			if tainted, ok := provider.(interface{ LastTaint() uint64 }); ok {
 				s.foldTaint(id, tainted.LastTaint())
 			}

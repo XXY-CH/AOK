@@ -636,6 +636,10 @@ func (s *Supervisor) ClaimMailbox(principal, id string) ([]MailboxMessage, error
 			s.state.Mailbox[id][i].Status = "claimed"
 			m := s.state.Mailbox[id][i]
 			m.Payload = append(json.RawMessage(nil), m.Payload...)
+			// The control-plane claim path consumes the message just like
+			// the runner does: the taint fold must not be skippable by
+			// choosing the RPC surface.
+			s.accumulateTaint(id, taintedPayload(m.Payload))
 			out = append(out, m)
 		}
 	}

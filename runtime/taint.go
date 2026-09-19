@@ -43,6 +43,39 @@ type ConfirmationRequest struct {
 
 const confirmationTTL = 5 * time.Minute
 
+// maxPendingConfirmations bounds the outstanding slow-path queue; a flood
+// of escalations fails closed instead of growing the state without limit.
+const maxPendingConfirmations = 64
+
+// sweepConfirmationsLocked expires stale pendings and drops the oldest
+// terminal entries past the cap so durable state growth is bounded.
+func (s *Supervisor) sweepConfirmationsLocked(now time.Time) {
+	for id, request := range s.state.Confirmations {
+		if request.Status == "pending" && now.UnixNano() > request.ExpiresAt {
+			request.Status = "expired"
+			s.state.Confirmations[id] = request
+		}
+	}
+	if len(s.state.Confirmations) <= maxPendingConfirmations {
+		return
+	}
+	type aged struct {
+		id string
+		at int64
+	}
+	terminals := []aged{}
+	for id, request := range s.state.Confirmations {
+		if request.Status != "pending" {
+			terminals = append(terminals, aged{id, request.CreatedAt})
+		}
+	}
+	sort.Slice(terminals, func(i, j int) bool { return terminals[i].at < terminals[j].at })
+	over := len(s.state.Confirmations) - maxPendingConfirmations
+	for i := 0; i < over && i < len(terminals); i++ {
+		delete(s.state.Confirmations, terminals[i].id)
+	}
+}
+
 // taintedPayload reads the optional taint declaration of a message payload.
 func taintedPayload(payload json.RawMessage) uint64 {
 	var p struct {
@@ -116,6 +149,18 @@ func (s *Supervisor) escalateExportLocked(principal string, a *Application, text
 		CreatedAt: now.UnixNano(), ExpiresAt: now.Add(confirmationTTL).UnixNano(),
 		Status: "pending",
 	}
+	s.sweepConfirmationsLocked(now)
+	pending := 0
+	for _, existing := range s.state.Confirmations {
+		if existing.Status == "pending" {
+			pending++
+		}
+	}
+	if pending >= maxPendingConfirmations {
+		_ = s.auditLocked(principal, a.ApplicationID, "confirmation.create",
+			"rejected", "deny", "slow-path queue full")
+		return "", errors.New("confirmation queue full; retry after settling pending requests")
+	}
 	s.state.Confirmations[request.RequestID] = request
 	_ = s.auditLocked(principal, a.ApplicationID, "confirmation.create",
 		request.RequestID, "allow", request.Kind)
@@ -135,11 +180,18 @@ func (s *Supervisor) exportViaRequestLocked(principal string, a *Application, te
 		return "", errors.New("confirmation request already used")
 	case request.Status != "approved":
 		return "", errors.New("confirmation request not approved")
+	}
+	switch {
 	case time.Now().UnixNano() > request.ExpiresAt:
 		request.Status = "expired"
 		s.state.Confirmations[requestID] = request
 		_ = s.persistLocked(nil)
 		return "", errors.New("confirmation request expired")
+	}
+	// The approval is bound to the escalated payload: the human approved
+	// exactly this text, so a different one may not ride the request.
+	if text != request.Object {
+		return "", errors.New("export payload does not match the approved request")
 	}
 	request.Status = "consumed"
 	s.state.Confirmations[requestID] = request

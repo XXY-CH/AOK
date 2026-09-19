@@ -32,6 +32,16 @@ python3 scripts/core-smoke.py
 无效）、重启后注册表保留、审计含 `capability.revoke`；不可验证 token（过期）被
 拒绝登记。
 
+## 链匹配语义（独立审查后收紧）
+
+撤销匹配 = 同 issuer key + **同 Subject** + 精确 digest 或**严格** caveat 前缀。
+- Subject 约束：同 key 不同 subject 的独立 token 互不波及。
+- 严格前缀：完全相同 caveat 列表的 token 是字节级同一授权（同 digest），不存在
+  "巧合兄弟"；共享早期 caveat、之后分叉的兄弟链互不波及，撤销任一根仍级联其真正
+  后代。`TestRevocationSiblingsDoNotCrossRevoke` 钉死全部三类。
+- 持有 issuer key 者可全新铸造绕过注册表——注册表防的是**被盗 token**，不是被盗
+  key；生产 key 托管在 supervisor，属部署边界。
+
 ## 尚未完成
 
 - unotify 人工确认慢路径（`confirm` 仍为同步标志）、Sigsum/witness 联签、

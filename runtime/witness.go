@@ -94,7 +94,7 @@ func (s *Supervisor) VerifyWitness() error {
 		return err
 	}
 	for _, cp := range s.state.WitnessCheckpoints {
-		if cp.Count > uint64(len(s.state.Audit)) ||
+		if cp.Count == 0 || cp.Count > uint64(len(s.state.Audit)) ||
 			s.state.Audit[cp.Count-1].Hash != cp.HeadHash {
 			return fmt.Errorf("%w at record %d", ErrWitnessMismatch, cp.Count)
 		}

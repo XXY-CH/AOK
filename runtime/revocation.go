@@ -17,6 +17,7 @@ import (
 type RevokedToken struct {
 	Digest    string   `json:"digest"`
 	PublicKey []byte   `json:"public_key"`
+	Subject   string   `json:"subject"`
 	Caveats   []string `json:"caveats"`
 	Time      int64    `json:"time"`
 	Reason    string   `json:"reason,omitempty"`
@@ -30,13 +31,23 @@ func tokenDigest(t CapabilityToken) string {
 }
 
 // revokedBy reports whether the token is the revoked entry itself or a
-// descendant of it: same issuer key and the entry's caveats form a prefix
-// of the token's caveats.
+// descendant of it: same issuer key, same subject, and the entry's caveats
+// form a prefix of the token's caveats. Subject equality keeps
+// independently attenuated sibling chains from the same issuer key (which
+// share early caveat strings) from cross-revoking each other; a revoked
+// root-tier entry (empty caveats) matches only tokens for that subject.
 func (r RevokedToken) revokedBy(t CapabilityToken) bool {
-	if !bytesEqual(r.PublicKey, t.PublicKey) {
+	if r.Subject != t.Subject || !bytesEqual(r.PublicKey, t.PublicKey) {
 		return false
 	}
-	if len(r.Caveats) > len(t.Caveats) {
+	// Exact-digest match is the revocation itself. Otherwise only a
+	// STRICT caveat prefix counts: coincident siblings (same key, subject
+	// and caveat list, independently attenuated) share no lineage edge,
+	// so revoking one leaves the other intact.
+	if tokenDigest(t) == r.Digest {
+		return true
+	}
+	if len(r.Caveats) >= len(t.Caveats) {
 		return false
 	}
 	for i, caveat := range r.Caveats {
@@ -76,6 +87,7 @@ func (s *Supervisor) RevokeCapabilityToken(principal string, token CapabilityTok
 	}
 	entry := RevokedToken{Digest: digest,
 		PublicKey: append([]byte(nil), token.PublicKey...),
+		Subject:   token.Subject,
 		Caveats:   append([]string(nil), token.Caveats...),
 		Time:      time.Now().UnixNano(), Reason: reason}
 	s.state.RevokedTokens = append(s.state.RevokedTokens, entry)
