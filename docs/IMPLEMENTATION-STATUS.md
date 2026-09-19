@@ -47,7 +47,7 @@
   application fd 按 `application_id` 幂等注册（boot 内存活），未确认事件跨 source fd
   释放与进程退出 replay；`AOK_EVENT_ATTACH_APP` 把 timer/port/LSFS 源挂入 128 深的
   durable 队列，LSFS post 携带 commit cursor；ack 按 application 隔离；
-  snapshot/restore 交接 supervisor 实现跨 VM 恢复。appregistry 45 项 + 全部六套
+  snapshot/restore 交接 supervisor 实现跨 VM 恢复。appregistry 47 项 + 全部六套
   enabled（object 44、task 64、resource 53、event-source 38、event-wake 37、
   core 46）与五套 disabled ENOSYS 回归通过，含一项游标重置 mutation 验证，见
   [KERNEL-APP-REGISTRY-VALIDATION.md](KERNEL-APP-REGISTRY-VALIDATION.md)。

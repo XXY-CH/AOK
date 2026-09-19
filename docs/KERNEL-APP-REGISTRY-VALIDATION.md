@@ -36,7 +36,7 @@ builder（Apple Container `aok-p1-builder`）和本机 QEMU `virt` arm64。
 manifest 哈希齐全）：
 
 ```text
-appregistry 45/45
+appregistry 47/47
 eventwake    37/37
 eventsrc     38/38
 object       44/44
@@ -55,18 +55,18 @@ task-disabled         11/11
 object-disabled       4/4
 ```
 
-`appregistry`（`kernel/kselftest/appregistry.c`）覆盖：注册/幂等重开/权限与参数
+`appregistry`（`kernel/kselftest/appregistry.c`）47 项覆盖：注册/幂等重开/权限与参数
 拒绝、LSFS post 携带 cursor、跨 source 共享 id/sequence 空间、事件跨 source fd
 释放与跨进程（fork 子进程投递）replay、app fd 与 duplicate 的 fresh cursor、
 `AOK_APP_ACK`/source ack、ack 按 application 隔离、READ/WRITE/poll 权限矩阵、
 满载 `EAGAIN` 不消耗 identity、snapshot 计数/有序拷贝/snapshot→restore round-trip、
-restore 拒绝非空队列/异属 id/非单调/超量、restore 延续 id 空间、timer 到期在
+restore 拒绝非空队列/异属 id/非单调/超量/零值与终值 id、restore 延续 id 空间、timer 到期在
 source 关闭后仍 durable、volatile 积压阻塞挂接、挂接后不可换标签、换绑游标
 重置、detach 清除标签。
 
 反向 mutation：临时删除 `aok_event_read` 的游标重置检查后重建，
-`appregistry` 第 44 项（rebound source replays from cursor reset）失败，其余 44 项
-通过；恢复源码重建后 45 项全过。
+`appregistry` 第 46 项（rebound source replays from cursor reset）失败，其余 46 项
+通过；恢复源码重建后 47 项全过。
 
 本轮同时修复两个既有问题：
 
@@ -126,12 +126,34 @@ python3 scripts/core-smoke.py
 去重、满载保留事件与容量释放后续投、关停 snapshot→新 boot restore、同 boot
 重启丢弃副本且不重复、幂等键保留、kernel_id 分配与持久化。
 
+## 独立审核与处置
+
+一轮独立内核审核（锁序/生命周期/UAPI/风格全量走查）确认：`bind_lock →
+source->lock → app->lock` 全路径无反序；registry 永久引用、source 挂接引用与
+anon inode 生命周期平衡；满载 `EAGAIN` 不消耗 id/sequence；UAPI 尺寸与
+syscall/ioctl 编号正确。审核同时发现并已修复：
+
+| 级别 | 问题 | 处置 |
+| --- | --- | --- |
+| Critical | inspect/create 的 app 分支用普通 `spin_lock`，而 `app->lock` 会被 timer 硬中断路径嵌套获取，同 CPU 持锁即死锁 | 两处改为 `spin_lock_irqsave`（时序型死锁不可黑盒复现，靠锁序走查保证） |
+| Major | epoll 路径的 `poll_wait`（可能睡眠分配）在 `spin_lock_irq` 内注册 | 重构 poll：锁外注册两个等待队列，锁内只做游标同步与就绪扫描 |
+| Minor | restore 接受 `event_id/event_seq == 0`（游标永远读不到）与 `U64_MAX`（续投计数回绕复用 id） | restore 校验拒绝零值与终值，新增两项测试 |
+| Minor | 挂接到已积压的 app 队列不唤醒已有 poller | attach 成功后 `aok_source_notify` |
+
+审核确认但保持现状并记录的边界：snapshot 不包含未 flush 的 coalesced 计数
+（restore 对 `coalesced != 0` 拒绝，满载关停的合并计数丢失）；空队列 snapshot
+不保留 id/sequence 续投点（跨 reboot 后 id 从 1 重新开始，符合 boot 内语义）；
+app fd 的 `AOK_APP_ACK` flush 后只唤醒 app 等待队列、不触发挂接 source 的
+wake policy（生产路径由 supervisor 驱动 aproc 恢复）。
+
 ## 尚未完成
 
 - 内核 registry 是 boot 内 durable：跨 VM 的持久性由 supervisor snapshot/restore
   承接，内核自身不落盘；不洁 VM 崩溃丢失最后窗口。`aok-init` → supervisor 的
   `AOK_ROOT_FD` 传递路径尚未在 guest 内整体演练（probe 直接以 PID1 认领）。
 - 生产者是 supervisor 自己的 LSFS 扫描器；独立的受监督 fsd 进程尚不存在。
+  内核路由事件只携带 application 与 cursor，不含 binding id；需要区分来源 binding 的
+  消费者应对照 cursor 与各 binding 的扫描区间。
   `0009` 的 wake target 仍是 source 私有，dormant aproc 创建与 `ON_QUIESCENT`
   语义仍不完整。
 - 按持久 owner/agent 隔离 application（registry 授权来自 parent capability）属于

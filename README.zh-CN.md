@@ -100,7 +100,7 @@ llama.cpp CPU probe、带崩溃回放的 durable supervisor、被监督的 engin
 vsock API、PID1/initfs 和 capability sandbox。
 
 启用构建的内核验证为：object 44、task 64、resource 53、event-source 38、
-event-wake 37、app-registry 45、core 46 项 kselftest。禁用构建另有 object 4、
+event-wake 37、app-registry 47、core 46 项 kselftest。禁用构建另有 object 4、
 task 11、resource 8、event-source 6、app-registry 5 项 `ENOSYS` 检查通过，均来自
 可复现的 patch series 重建。
 
@@ -201,6 +201,7 @@ make aok-initramfs
 | --- | --- |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 分层、Application 模型、ABI 边界 |
 | [docs/IMPLEMENTATION-STATUS.md](docs/IMPLEMENTATION-STATUS.md) | 已冻结决议与当前边界 |
+| [docs/KERNEL-APP-REGISTRY-VALIDATION.md](docs/KERNEL-APP-REGISTRY-VALIDATION.md) | 内核 Application registry、durable replay 与 supervisor 接线证据 |
 | [docs/PLAN-L0-AGENT-KERNEL.md](docs/PLAN-L0-AGENT-KERNEL.md) | L0 Agent 内核设计计划 |
 | [docs/PLAN-AOK-DEEP.md](docs/PLAN-AOK-DEEP.md) | 深度设计决议与调研来源 |
 | [docs/abi/](docs/abi/) | fd ABI、engine 协议、control API、application/context 模型 |

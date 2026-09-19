@@ -30,6 +30,9 @@ const (
 
 	// AppQueueDepth mirrors AOK_APP_QUEUE_DEPTH; snapshot is bounded by it.
 	AppQueueDepth = 128
+
+	// objectApplication mirrors AOK_OBJECT_APPLICATION.
+	objectApplication = 4
 )
 
 // Layout guards mirror the UAPI structs so drift is a compile error.
@@ -139,7 +142,7 @@ func (r *Registry) OpenApplication(applicationID uint64) (*Application, error) {
 	if errno != 0 {
 		return nil, errno
 	}
-	if info.Type != 4 {
+	if info.Type != objectApplication {
 		if n >= 0 {
 			syscall.Close(int(n))
 		}
