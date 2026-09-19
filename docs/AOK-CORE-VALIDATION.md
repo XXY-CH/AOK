@@ -29,3 +29,26 @@ python3 runtime/scripts/core-smoke.py
 - runtime 已提供 llama slot save/restore、loopback Metal adapter、Anthropic Messages adapter、router/fallback、vsock API 和 cgroup v2 CPU/RSS enforcement。当前机器没有 `ANTHROPIC_API_KEY`，因此 Anthropic 真实服务验证被阻塞；当前 QEMU 也没有可用 virtio-vsock device model。
 - kernel probe 的 backend adapter 与 PID1 同进程；尚未证明独立 backend 的长期 guest↔host vsock 心跳或 VM 重启后的真实模型 KV 恢复。
 - QEMU arm64 的 PID1 probe 通过 46/46 新断言，并回归 object 44/44、task 64/64、resource 50/50、event-source 37/37。证据在 `kernel/.build/qemu-arm64-core/probe-serial.log` 和 `kernel/kselftest/CORE-VALIDATION.md`。
+
+
+## 2026-09-19 追加：supervisor 推理经内核 ainf 设备闭环
+
+`runtime/kernel_infer_linux_arm64.go` 新增 `KernelInferProvider`：supervisor 的每个
+turn 都经 0006 推理 ABI 执行——prompt 作为 client session 提交（预留
+input+声明输出上限），被包裹的 provider 只服务 backend 半边（Take→推理→
+Complete 实报 usage），内核结算的 capability 台账与结果 payload 是唯一被接受的
+outcome；预算与 EDQUOT 强制全部在内核。协议要点（均由 guest 实测钉死）：
+session 序号从 1 起（跨 session 复用会 ESTALE）、Submit 预留/Complete 实报
+（实报超预留即 EDQUOT）、`Result.TokensUsed` 是 capability 累计台账（对账按
+provider 已结算累计）。
+
+event probe 第三阶段（`make aok-event-probe-test`）在真实 AOK 内核上以 PID1 运行
+真实 supervisor：短 turn 经内核会话完成并按内核对账（in=10/out=10），预算 128
+下第二个超限 turn 在 Submit 处被内核拒绝、turn fail-closed：
+
+```text
+AOK_EVENT_PROBE_INFER=pass budget=128 used=20
+AOK_EVENT_PROBE=pass
+```
+
+macOS/非 arm64 构建返回 `ErrUnsupported`，supervisor 回退直连 provider。

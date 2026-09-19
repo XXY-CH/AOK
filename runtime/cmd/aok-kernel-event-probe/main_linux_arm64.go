@@ -197,6 +197,71 @@ func waitForKernelTurns(s *aok.Supervisor, appID string, want int, timeout time.
 	return fmt.Errorf("%d kernel turns did not complete in %s", want, timeout)
 }
 
+// runKernelInfer drives supervisor turns through the kernel inference
+// device: the echo provider serves only the backend half of an ainf
+// session, usage is reconciled by the kernel, and a turn that exceeds the
+// capability budget fails closed with EDQUOT.
+func runKernelInfer(root *kernelbridge.Root, stateDir string) error {
+	s, err := aok.NewSupervisor(stateDir, aok.CapabilitySet{Engine: "echo"})
+	if err != nil {
+		return fmt.Errorf("supervisor: %w", err)
+	}
+	provider, err := aok.NewKernelInferProvider(root, aok.EchoProvider{}, 128, 64)
+	if err != nil {
+		s.Close()
+		return fmt.Errorf("kernel infer provider: %w", err)
+	}
+	defer provider.Close()
+	for _, diagPrompt := range []string{"diag", "kkkkkkkkkk"} {
+		if _, _, derr := provider.Complete(context.Background(), diagPrompt); derr != nil {
+			return fmt.Errorf("kernel infer diagnostic len=%d: %w", len(diagPrompt), derr)
+		}
+	}
+	app, err := s.CreateApplication("probe", "probe-owner", "on_event")
+	if err != nil {
+		s.Close()
+		return fmt.Errorf("application: %w", err)
+	}
+	short := strings.Repeat("k", 10)
+	long := strings.Repeat("K", 120)
+	for i, text := range []string{short, long} {
+		if _, err := s.Enqueue("probe", app.ApplicationID,
+			fmt.Sprintf("infer-%d", i), json.RawMessage(`{"text":"`+text+`"}`)); err != nil {
+			s.Close()
+			return fmt.Errorf("enqueue: %w", err)
+		}
+	}
+	runCtx, stop := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Run(runCtx, provider) }()
+	defer func() { stop(); <-done; s.Close() }()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		mailbox, err := s.ListMailbox(app.ApplicationID)
+		if err != nil {
+			return err
+		}
+		if len(mailbox) == 2 {
+			first, ferr := s.Result(app.ApplicationID, mailbox[0].MessageID)
+			second, serr := s.Result(app.ApplicationID, mailbox[1].MessageID)
+			if ferr == nil && serr == nil {
+				if first.Status != "completed" || first.Provider != "kernel-infer/echo" ||
+					first.Usage.InputTokens != 10 || first.Usage.OutputTokens != 10 {
+					return fmt.Errorf("kernel turn not reconciled: %+v", first)
+				}
+				if second.Status != "failed" {
+					return fmt.Errorf("budget overrun turn did not fail: %+v", second)
+				}
+				fmt.Printf("AOK_EVENT_PROBE_INFER=pass budget=128 used=%d\n",
+					first.Usage.InputTokens+first.Usage.OutputTokens)
+				return nil
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return errors.New("kernel infer turns did not settle")
+}
+
 func run() error {
 	if os.Getpid() != 1 {
 		return errors.New("event probe must run as guest PID1")
@@ -220,6 +285,9 @@ func run() error {
 	}
 	if err := runSupervisor(root, filepath.Join("/var", "lib", "aok-event-probe")); err != nil {
 		return fmt.Errorf("supervisor phase: %w", err)
+	}
+	if err := runKernelInfer(root, filepath.Join("/var", "lib", "aok-infer-probe")); err != nil {
+		return fmt.Errorf("kernel-infer phase: %w", err)
 	}
 	fmt.Println("AOK_EVENT_PROBE=pass")
 	return nil
