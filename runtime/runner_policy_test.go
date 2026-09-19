@@ -115,3 +115,49 @@ func TestRunDeniesTurnOutsidePolicy(t *testing.T) {
 		t.Fatalf("route record wrong: %+v", records)
 	}
 }
+
+// Recovery must preserve the frozen failure cause: the prepared record
+// carries it, so a crash between staging and the final persist cannot
+// relabel a provider failure or a policy denial as a text overflow.
+func TestRecoveryKeepsFrozenFailureReason(t *testing.T) {
+	for _, tc := range []struct {
+		reason string
+	}{
+		{"route_denied"},
+		{"provider_failed"},
+		{"text_overflow"},
+	} {
+		s := newKernelTestSupervisor(t)
+		app, err := s.CreateApplication("tester", "owner", "on_event")
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		if _, err := s.Enqueue("tester", app.ApplicationID, "k",
+			json.RawMessage(`{"text":"hi"}`)); err != nil {
+			t.Fatal(err)
+		}
+		id, m, err := s.claimTurn()
+		if err != nil || id == "" {
+			t.Fatalf("claim: %v", err)
+		}
+		// Simulate the post-crash retry: the first pass staged a failed
+		// prepared record (with its cause) but never reached the final
+		// result persist. The retry takes the prepared-recovery path.
+		s.mu.Lock()
+		s.state.Prepared[m.MessageID] = TurnResult{
+			ApplicationID: id, MessageID: m.MessageID,
+			Status: "failed", Text: "", Usage: Usage{InputTokens: 2, OutputTokens: 2},
+			Provider: "echo", FailureReason: tc.reason,
+		}
+		m.Status = "claimed"
+		s.state.Mailbox[id][0].Status = "claimed"
+		s.mu.Unlock()
+		if err := s.finishTurn(id, m, "", Usage{}, RouteInfo{Provider: "echo"}, nil); err != nil {
+			t.Fatalf("recovery finishTurn: %v", err)
+		}
+		records, _ := s.RouteRecords(app.ApplicationID)
+		if len(records) != 1 || records[0].Reason != tc.reason {
+			t.Fatalf("recovery relabeled %s as %+v", tc.reason, records)
+		}
+	}
+}

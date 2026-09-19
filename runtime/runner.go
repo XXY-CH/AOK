@@ -19,6 +19,7 @@ type TurnResult struct {
 	Provider      string `json:"provider,omitempty"`
 	Fallbacks     uint32 `json:"fallbacks,omitempty"`
 	CacheHitKind  string `json:"cache_hit_kind,omitempty"`
+	FailureReason string `json:"failure_reason,omitempty"`
 }
 
 type ApplicationTimer struct {
@@ -269,27 +270,34 @@ func (s *Supervisor) finishTurn(id string, m MailboxMessage, text string, usage 
 		return nil
 	}
 	cacheHit := cacheHitKind(usage, a.LastCompat, route.CompatKey)
-	overflowed = false
+	overflowed = providerErr == nil && len(text) > maxTextBytes
 	prepared, ok := s.state.Prepared[m.MessageID]
 	if !ok {
 		status := "completed"
-		if len(text) > maxTextBytes {
-			overflowed = true
-		}
-		if providerErr != nil || overflowed {
+		frozen := ""
+		if providerErr != nil {
 			status = "failed"
+			frozen = "provider_failed"
+			if routeDenied {
+				frozen = "route_denied"
+			}
+			text = ""
+		} else if overflowed {
+			status = "failed"
+			frozen = "text_overflow"
 			text = ""
 		}
 		prepared = TurnResult{ApplicationID: id, MessageID: m.MessageID, Text: text, Usage: usage, Status: status,
-			Provider: route.Provider, Fallbacks: route.Fallbacks, CacheHitKind: cacheHit}
+			Provider: route.Provider, Fallbacks: route.Fallbacks, CacheHitKind: cacheHit,
+			FailureReason: frozen}
 		s.state.Prepared[m.MessageID] = prepared
 		if err := s.persistLocked(nil); err != nil {
 			return err
 		}
 	}
 	text, usage = prepared.Text, prepared.Usage
-	if prepared.Status == "failed" && providerErr == nil && text == "" {
-		overflowed = true // staged clamp on the first pass
+	if prepared.FailureReason == "text_overflow" {
+		overflowed = true
 	}
 	if prepared.Provider != "" {
 		route.Provider = prepared.Provider
@@ -348,8 +356,11 @@ func (s *Supervisor) finishTurn(id string, m MailboxMessage, text string, usage 
 	// The prepared result fixes nondeterministic model output before idempotent
 	// context writes. Recovery finishes that result without running the model.
 	a.Checkpoint = checkpoint
-	reason := ""
-	if providerErr != nil {
+	// The frozen reason wins on recovery: the prepared normalization
+	// synthesizes a generic provider error, which would otherwise relabel
+	// the original cause.
+	reason := prepared.FailureReason
+	if providerErr != nil && reason == "" {
 		reason = "provider_failed"
 	}
 	if routeDenied {
