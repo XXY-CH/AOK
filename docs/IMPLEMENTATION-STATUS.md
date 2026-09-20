@@ -135,6 +135,12 @@
   控制面 `capability.revoke`。见
   [RUNTIME-REVOCATION-VALIDATION.md](RUNTIME-REVOCATION-VALIDATION.md)。
 
+- 2026-09-20 P5 首证据：MVP 多开并行调研（echo 后端）——`make runtime-mvp-smoke`
+  以真实 supervisor 控制面驱动 planner → 3 researchers（VTC 排序 + 前缀亲和）→
+  aggregator 报告 checkpoint 落盘，审计 20 条全 allow、命中率/VTC 数据可复算，
+  输出归档 `kernel/.build/smoke-logs/runtime-mvp.log`。见
+  [RUNTIME-MVP-VALIDATION.md](RUNTIME-MVP-VALIDATION.md)。三后端混合编排、
+  /proc 观测与 ash 入口属后续。
 - 2026-09-19 P4 独立审查修复：网关回复按**来源会话**路由（多会话应用不再随机
   误投/跨 principal 泄漏）、入站信封展平 text 字段（runner 真正读到正文）并**强制
   external taint**（网关入口不再绕过污点台账）、重绑保留游标（无重放窗口）；web
