@@ -3,10 +3,28 @@
 package runtime
 
 import (
+	"fmt"
 	"os"
 
 	"aok/runtime/kernelbridge"
+	"golang.org/x/sys/unix"
 )
+
+func prepareInitKernel() error {
+	if os.Getpid() != 1 {
+		return nil
+	}
+	if _, err := os.ReadFile("/proc/sys/kernel/random/boot_id"); err == nil {
+		return nil
+	}
+	if err := os.MkdirAll("/proc", 0555); err != nil {
+		return err
+	}
+	if err := unix.Mount("proc", "/proc", "proc", unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, ""); err != nil {
+		return fmt.Errorf("mount proc for kernel boot identity: %w", err)
+	}
+	return nil
+}
 
 // claimInitKernelRoot claims the AOK root capability exactly once per boot.
 // Only PID1 may claim it; the descriptor is handed to the supervisor child

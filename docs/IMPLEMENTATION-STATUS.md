@@ -3,6 +3,9 @@
 这份记录把准备阶段容易混淆的名称、路径和实现状态固定下来。它与设计决议一起使用，
 不替代 `docs/PLAN-AOK-DEEP.md` 的阶段计划。
 
+2026-09-20 对照结论：P1-P5 均为**部分实现**，不能据以下切片通过情况认定整阶段完成。
+原始验收标准不变；逐阶段差距见 [P1-P5-ALIGNMENT.md](P1-P5-ALIGNMENT.md)。
+
 ## 已冻结
 
 - **AOK** 是 Agent-native kernel、SubOS 产品和 VM 环境的统一名称，Swift 可执行文件统一为 `aok`。
@@ -15,8 +18,9 @@
 
 ## 当前已实现
 
-- 设计文档、P0 ABI 冻结记录、Linux 基线拉取脚本、QEMU arm64 配置探针、patch/config/kselftest 准备目录。
-- `aok up/down/ls/exec` 仅用于开发 VM 生命周期和探针；它还没有连接 AOK control API。
+- 设计文档、P0 `1.0-draft` 语义文档集、Linux 基线拉取脚本、QEMU arm64 配置探针、patch/config/kselftest 准备目录；稳定 syscall 编号和两个独立实现的互操作验收尚未完成。
+- `aok up/down/ls/exec` 用于开发 VM 生命周期和探针，`exec` 尚未迁移为 handle 语义。
+  Swift TUI 已通过配置的 `aokctl` 与 control socket 调用 AOK control API。
 - stock baseline 已在 Debian arm64 builder 构建：Linux `6.18.51`，提交号由 `linux-6.18.y`
   shallow checkout 固定，`CONFIG_SCHED_CLASS_EXT=y`、Landlock、virtiofs、virtio-vsock、KVM
   和 initrd 配置均为 `y`。
@@ -47,13 +51,15 @@
   application fd 按 `application_id` 幂等注册（boot 内存活），未确认事件跨 source fd
   释放与进程退出 replay；`AOK_EVENT_ATTACH_APP` 把 timer/port/LSFS 源挂入 128 深的
   durable 队列，LSFS post 携带 commit cursor；ack 按 application 隔离；
-  snapshot/restore 交接 supervisor 实现跨 VM 恢复。appregistry 47 项 + 全部六套
+  snapshot 交接 supervisor 持久化，恢复时投递 mailbox。appregistry 47 项 + 全部六套
   enabled（object 44、task 64、resource 56、event-source 38、event-wake 37、
   core 46）与五套 disabled ENOSYS 回归通过，含一项游标重置 mutation 验证，见
   [KERNEL-APP-REGISTRY-VALIDATION.md](KERNEL-APP-REGISTRY-VALIDATION.md)。
-  runtime 侧 `kernelbridge` 绑定 0010 ABI，supervisor 以 `kernel:<app>:<event_id>`
+  runtime 侧 `kernelbridge` 绑定 0010 ABI，supervisor 以 `kernel:<app>:<origin_boot_id>:<event_id>`
   幂等键先持久后 ack 地 drain 内核队列，满载丢弃 handle 重放，关停 snapshot/启动
-  restore。生产路径已通电：PID1 认领 root 经 `AOK_ROOT_FD` 传给 supervisor，LSFS
+  恢复。跨 VM 的旧 snapshot 按原始 boot 身份直接持久投递到 mailbox；新队列独立 drain，
+  避免 Restore 竞态及新 VM 复用事件编号串入旧记录。
+  生产路径已通电：PID1 认领 root 经 `AOK_ROOT_FD` 传给 supervisor，LSFS
   binding 的 artifact commit 经内核 durable 队列路由（满载保留 cursor）。QEMU 端到端
   probe（`make aok-event-probe-test`）在真实内核上运行 ABI 阶段与完整 supervisor
   链路（binding→内核队列→drain→mailbox→echo turn→关停→重启精确一次续投）；
@@ -66,7 +72,7 @@
   （每应用每秒一个 turn）。同轮修复 runner 对容器挂载路径的陈旧页缓存问题：QEMU
   一律从本地临时副本引导。见 [KERNEL-P8-VALIDATION.md](KERNEL-P8-VALIDATION.md)。
 - 2026-09-19 P2 切片：route_policy/route_record 对象落地——Application 持久化
-  版本化 backend fallback 策略（router 按 context 过滤、直连 provider 调用前检查、
+  版本化 backend fallback 策略（router 按 context 的允许顺序尝试、直连 provider 调用前检查、
   越权 turn 以 `route_denied` 失败且不触达 backend），每个 turn 追加不可变 route
   record（policy 版本/backend/compat/fallbacks/cache_hit_kind/token 三项/理由码，
   supervisor 全局上限 512 条、新的逐出旧的），`application.set_route_policy` 与 `route.list` 上控制面。
@@ -127,7 +133,7 @@
   污点（`-32006`）或降级为已审计的人工确认；门控决策全部进 hash chain。见
   [RUNTIME-TAINT-VALIDATION.md](RUNTIME-TAINT-VALIDATION.md)。内核会话污点经
   `LastTaint()` 回流台账，外发门控同时看到 payload 与内核两类标记。unotify 慢路径、
-  两级撤销与 witness 联签仍属后续。
+  acapd/Cedar/Biscuit 和外部 witness 服务仍属后续；两级撤销与本地 witness 验证已见下列切片。
 
 - 2026-09-19 P3 切片：撤销两级生效——内核级为既有 0006 revoke（probe 验证）；
   runtime 级新增 capability token 撤销注册表（digest 持久化、caveat 前缀链式波及
@@ -135,20 +141,24 @@
   控制面 `capability.revoke`。见
   [RUNTIME-REVOCATION-VALIDATION.md](RUNTIME-REVOCATION-VALIDATION.md)。
 
-- 2026-09-20 P5 二阶段：`scripts/mvp-research.sh` 一条命令入口（自动拉起或复用
-  supervisor、planner→fan-out→聚合全流程）；`make runtime-mvp-mixed-smoke` 以真实
+- 2026-09-20 P5 用户态切片：`scripts/mvp-research.sh` 一条命令入口（自动拉起或复用
+  supervisor、planner 输出传入 researcher、driver 收集结果提交 aggregator）；默认持久保留
+  report.txt、完整 receipt.json 和自建 supervisor 的 state，支持 `-o` 指定目录。
+  `make runtime-mvp-mixed-smoke` 是历史命名，实际只使用一个真实
   llama.cpp 后端验证——共享 brief 前缀使后续 researcher 命中率 0.95（首个 0.00
   冷启动），前缀亲和在真实 KV cache 上生效，输出归档 smoke-logs。
 - 2026-09-20 P4 复审修复：网关来源映射从进程内全局改为 supervisor 私有 + 重启时从
   持久信封重建（回复跨重启可用、多实例 msg-N 无碰撞）；web 证据链记录真实最终
   URL（重定向后来源不再误标）；hostfs 挂载路径创建即规范化（尾斜杠/双斜杠挂载
-  根不可达问题消除）。复审确认八项安全目标全部 CORRECT/fail-closed。
-- 2026-09-20 P5 首证据：MVP 多开并行调研（echo 后端）——`make runtime-mvp-smoke`
+  根不可达问题消除）。后续审阅发现同 channel 多 conversation 重启串路、Reply 漏污点检查、
+  WebExecute 在应用校验前触网，已补修复与回归；旧的“全部安全目标正确”结论撤回。
+- 2026-09-20 P5 首证据：MVP 多应用调研队列（echo 后端）——`make runtime-mvp-smoke`
   以真实 supervisor 控制面驱动 planner → 3 researchers（VTC 排序 + 前缀亲和）→
-  aggregator 报告 checkpoint 落盘，审计 20 条全 allow、命中率/VTC 数据可复算，
+  aggregator 报告 checkpoint 落盘，审计与命中率/token 台账可复算；runner 当前串行执行，
+  echo 只验证数据流，不验证报告质量或并行公平性。
   输出归档 `kernel/.build/smoke-logs/runtime-mvp.log`。见
   [RUNTIME-MVP-VALIDATION.md](RUNTIME-MVP-VALIDATION.md)。三后端混合编排、
-  /proc 观测与 ash 入口属后续。
+  COW researchers、工具调用、port 回传、完整 LSFS、/proc 观测与 ash 入口属后续。
 - 2026-09-19 P4 独立审查修复：网关回复按**来源会话**路由（多会话应用不再随机
   误投/跨 principal 泄漏）、入站信封展平 text 字段（runner 真正读到正文）并**强制
   external taint**（网关入口不再绕过污点台账）、重绑保留游标（无重放窗口）；web
@@ -185,12 +195,17 @@
   确认（request_id/TTL 5 分钟），`confirmation.list/settle` 审批，approved 请求
   单次放行（consumed），全部状态迁移入审计并跨重启保留；控制面
   `application.export` 以 `-32007` 返回 pending。
-- 2026-09-19 P3 切片：撤销两级生效
+- 2026-09-20 修复：撤销注册表到达 1024 条时明确拒绝新增，不再逐出有效撤销；
+  router 遵循应用指定顺序；内核事件按 boot 分域，回滚恢复所有可选 map 与来源索引。
 
-- 内核 amem/LSFS 存储、sched_ext Agent 调度、ainf 内核设备化、Web capability、HostFS bridge
-  和消息 gateway 尚未实现。`0009` 的 wake target 仍是 source 私有，dormant aproc 创建与
-  `ON_QUIESCENT` 语义不完整；内核 registry 不落盘，跨 VM 持久性由 supervisor snapshot/
-  restore 承接；独立受监督的 fsd 进程尚未存在（当前由 supervisor 扫描器兼任生产者）。`runtime/cmd/aok-init` 与
+## 尚未完成
+
+- 内核 amem/LSFS 存储、sched_ext Agent 调度仍未实现；ainf 已有内核 0006 + probe 闭环，
+  生产 supervisor 尚未接入 KernelInferProvider。Web fetch/document、HostFS 授权与传输数据模型、
+  消息 gateway 队列已有用户态实现，但完整控制面、协议适配器和真实外部 transport 未齐备。
+  `0009` 的 wake target 仍是 source 私有，dormant aproc 创建与
+  `ON_QUIESCENT` 语义不完整；内核 registry 不落盘，跨 VM 持久性由 supervisor snapshot
+  和 mailbox 恢复承接；独立受监督的 fsd 进程尚未存在（当前由 supervisor 扫描器兼任生产者）。`runtime/cmd/aok-init` 与
   `kernel/initramfs/build-aok.sh` 已提供 supervisor PID1/initfs 基础闭环；QEMU kernel probe
   仍是独立验证程序，不能替代完整 guest 服务编排。
 - `kernel/linux` 保持干净的上游基线；AOK 代码位于外层 patch，构建时应用到独立源码目录。

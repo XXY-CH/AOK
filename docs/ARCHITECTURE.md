@@ -83,12 +83,14 @@ resources:
 
 ## 目录
 
-- `host/` Swift：未来的 aok CLI 与 VM/control API 适配器
+- `host/` Swift：VM CLI 与经 aokctl 接入 control API 的 TUI；exec 的 handle 语义迁移尚未完成
 - `kernel/`：Linux AOK fork、patch series、配置片段和 kselftest
 - `manifests/` Agent 能力清单示例
 - `docs/abi/` AOK fd ABI、control API 和外部 adapter 契约
 
 ## 路线
+
+以下为目标路线；当前完成度及原始验收差距见 [P1-P5-ALIGNMENT.md](P1-P5-ALIGNMENT.md)。
 
 1. 底座打通（aok vm up + Agent runtime handshake）
 2. Agent-native 内核原语（aproc、amem、ainf、IPC、event source）

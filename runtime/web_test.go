@@ -6,8 +6,38 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
+
+func TestWebRejectsInactiveApplicationBeforeNetwork(t *testing.T) {
+	s := newKernelTestSupervisor(t)
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Write([]byte("changed"))
+	}))
+	defer server.Close()
+	cap := WebCapability{Kind: "web.fetch", URLPrefixes: []string{server.URL + "/"}, Methods: []string{"POST"}}
+	for _, state := range []string{"missing", "retiring", "tombstoned"} {
+		id := "missing"
+		if state != "missing" {
+			app, err := s.CreateApplication("tester", "owner", "on_event")
+			if err != nil {
+				t.Fatal(err)
+			}
+			id = app.ApplicationID
+			s.state.Applications[id].State = state
+		}
+		_, _, err := s.WebExecute("tester", id, cap, WebRequest{Kind: "web.fetch", Method: "POST", URL: server.URL + "/change"})
+		if !errors.Is(err, ErrApplicationNotFound) {
+			t.Fatalf("state=%s: %v", state, err)
+		}
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("rejected applications made %d network requests", calls.Load())
+	}
+}
 
 func TestWebLadderAndCapabilityChecks(t *testing.T) {
 	s := newKernelTestSupervisor(t)

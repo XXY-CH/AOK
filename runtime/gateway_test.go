@@ -14,6 +14,7 @@ import (
 // claim / duplicate ack) never duplicate anything.
 func TestGatewayRoundTripWithReconnects(t *testing.T) {
 	s := newKernelTestSupervisor(t)
+	s.policy.ExportMask = TaintExternal
 	app, err := s.CreateApplication("tester", "owner", "on_event")
 	if err != nil {
 		t.Fatal(err)
@@ -162,6 +163,7 @@ func (s *Supervisor) finishTurnForGateway(t *testing.T, applicationID string, m 
 // conversation, and the ingress folded external taint.
 func TestGatewayHeadlessRunAndSourcing(t *testing.T) {
 	s := newKernelTestSupervisor(t)
+	s.policy.ExportMask = TaintExternal
 	app, err := s.CreateApplication("tester", "owner", "on_event")
 	if err != nil {
 		t.Fatal(err)
@@ -220,6 +222,7 @@ func TestGatewayHeadlessRunAndSourcing(t *testing.T) {
 // message-id collisions).
 func TestReplySurvivesRestart(t *testing.T) {
 	s := newKernelTestSupervisor(t)
+	s.policy.ExportMask = TaintExternal
 	app, err := s.CreateApplication("tester", "owner", "on_event")
 	if err != nil {
 		t.Fatal(err)
@@ -238,7 +241,7 @@ func TestReplySurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Fresh instance: the sourcing map must be rebuilt from the envelope.
-	s2, err := NewSupervisor(root, CapabilitySet{Engine: "echo"})
+	s2, err := NewSupervisor(root, CapabilitySet{Engine: "echo", ExportMask: TaintExternal})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,6 +264,7 @@ func TestReplySurvivesRestart(t *testing.T) {
 	// Per-instance isolation: a second supervisor with its own root must
 	// not see the first one's sourcing (colliding msg-N ids).
 	s3 := newKernelTestSupervisor(t)
+	s3.policy.ExportMask = TaintExternal
 	defer s3.Close()
 	app3, _ := s3.CreateApplication("tester", "owner", "on_event")
 	if _, err := s3.CreateChannel("tester", "other", "other"); err != nil {
@@ -287,5 +291,159 @@ func TestReplySurvivesRestart(t *testing.T) {
 	if err == nil && again.EntryID != entry.EntryID {
 		// dedup should return the SAME entry, not create one under the other instance's map
 		t.Fatalf("dedup broken after cross-instance activity: %+v", again)
+	}
+}
+
+func TestReplyRestartRoutesEachConversationExactly(t *testing.T) {
+	s := newKernelTestSupervisor(t)
+	s.policy.ExportMask = TaintExternal
+	app, err := s.CreateApplication("tester", "owner", "on_event")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateChannel("tester", "im", "im"); err != nil {
+		t.Fatal(err)
+	}
+	externalIDs := []string{"alice", "bob", "carol", "dave"}
+	messages := make([]MailboxMessage, 0, len(externalIDs))
+	for _, externalID := range externalIDs {
+		if _, err := s.BindConversation("tester", "im", externalID, app.ApplicationID); err != nil {
+			t.Fatal(err)
+		}
+		message, err := s.DeliverInbound("im", externalID, 1,
+			json.RawMessage(`{"text":"hello"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		messages = append(messages, message)
+	}
+	for range messages {
+		id, message, err := s.claimTurn()
+		if err != nil || id != app.ApplicationID {
+			t.Fatalf("claim: id=%q err=%v", id, err)
+		}
+		if err := s.finishTurn(id, message, "ok", Usage{InputTokens: 1},
+			RouteInfo{Provider: "echo"}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	root := s.root
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := NewSupervisor(root, CapabilitySet{Engine: "echo", ExportMask: TaintExternal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	for i, message := range messages {
+		entry, err := s2.Reply("tester", app.ApplicationID, message.MessageID)
+		want := conversationKey("im", externalIDs[i])
+		if err != nil || entry.ConversationID != want {
+			t.Fatalf("message %s routed to %q, want %q: %v",
+				message.MessageID, entry.ConversationID, want, err)
+		}
+	}
+}
+
+func TestReplyBlocksConfidentialTaintAndPersistsDeny(t *testing.T) {
+	s := newKernelTestSupervisor(t)
+	s.policy.ExportMask = TaintExternal
+	app, err := s.CreateApplication("tester", "owner", "on_event")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateChannel("tester", "im", "im"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.BindConversation("tester", "im", "u", app.ApplicationID); err != nil {
+		t.Fatal(err)
+	}
+	message, err := s.DeliverInbound("im", "u", 1, json.RawMessage(`{"text":"secret"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.finishTurnForGateway(t, app.ApplicationID, message); err != nil {
+		t.Fatal(err)
+	}
+	s.accumulateTaint(app.ApplicationID, TaintConfidential)
+	if _, err := s.Reply("tester", app.ApplicationID, message.MessageID); !errors.Is(err, ErrTaintBlocked) {
+		t.Fatalf("confidential reply was not blocked: %v", err)
+	}
+	if len(s.state.Outbox) != 0 {
+		t.Fatalf("blocked reply entered outbox: %+v", s.state.Outbox)
+	}
+	audit := s.Audit()
+	last := audit[len(audit)-1]
+	if last.Action != "gateway.reply" || last.Decision != "deny" || last.Reason != "unmasked taint" {
+		t.Fatalf("missing reply deny audit: %+v", last)
+	}
+
+	root := s.root
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := NewSupervisor(root, CapabilitySet{Engine: "echo", ExportMask: TaintExternal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	audit = s2.Audit()
+	found := false
+	for _, record := range audit {
+		if record.Action == "gateway.reply" && record.Object == message.MessageID &&
+			record.Decision == "deny" && record.Reason == "unmasked taint" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("reply deny was not persisted")
+	}
+}
+
+func TestRevokedChannelBlocksReplyAndOutboxClaim(t *testing.T) {
+	s := newKernelTestSupervisor(t)
+	s.policy.ExportMask = TaintExternal
+	app, err := s.CreateApplication("tester", "owner", "on_event")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateChannel("tester", "im", "im"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.BindConversation("tester", "im", "u", app.ApplicationID); err != nil {
+		t.Fatal(err)
+	}
+	var messages []MailboxMessage
+	for sequence := int64(1); sequence <= 2; sequence++ {
+		message, err := s.DeliverInbound("im", "u", sequence, json.RawMessage(`{"text":"x"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		messages = append(messages, message)
+	}
+	for range messages {
+		id, message, err := s.claimTurn()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.finishTurn(id, message, "ok", Usage{InputTokens: 1},
+			RouteInfo{Provider: "echo"}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.Reply("tester", app.ApplicationID, messages[0].MessageID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RevokeChannel("tester", "im"); err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := s.ClaimOutbox("im", "u"); !errors.Is(err, ErrChannelNotFound) || len(claimed) != 0 {
+		t.Fatalf("revoked channel claimed outbox: %+v %v", claimed, err)
+	}
+	if _, err := s.Reply("tester", app.ApplicationID, messages[1].MessageID); !errors.Is(err, ErrChannelNotFound) {
+		t.Fatalf("revoked channel accepted reply: %v", err)
 	}
 }

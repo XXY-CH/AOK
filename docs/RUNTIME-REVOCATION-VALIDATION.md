@@ -11,7 +11,8 @@
 ## 实现
 
 - 撤销按 token digest 登记（`sha256(tokenBytes||signature)`），持久化于
-  supervisor state（上限 1024 条、新的逐出旧的），带时间与理由，审计入 hash chain。
+  supervisor state（上限 1024 条，达到上限返回 `ErrRevocationCapacity`，保留已有撤销），
+  带时间与理由，允许和容量拒绝均审计入 hash chain。当前不自动清理过期项；容量回收仍待实现。
 - **链式波及**：衰减用同一 issuer key 重签、只追加 caveat，因此后代的 caveat 列表
   必然以祖先为前缀——撤销条目匹配"同 key 且条目 caveat 是 token caveat 前缀"的
   一切 token。撤销中间节点 ⇒ 叶子死亡、根仍可用、撤销后新派生的后代先天无效。

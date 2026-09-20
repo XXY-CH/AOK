@@ -22,6 +22,12 @@ runtime 侧。
   `gateway.outbox.ack` 幂等确认并记录远端 receipt。outbox 上限 256 条、优先逐出
   终局条目。
 
+2026-09-20 修复：重启从完整 `(channel, external_id)` 恢复来源，核验 application
+绑定；拒绝冒号拼接键的结构碰撞。Reply 检查应用 serving、channel active 与
+`TaintBits & ^ExportMask == 0`，拒绝写持久审计；ClaimOutbox 也拒绝撤销通道。
+成功回复 external 入站需要 manifest 明确允许 `TaintExternal`，不能隐式放行。
+回归覆盖同一通道四个会话重启、confidential 污点拒绝、deny 审计重启、撤销后禁止发出。
+
 ## 证据
 
 ```sh
@@ -40,3 +46,5 @@ python3 scripts/core-smoke.py && python3 scripts/smoke.py
 
 - 真实外部 transport（webhook/im connector 进程）、MCP/A2A/ACP 驱动、
   message_identities 与投递尝试表、TLS/签名验证、出站退避与死信。
+- ABI 规定的 channel/conversation 范围 capability 与 Reply 人工确认升级尚未接入；
+  当前未掩蔽污点直接拒绝，不能用此切片宣称完整出站授权契约已完成。

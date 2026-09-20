@@ -5,6 +5,7 @@ package runtime
 import (
 	"os"
 	"strconv"
+	"strings"
 
 	"aok/runtime/kernelbridge"
 )
@@ -19,6 +20,11 @@ type kernelAppAdapter struct {
 
 type kernelSourceAdapter struct {
 	source *kernelbridge.EventSource
+}
+
+func (b kernelBridgeAdapter) BootID() (string, error) {
+	data, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	return strings.TrimSpace(string(data)), err
 }
 
 // OpenKernelEventBridge connects the kernel application registry. It first

@@ -2,10 +2,45 @@ package runtime
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"testing"
 	"time"
 )
+
+func TestRevocationCapacityPreservesExistingEntries(t *testing.T) {
+	s := newKernelTestSupervisor(t)
+	_, issuer, err := GenerateCapabilityKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var first CapabilityToken
+	for i := 0; i <= maxRevokedTokens; i++ {
+		token, err := MintCapabilityToken(issuer, "supervisor", fmt.Sprintf("subject-%d", i),
+			time.Now().Add(time.Hour), []CapabilityGrant{{Object: "net", Action: "*"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			first = token
+		}
+		err = s.RevokeCapabilityToken("tester", token, "test")
+		if i == maxRevokedTokens {
+			if !errors.Is(err, ErrRevocationCapacity) {
+				t.Fatalf("overflow must be explicit: %v", err)
+			}
+		} else if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.RevokeCapabilityToken("tester", first, "idempotent at capacity"); err != nil {
+		t.Fatal(err)
+	}
+	s.restoreLocked()
+	if !s.tokenRevokedLocked(first) || len(s.state.RevokedTokens) != maxRevokedTokens {
+		t.Fatal("capacity overflow lost a committed revocation")
+	}
+}
 
 // The second revocation level: revoking a runtime capability token takes
 // its whole attenuation chain with it, survives restarts, and leaves

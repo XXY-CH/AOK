@@ -39,6 +39,9 @@ func RunInit(ctx context.Context, config InitConfig) error {
 	if config.MaxRestarts < 1 || config.RestartWindow <= 0 || config.StopTimeout <= 0 {
 		return errors.New("invalid init restart limits")
 	}
+	if err := prepareInitKernel(); err != nil {
+		return err
+	}
 	var starts []time.Time
 	// The root capability is claimable only by PID1; keep it for the whole
 	// boot and hand each supervisor incarnation the same descriptor.

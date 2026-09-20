@@ -75,10 +75,20 @@ func WithRouteBackends(ctx context.Context, backends []string) context.Context {
 func (r *RouterProvider) Complete(ctx context.Context, prompt string) (string, Usage, error) {
 	var failures []string
 	allowed, _ := ctx.Value(routeBackendsKey{}).([]string)
-	for _, provider := range r.providers {
-		if len(allowed) > 0 && !containsString(allowed, provider.Name()) {
-			continue
+	candidates := r.providers
+	if len(allowed) > 0 {
+		candidates = nil
+		seen := map[string]bool{}
+		for _, name := range allowed {
+			for _, provider := range r.providers {
+				if provider.Name() == name && !seen[name] {
+					candidates = append(candidates, provider)
+					seen[name] = true
+				}
+			}
 		}
+	}
+	for _, provider := range candidates {
 		if err := ctx.Err(); err != nil {
 			return "", Usage{}, err
 		}

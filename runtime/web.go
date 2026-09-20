@@ -216,6 +216,15 @@ func (s *Supervisor) WebExecute(principal, applicationID string, cap WebCapabili
 			}
 			return nil
 		}}
+	// Validate before network side effects, then recheck after I/O in case
+	// the application was retired while the request was in flight.
+	s.mu.Lock()
+	a, ok := s.state.Applications[applicationID]
+	live := ok && a.State != "tombstoned" && a.State != "retiring"
+	s.mu.Unlock()
+	if !live {
+		return WebResult{}, nil, ErrApplicationNotFound
+	}
 	result, body, err := s.webFetch(client, req)
 	if err != nil {
 		return WebResult{}, nil, err
@@ -225,7 +234,7 @@ func (s *Supervisor) WebExecute(principal, applicationID string, cap WebCapabili
 		extraction = webDocument(body, result.ContentType)
 	}
 	s.mu.Lock()
-	a, ok := s.state.Applications[applicationID]
+	a, ok = s.state.Applications[applicationID]
 	if !ok || a.State == "tombstoned" || a.State == "retiring" {
 		s.mu.Unlock()
 		return WebResult{}, nil, ErrApplicationNotFound

@@ -40,6 +40,28 @@ func TestRouterRejectsDuplicateOrEmptyProviders(t *testing.T) {
 	}
 }
 
+func TestRouterUsesApplicationOrder(t *testing.T) {
+	for _, failLocal := range []bool{false, true} {
+		var local Provider = fixedProvider{"llama.cpp", "local"}
+		if failLocal {
+			local = failingProvider{"llama.cpp"}
+		}
+		r, err := NewRouterProvider(fixedProvider{"anthropic", "cloud"}, local)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx := WithRouteBackends(context.Background(), []string{"unknown", "llama.cpp", "llama.cpp", "anthropic"})
+		text, _, err := r.Complete(ctx, "prompt")
+		want, fallbacks := "local", uint32(0)
+		if failLocal {
+			want, fallbacks = "cloud", 1
+		}
+		if err != nil || text != want || r.LastRoute().Fallbacks != fallbacks {
+			t.Fatalf("local failure=%v text=%q route=%+v err=%v", failLocal, text, r.LastRoute(), err)
+		}
+	}
+}
+
 type keyedProvider struct {
 	name, text, key string
 }

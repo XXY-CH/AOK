@@ -1,5 +1,8 @@
 # P1 Object Prototype
 
+本文记录 `0001`/`0002` 的历史边界，不代表当前完整 patch series。
+最新实现与验证见 [IMPLEMENTATION-STATUS.md](../IMPLEMENTATION-STATUS.md)。
+
 前两枚补丁是对象和 bootstrap 实验，不是 P0 产品 ABI 的完整实现。设计中的 job、
 首个 task/pidfd、持久生命周期、事件和资源域仍按原决议实现；不能把此实验用于运行不可信
 Agent。启用项为 `CONFIG_AOK_EXPERIMENTAL`，依赖 arm64 和 `EXPERT`，默认关闭。

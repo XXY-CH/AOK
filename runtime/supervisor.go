@@ -225,33 +225,7 @@ func (s *Supervisor) load() error {
 	if s.state.Applications == nil || s.state.Mailbox == nil {
 		return errors.New("invalid supervisor state")
 	}
-	if s.state.Results == nil {
-		s.state.Results = map[string]TurnResult{}
-	}
-	if s.state.Prepared == nil {
-		s.state.Prepared = map[string]TurnResult{}
-	}
-	if s.state.Timers == nil {
-		s.state.Timers = map[string]ApplicationTimer{}
-	}
-	if s.state.Bindings == nil {
-		s.state.Bindings = map[string]WakeBinding{}
-	}
-	if s.state.KernelPending == nil {
-		s.state.KernelPending = map[string][]KernelEvent{}
-	}
-	if s.state.Confirmations == nil {
-		s.state.Confirmations = map[string]ConfirmationRequest{}
-	}
-	if s.state.Channels == nil {
-		s.state.Channels = map[string]MessageChannel{}
-	}
-	if s.state.Conversations == nil {
-		s.state.Conversations = map[string]MessageConversation{}
-	}
-	if s.state.HostfsMounts == nil {
-		s.state.HostfsMounts = map[string]HostfsMount{}
-	}
+	s.initializeStateMapsLocked()
 	for _, a := range s.state.Applications {
 		if a == nil {
 			continue
@@ -301,6 +275,36 @@ func (s *Supervisor) load() error {
 	return s.persistLocked(nil)
 }
 
+func (s *Supervisor) initializeStateMapsLocked() {
+	if s.state.Results == nil {
+		s.state.Results = map[string]TurnResult{}
+	}
+	if s.state.Prepared == nil {
+		s.state.Prepared = map[string]TurnResult{}
+	}
+	if s.state.Timers == nil {
+		s.state.Timers = map[string]ApplicationTimer{}
+	}
+	if s.state.Bindings == nil {
+		s.state.Bindings = map[string]WakeBinding{}
+	}
+	if s.state.KernelPending == nil {
+		s.state.KernelPending = map[string][]KernelEvent{}
+	}
+	if s.state.Confirmations == nil {
+		s.state.Confirmations = map[string]ConfirmationRequest{}
+	}
+	if s.state.Channels == nil {
+		s.state.Channels = map[string]MessageChannel{}
+	}
+	if s.state.Conversations == nil {
+		s.state.Conversations = map[string]MessageConversation{}
+	}
+	if s.state.HostfsMounts == nil {
+		s.state.HostfsMounts = map[string]HostfsMount{}
+	}
+}
+
 func (s *Supervisor) persistLocked(_ any) error {
 	b, err := json.Marshal(s.state)
 	if err == nil {
@@ -317,6 +321,8 @@ func (s *Supervisor) persistLocked(_ any) error {
 func (s *Supervisor) restoreLocked() {
 	s.state = supervisorState{}
 	_ = json.Unmarshal(s.committed, &s.state)
+	s.initializeStateMapsLocked()
+	s.rescanSourcedLocked()
 	s.previousHash = ""
 	if n := len(s.state.Audit); n > 0 {
 		s.previousHash = s.state.Audit[n-1].Hash

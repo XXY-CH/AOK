@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strings"
 	"time"
 )
 
@@ -59,29 +58,23 @@ func (s *Supervisor) sourceFor(messageID string) string {
 // rescanSourcedLocked rebuilds the map from persisted mailbox envelopes
 // after a restart. Idempotent; caller holds s.mu.
 func (s *Supervisor) rescanSourcedLocked() {
+	s.sourced = map[string]string{}
 	for applicationID, messages := range s.state.Mailbox {
-		var keys []string
-		for key, conversation := range s.state.Conversations {
-			if conversation.ApplicationID == applicationID {
-				keys = append(keys, key)
-			}
-		}
-		if len(keys) == 0 {
-			continue
-		}
 		for _, m := range messages {
 			var envelope struct {
-				Source  string `json:"source"`
-				Channel string `json:"channel"`
+				Source     string `json:"source"`
+				Channel    string `json:"channel"`
+				ExternalID string `json:"external_id"`
 			}
 			if json.Unmarshal(m.Payload, &envelope) != nil || envelope.Source != "gateway" {
 				continue
 			}
-			for _, key := range keys {
-				if strings.HasPrefix(key, envelope.Channel+":") {
-					s.sourced[m.MessageID] = key
-					break
-				}
+			key := conversationKey(envelope.Channel, envelope.ExternalID)
+			conversation, ok := s.state.Conversations[key]
+			if ok && conversation.ChannelID == envelope.Channel &&
+				conversation.ExternalID == envelope.ExternalID &&
+				conversation.ApplicationID == applicationID {
+				s.sourced[m.MessageID] = key
 			}
 		}
 	}
@@ -97,6 +90,17 @@ const maxOutboxEntries = 256
 
 func conversationKey(channelID, externalID string) string {
 	return channelID + ":" + externalID
+}
+
+// conversationLocked protects the legacy colon-delimited key from routing a
+// colliding (channel, external id) pair to a different persisted binding.
+func (s *Supervisor) conversationLocked(channelID, externalID string) (string, MessageConversation, bool) {
+	key := conversationKey(channelID, externalID)
+	conversation, ok := s.state.Conversations[key]
+	if !ok || conversation.ChannelID != channelID || conversation.ExternalID != externalID {
+		return key, MessageConversation{}, false
+	}
+	return key, conversation, true
 }
 
 // CreateChannel registers an outbound-capable channel of the given kind.
@@ -151,11 +155,11 @@ func (s *Supervisor) BindConversation(principal, channelID, externalID, applicat
 		return MessageConversation{}, errors.New("invalid external identity")
 	}
 	key := conversationKey(channelID, externalID)
-	if existing, ok := s.state.Conversations[key]; ok &&
-		existing.ApplicationID != applicationID {
-		return MessageConversation{}, ErrConversationBound
-	}
 	if existing, ok := s.state.Conversations[key]; ok {
+		if existing.ChannelID != channelID || existing.ExternalID != externalID ||
+			existing.ApplicationID != applicationID {
+			return MessageConversation{}, ErrConversationBound
+		}
 		// Re-binding the same identity to the same application preserves
 		// the cursor and creation time; wiping them would make already
 		// routed sequences deliverable again.
@@ -179,8 +183,7 @@ func (s *Supervisor) DeliverInbound(channelID, externalID string, sequence int64
 	if !ok || channel.State != "active" {
 		return MailboxMessage{}, ErrChannelNotFound
 	}
-	key := conversationKey(channelID, externalID)
-	conversation, ok := s.state.Conversations[key]
+	key, conversation, ok := s.conversationLocked(channelID, externalID)
 	if !ok {
 		return MailboxMessage{}, ErrConversationNotFound
 	}
@@ -282,15 +285,38 @@ func (s *Supervisor) Reply(principal, applicationID, messageID string) (OutboxEn
 	if !ok || result.ApplicationID != applicationID {
 		return OutboxEntry{}, errors.New("result not found")
 	}
+	deny := func(err error, reason string) (OutboxEntry, error) {
+		_ = s.auditLocked(principal, applicationID, "gateway.reply", messageID, "deny", reason)
+		if persistErr := s.persistLocked(nil); persistErr != nil {
+			return OutboxEntry{}, persistErr
+		}
+		return OutboxEntry{}, err
+	}
+	application, ok := s.state.Applications[applicationID]
+	if !ok {
+		return deny(ErrApplicationNotFound, "application not found")
+	}
+	if application.State != "serving" {
+		return deny(ErrApplicationRetired, "application is not active")
+	}
 	// Replies route to the conversation that sourced the message; with
 	// several conversations bound to one application an arbitrary pick
 	// would leak one principal's output to another.
 	conversationKey := s.sourceFor(messageID)
 	if conversationKey == "" {
-		return OutboxEntry{}, ErrConversationNotFound
+		return deny(ErrConversationNotFound, "source conversation not found")
 	}
-	if _, ok := s.state.Conversations[conversationKey]; !ok {
-		return OutboxEntry{}, ErrConversationNotFound
+	conversation, ok := s.state.Conversations[conversationKey]
+	if !ok || conversationKey != conversationKeyFor(conversation) ||
+		conversation.ApplicationID != applicationID {
+		return deny(ErrConversationNotFound, "source binding mismatch")
+	}
+	channel, ok := s.state.Channels[conversation.ChannelID]
+	if !ok || channel.State != "active" {
+		return deny(ErrChannelNotFound, "source channel is not active")
+	}
+	if blocked := application.TaintBits & ^s.policy.ExportMask; blocked != 0 {
+		return deny(ErrTaintBlocked, "unmasked taint")
 	}
 	payload, err := json.Marshal(struct {
 		Kind   string     `json:"kind"`
@@ -315,11 +341,12 @@ func (s *Supervisor) Reply(principal, applicationID, messageID string) (OutboxEn
 func (s *Supervisor) ClaimOutbox(channelID, externalID string) ([]OutboxEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	key := conversationKey(channelID, externalID)
-	if _, ok := s.state.Channels[channelID]; !ok {
+	channel, ok := s.state.Channels[channelID]
+	if !ok || channel.State != "active" {
 		return nil, ErrChannelNotFound
 	}
-	if _, ok := s.state.Conversations[key]; !ok {
+	key, _, ok := s.conversationLocked(channelID, externalID)
+	if !ok {
 		return nil, ErrConversationNotFound
 	}
 	var out []OutboxEntry
@@ -335,6 +362,10 @@ func (s *Supervisor) ClaimOutbox(channelID, externalID string) ([]OutboxEntry, e
 		_ = s.persistLocked(nil)
 	}
 	return out, nil
+}
+
+func conversationKeyFor(conversation MessageConversation) string {
+	return conversationKey(conversation.ChannelID, conversation.ExternalID)
 }
 
 // AckOutbox confirms remote acceptance; a duplicate ack for an already

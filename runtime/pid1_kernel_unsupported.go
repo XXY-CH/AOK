@@ -5,3 +5,5 @@ package runtime
 import "os"
 
 func claimInitKernelRoot() *os.File { return nil }
+
+func prepareInitKernel() error { return nil }

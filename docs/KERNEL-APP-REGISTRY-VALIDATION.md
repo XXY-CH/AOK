@@ -103,12 +103,22 @@ source 关闭后仍 durable、volatile 积压阻塞挂接、挂接后不可换�
   `PostLSFS`、`Read`/`Ack`/`Snapshot`/`Restore`，结构体大小有编译期 layout 断言。
 - `Supervisor.SetKernelBridge` 注入 `KernelEventBridge` 接口；Application 获得
   持久 `kernel_id`（单调分配，重启保留），`kernel:` 为保留幂等键前缀。
-- drain 协议：先以 `kernel:<app>:<event_id>` 幂等键写入 durable mailbox 并提交，
+- drain 协议：先以 `kernel:<app>:<origin_boot_id>:<event_id>` 幂等键写入 durable mailbox 并提交，
   再 ack 内核事件；mailbox 满载时丢弃 handle（下次以新游标从头重放，幂等键去重
   已投递前缀），不 ack、不丢失。
 - 关停时按需打开 handle 并把未确认队列 snapshot 进 `kernel_pending`；下次启动
-  restore 回内核（跨 VM 恢复）。同 boot 重启时内核队列仍存活，restore 被拒后
-  丢弃持久副本，由同一幂等键去重。retire 关闭 handle 并清除持久副本。
+  按原始 boot 身份先持久投递到 mailbox。跨 VM 不再把旧事件注入新 boot 的内核队列，
+  避免 producer 与 Restore 竞争，以及新旧 boot 复用编号时的身份混淆。
+  同 boot 可恢复空队列；`EBUSY` 只因旧事件已持久投递才可接受，其他错误返回调用方。
+  live queue 随后通过同一幂等键去重并 ACK。ACK 前先提交 pending 和 mailbox，ACK 后清除 pending。
+  mailbox 满载或持久失败时保留未投递 snapshot，后续继续恢复。
+  retire 关闭 handle 并清除持久副本。Linux boot 身份取自 `/proc/sys/kernel/random/boot_id`；
+  最小内核需启用 `CONFIG_PROC_FS` 和 `CONFIG_PROC_SYSCTL`，guest PID1 启动时挂载 proc。
+
+升级约束：旧版本的 pending 和 mailbox key 没有 boot 身份，无法区分旧队列重放与
+新 boot 的同编号事件。从该版本升级时须先有序关闭 supervisor、保留 state，再完整
+重启 VM；不支持只热重启 supervisor 的精确一次保证。旧 pending 保留 legacy key
+恢复，新 VM 队列使用 boot-scoped key。此约束不影响新版状态的同 boot supervisor 重启。
 
 runtime 侧验证（本机 macOS）：
 
@@ -123,7 +133,7 @@ python3 scripts/core-smoke.py
 ```
 
 全部通过。`runtime/kernelwake_test.go` 用 fake bridge 覆盖：drain+ack、重复 drain
-去重、满载保留事件与容量释放后续投、关停 snapshot→新 boot restore、同 boot
+去重、满载保留事件与容量释放后续投、关停 snapshot→新 boot mailbox 恢复、同 boot
 重启丢弃副本且不重复、幂等键保留、kernel_id 分配与持久化。
 
 ## 独立审核与处置
@@ -148,9 +158,10 @@ wake policy（生产路径由 supervisor 驱动 aproc 恢复）。
 
 ## 尚未完成
 
-- 内核 registry 是 boot 内 durable：跨 VM 的持久性由 supervisor snapshot/restore
-  承接，内核自身不落盘；不洁 VM 崩溃丢失最后窗口。`aok-init` → supervisor 的
-  `AOK_ROOT_FD` 传递路径尚未在 guest 内整体演练（probe 直接以 PID1 认领）。
+- 内核 registry 是 boot 内 durable：跨 VM 的持久性由 supervisor snapshot 和 mailbox 恢复
+  承接，内核自身不落盘；不洁 VM 崩溃可能丢失尚未提交的窗口。`aok-init` → supervisor 的
+  `AOK_ROOT_FD` 传递路径已有 [guest boot 验证](GUEST-INITFS-BOOT-VALIDATION.md)，
+  guest 内监督重启演练仍未完成。
 - 生产者是 supervisor 自己的 LSFS 扫描器；独立的受监督 fsd 进程尚不存在。
   内核路由事件只携带 application 与 cursor，不含 binding id；需要区分来源 binding 的
   消费者应对照 cursor 与各 binding 的扫描区间。

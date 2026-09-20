@@ -71,11 +71,12 @@ model）。`TurnResult` 携带 `provider/fallbacks/cache_hit_kind`，Application
 supervisor 调度带前缀亲和：在与最少计费候选的公平带（25% 或 64 token）内优先
 共享上一执行前缀的 turn，保证同源 fan-out 连续执行以保住热 KV。证据见
 [RUNTIME-ROUTE-AFFINITY-VALIDATION.md](../RUNTIME-ROUTE-AFFINITY-VALIDATION.md)。
-`route_policy`/`route_handle` 对象、跨 backend 的 KV 迁移与 `ainf` 校验闭环仍属后续。
+`route_handle`、跨 backend 的 KV 迁移与生产 `ainf` 路由校验闭环仍属后续。
 
 2026-09-19 补齐：`route_policy` 已落地为 Application 持久字段（版本化的允许 backend
 fallback 顺序，control API `application.set_route_policy` 设置，记审计）；router 从
-turn context 读取策略并只在允许集合内 fallback（全被排除即拒绝，错误明确），直连
+turn context 读取策略并按允许列表顺序 fallback（2026-09-20 修复原先仅过滤集合的行为；
+全被排除即拒绝，错误明确），直连
 provider 由 runner 在调用前检查，越权 turn 以 `route_denied` 失败且不触达任何
 backend。`route_record` 以不可变记录持久化（每个 turn 一条，含 policy 版本、
 backend、compat key、fallbacks、cache_hit_kind、prompt/cached/completion tokens、

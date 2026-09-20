@@ -25,6 +25,8 @@ type RevokedToken struct {
 
 const maxRevokedTokens = 1024
 
+var ErrRevocationCapacity = errors.New("revocation registry is full")
+
 func tokenDigest(t CapabilityToken) string {
 	sum := sha256.Sum256(append(tokenBytes(t), t.Signature...))
 	return hex.EncodeToString(sum[:])
@@ -85,15 +87,20 @@ func (s *Supervisor) RevokeCapabilityToken(principal string, token CapabilityTok
 			return nil // idempotent
 		}
 	}
+	// Effective revocations must never be evicted to admit a new entry.
+	if len(s.state.RevokedTokens) >= maxRevokedTokens {
+		_ = s.auditLocked(principal, "", "capability.revoke", digest, "deny", "registry full")
+		if err := s.persistLocked(nil); err != nil {
+			return err
+		}
+		return ErrRevocationCapacity
+	}
 	entry := RevokedToken{Digest: digest,
 		PublicKey: append([]byte(nil), token.PublicKey...),
 		Subject:   token.Subject,
 		Caveats:   append([]string(nil), token.Caveats...),
 		Time:      time.Now().UnixNano(), Reason: reason}
 	s.state.RevokedTokens = append(s.state.RevokedTokens, entry)
-	if overflow := len(s.state.RevokedTokens) - maxRevokedTokens; overflow > 0 {
-		s.state.RevokedTokens = append([]RevokedToken(nil), s.state.RevokedTokens[overflow:]...)
-	}
 	_ = s.auditLocked(principal, "", "capability.revoke", digest, "allow",
 		strings.Join(append([]string(nil), token.Caveats...), "|"))
 	return s.persistLocked(nil)
