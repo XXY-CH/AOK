@@ -44,8 +44,13 @@ func (s *Supervisor) MountHostfs(principal, applicationID, guestPath, mode strin
 	if _, ok := s.state.Applications[applicationID]; !ok {
 		return HostfsMount{}, ErrApplicationNotFound
 	}
-	if !hostfsModes[mode] || guestPath == "" || !strings.HasPrefix(guestPath, "/") || limits < 0 {
+	if !hostfsModes[mode] || guestPath == "" || limits < 0 {
 		return HostfsMount{}, errors.New("invalid hostfs mount")
+	}
+	// Mount paths are stored canonical: a trailing slash or double slash
+	// would make the mount root unreachable at check time.
+	if filepath.Clean(guestPath) != guestPath || !filepath.IsAbs(guestPath) {
+		return HostfsMount{}, errors.New("invalid hostfs mount path")
 	}
 	s.state.NextSequence++
 	mount := HostfsMount{

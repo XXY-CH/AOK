@@ -40,6 +40,7 @@ type Supervisor struct {
 	kernelSrcs   map[string]KernelEventSource
 	lastClaim    map[string]time.Time
 	lastPrefix   string
+	sourced      map[string]string
 }
 
 type supervisorState struct {
@@ -178,7 +179,7 @@ func NewSupervisor(root string, policy CapabilitySet) (*Supervisor, error) {
 	policy.FSRead = append([]string(nil), policy.FSRead...)
 	policy.FSWrite = append([]string(nil), policy.FSWrite...)
 	policy.Tools = append([]string(nil), policy.Tools...)
-	s := &Supervisor{root: root, policy: policy, lastClaim: map[string]time.Time{}, state: supervisorState{Applications: map[string]*Application{}, Mailbox: map[string][]MailboxMessage{}, Bindings: map[string]WakeBinding{}}, authorizer: CapabilityAuthorizer{Policy: cedarPolicyFromCapabilitySet(policy)}}
+	s := &Supervisor{root: root, policy: policy, lastClaim: map[string]time.Time{}, sourced: map[string]string{}, state: supervisorState{Applications: map[string]*Application{}, Mailbox: map[string][]MailboxMessage{}, Bindings: map[string]WakeBinding{}}, authorizer: CapabilityAuthorizer{Policy: cedarPolicyFromCapabilitySet(policy)}}
 	s.lock = lock
 	if err := s.load(); err != nil {
 		s.Close()
@@ -260,6 +261,7 @@ func (s *Supervisor) load() error {
 			a.KernelID = s.state.NextKernelID
 		}
 	}
+	s.rescanSourcedLocked()
 	if err = VerifyAudit(s.state.Audit); err != nil {
 		return err
 	}

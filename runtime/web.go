@@ -109,7 +109,11 @@ func (s *Supervisor) webFetch(client *http.Client, req WebRequest) (WebResult, [
 		return WebResult{}, nil, errors.New("web response exceeds the fetch limit")
 	}
 	sum := sha256.Sum256(body)
-	result := WebResult{Kind: "web.fetch", URL: req.URL, Status: resp.StatusCode,
+	finalURL := req.URL
+	if resp.Request != nil && resp.Request.URL != nil {
+		finalURL = resp.Request.URL.String()
+	}
+	result := WebResult{Kind: "web.fetch", URL: finalURL, Status: resp.StatusCode,
 		ContentSHA256: hex.EncodeToString(sum[:]), Bytes: int64(len(body)),
 		ContentType: resp.Header.Get("Content-Type"), Taint: TaintExternal,
 		FetchedAt: time.Now().UnixNano()}
@@ -216,7 +220,6 @@ func (s *Supervisor) WebExecute(principal, applicationID string, cap WebCapabili
 	if err != nil {
 		return WebResult{}, nil, err
 	}
-	result.URL = respURL(req, client)
 	var extraction map[string]any
 	if req.Kind != "web.fetch" {
 		extraction = webDocument(body, result.ContentType)
@@ -239,12 +242,6 @@ func (s *Supervisor) WebExecute(principal, applicationID string, cap WebCapabili
 		result.Kind = req.Kind
 	}
 	return result, extraction, nil
-}
-
-// respURL reports the final URL after redirects so the evidence trail
-// records the true origin.
-func respURL(req WebRequest, client *http.Client) string {
-	return req.URL
 }
 
 func prefixAllowed(prefixes []string, target string) bool {

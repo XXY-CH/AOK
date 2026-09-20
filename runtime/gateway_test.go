@@ -214,3 +214,78 @@ func TestGatewayHeadlessRunAndSourcing(t *testing.T) {
 		t.Fatalf("re-bind wiped the cursor: %+v -> %+v", before[0], after[0])
 	}
 }
+
+// Replies must survive a real restart: the sourcing map is rebuilt from the
+// durable envelopes on load, and it is per-supervisor (no cross-instance
+// message-id collisions).
+func TestReplySurvivesRestart(t *testing.T) {
+	s := newKernelTestSupervisor(t)
+	app, err := s.CreateApplication("tester", "owner", "on_event")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateChannel("tester", "im", "im"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.BindConversation("tester", "im", "u", app.ApplicationID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DeliverInbound("im", "u", 1, json.RawMessage(`{"text":"x"}`)); err != nil {
+		t.Fatal(err)
+	}
+	root := s.root
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Fresh instance: the sourcing map must be rebuilt from the envelope.
+	s2, err := NewSupervisor(root, CapabilitySet{Engine: "echo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	// The turn result exists via the runner path or a direct finish; here
+	// the message is still pending — reply for an unexecuted message is
+	// rejected before the routing check anyway. Execute it first.
+	id, m, err := s2.claimTurn()
+	if err != nil || id != app.ApplicationID {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := s2.finishTurn(id, m, "x", Usage{InputTokens: 1, OutputTokens: 1},
+		RouteInfo{Provider: "echo"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	entry, err := s2.Reply("tester", app.ApplicationID, m.MessageID)
+	if err != nil || entry.ConversationID != "im:u" {
+		t.Fatalf("reply after restart lost its sourcing: %+v %v", entry, err)
+	}
+	// Per-instance isolation: a second supervisor with its own root must
+	// not see the first one's sourcing (colliding msg-N ids).
+	s3 := newKernelTestSupervisor(t)
+	defer s3.Close()
+	app3, _ := s3.CreateApplication("tester", "owner", "on_event")
+	if _, err := s3.CreateChannel("tester", "other", "other"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s3.BindConversation("tester", "other", "v", app3.ApplicationID); err != nil {
+		t.Fatal(err)
+	}
+	sent3, err := s3.DeliverInbound("other", "v", 1, json.RawMessage(`{"text":"y"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id3, m3, err := s3.claimTurn(); err != nil || id3 != app3.ApplicationID {
+		t.Fatalf("claim3: %v", err)
+	} else if err := s3.finishTurn(id3, m3, "y", Usage{InputTokens: 1}, RouteInfo{Provider: "echo"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	entry3, err := s3.Reply("tester", app3.ApplicationID, sent3.MessageID)
+	if err != nil || entry3.ConversationID != "other:v" {
+		t.Fatalf("cross-instance sourcing corrupted: %+v %v", entry3, err)
+	}
+	// The first supervisor's routing is unaffected by the second's writes.
+	again, err := s2.Reply("tester", app.ApplicationID, m.MessageID)
+	if err == nil && again.EntryID != entry.EntryID {
+		// dedup should return the SAME entry, not create one under the other instance's map
+		t.Fatalf("dedup broken after cross-instance activity: %+v", again)
+	}
+}

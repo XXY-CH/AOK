@@ -135,6 +135,10 @@
   控制面 `capability.revoke`。见
   [RUNTIME-REVOCATION-VALIDATION.md](RUNTIME-REVOCATION-VALIDATION.md)。
 
+- 2026-09-20 P4 复审修复：网关来源映射从进程内全局改为 supervisor 私有 + 重启时从
+  持久信封重建（回复跨重启可用、多实例 msg-N 无碰撞）；web 证据链记录真实最终
+  URL（重定向后来源不再误标）；hostfs 挂载路径创建即规范化（尾斜杠/双斜杠挂载
+  根不可达问题消除）。复审确认八项安全目标全部 CORRECT/fail-closed。
 - 2026-09-20 P5 首证据：MVP 多开并行调研（echo 后端）——`make runtime-mvp-smoke`
   以真实 supervisor 控制面驱动 planner → 3 researchers（VTC 排序 + 前缀亲和）→
   aggregator 报告 checkpoint 落盘，审计 20 条全 allow、命中率/VTC 数据可复算，

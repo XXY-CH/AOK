@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"sync"
+	"strings"
 	"time"
 )
 
@@ -44,10 +44,48 @@ type OutboxEntry struct {
 	Receipt        string          `json:"receipt,omitempty"`
 }
 
-// sourcedConversation records which conversation delivered the mailbox
-// message a result answers, so replies route to the origin, never to an
-// arbitrary conversation that happens to share the application.
-var sourcedConversation sync.Map // messageID -> conversation key
+// sourceOf records which conversation delivered a mailbox message, so
+// replies route to the origin. It lives on the Supervisor (not a package
+// global: per-root message counters collide across instances) and is
+// rebuilt from the durable envelope on load, surviving restarts.
+func (s *Supervisor) sourceOf(messageID, conversationKey string) {
+	s.sourced[messageID] = conversationKey
+}
+
+func (s *Supervisor) sourceFor(messageID string) string {
+	return s.sourced[messageID]
+}
+
+// rescanSourcedLocked rebuilds the map from persisted mailbox envelopes
+// after a restart. Idempotent; caller holds s.mu.
+func (s *Supervisor) rescanSourcedLocked() {
+	for applicationID, messages := range s.state.Mailbox {
+		var keys []string
+		for key, conversation := range s.state.Conversations {
+			if conversation.ApplicationID == applicationID {
+				keys = append(keys, key)
+			}
+		}
+		if len(keys) == 0 {
+			continue
+		}
+		for _, m := range messages {
+			var envelope struct {
+				Source  string `json:"source"`
+				Channel string `json:"channel"`
+			}
+			if json.Unmarshal(m.Payload, &envelope) != nil || envelope.Source != "gateway" {
+				continue
+			}
+			for _, key := range keys {
+				if strings.HasPrefix(key, envelope.Channel+":") {
+					s.sourced[m.MessageID] = key
+					break
+				}
+			}
+		}
+	}
+}
 
 var (
 	ErrChannelNotFound      = errors.New("message channel not found")
@@ -186,7 +224,7 @@ func (s *Supervisor) DeliverInbound(channelID, externalID string, sequence int64
 	if err != nil {
 		return MailboxMessage{}, err
 	}
-	sourcedConversation.Store(message.MessageID, key)
+	s.sourceOf(message.MessageID, key)
 	// Cursor advances only with the mailbox accept: a mail-rollback keeps
 	// the old cursor, so the retry re-routes the same sequence idempotently.
 	conversation.LastSequence = sequence
@@ -247,9 +285,8 @@ func (s *Supervisor) Reply(principal, applicationID, messageID string) (OutboxEn
 	// Replies route to the conversation that sourced the message; with
 	// several conversations bound to one application an arbitrary pick
 	// would leak one principal's output to another.
-	conversationKeyAny, ok := sourcedConversation.Load(messageID)
-	conversationKey, _ := conversationKeyAny.(string)
-	if !ok || conversationKey == "" {
+	conversationKey := s.sourceFor(messageID)
+	if conversationKey == "" {
 		return OutboxEntry{}, ErrConversationNotFound
 	}
 	if _, ok := s.state.Conversations[conversationKey]; !ok {
