@@ -32,8 +32,24 @@ hit_rates=[0.0, 0.0, 0.0] audit_records=20 denies=0
 - **零越权事件**：整条链路的审计全为 allow（20 条记录），hash chain 由
   supervisor 每次 load 强制校验。
 
+## 一条命令入口与真实后端
+
+`runtime/scripts/mvp-research.sh`（`sh scripts/mvp-research.sh [-j N] "question"`）
+以一条命令完成整个流程：自动拉起 supervisor（或复用 `AOK_CTL_SOCKET` 指定的运行
+实例）、planner 派生、fan-out、聚合，输出验收数据。
+
+`make runtime-mvp-mixed-smoke` 把 researchers 换到**真实 llama.cpp 后端**（归档
+`kernel/.build/smoke-logs/runtime-mvp-mixed.log`）：
+
+```text
+AOK_MVP_MIXED=pass backend=llama.cpp rates=[0.0, 0.95, 0.95] nonzero=2/3 audit=12
+```
+
+首个 turn 冷启动（0.00），后续两个 researcher 复用共享 brief 前缀（0.95）——
+前缀亲和调度在真实 KV cache 上生效，命中率成为验收数据而非声明。
+
 ## 尚未完成
 
-- 三后端**混合**推理（本证据为 echo；llama/Metal 已各自有独立证据，router
-  混合编排属下一片）、/proc 观测（需 guest 内运行）、ash 一条命令入口、
-  COW fork（amem 未实现，fan-out 当前为独立 application）。
+- /proc 观测（需 guest 内运行）、ash 命令名下的统一入口（当前为 scripts/
+  mvp-research.sh）、COW fork（amem 未实现，fan-out 为独立 application）、
+  三后端**同时**混合（当前单后端 + router fallback 机制已验证）。

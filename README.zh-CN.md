@@ -161,6 +161,8 @@ make aok-event-probe-test
 make aok-initfs-boot-test
 make runtime-hitrate-smoke
 make runtime-affinity-smoke
+make runtime-mvp-smoke
+make runtime-mvp-mixed-smoke
 make aok-core-test
 ```
 

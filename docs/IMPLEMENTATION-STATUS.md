@@ -135,6 +135,10 @@
   控制面 `capability.revoke`。见
   [RUNTIME-REVOCATION-VALIDATION.md](RUNTIME-REVOCATION-VALIDATION.md)。
 
+- 2026-09-20 P5 二阶段：`scripts/mvp-research.sh` 一条命令入口（自动拉起或复用
+  supervisor、planner→fan-out→聚合全流程）；`make runtime-mvp-mixed-smoke` 以真实
+  llama.cpp 后端验证——共享 brief 前缀使后续 researcher 命中率 0.95（首个 0.00
+  冷启动），前缀亲和在真实 KV cache 上生效，输出归档 smoke-logs。
 - 2026-09-20 P4 复审修复：网关来源映射从进程内全局改为 supervisor 私有 + 重启时从
   持久信封重建（回复跨重启可用、多实例 msg-N 无碰撞）；web 证据链记录真实最终
   URL（重定向后来源不再误标）；hostfs 挂载路径创建即规范化（尾斜杠/双斜杠挂载

@@ -164,6 +164,10 @@ runtime-affinity-smoke:
 runtime-mvp-smoke:
 	@mkdir -p kernel/.build/smoke-logs && AOK_SMOKE_LOG="$(CURDIR)/kernel/.build/smoke-logs/runtime-mvp.log" python3 runtime/scripts/mvp-smoke.py
 
+.PHONY: runtime-mvp-mixed-smoke
+runtime-mvp-mixed-smoke:
+	@mkdir -p kernel/.build/smoke-logs && AOK_SMOKE_LOG="$(CURDIR)/kernel/.build/smoke-logs/runtime-mvp-mixed.log" python3 runtime/scripts/mvp-mixed-smoke.py
+
 aok-core-test:
 	@AOK_INITRD="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/core-initramfs.cpio.gz" \
 	 AOK_SERIAL_LOG="$${AOK_OBJECT_OUTPUT:-$(CURDIR)/kernel/.build/qemu-arm64-object}/serial-core.log" \
