@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"sync"
 
+	"golang.org/x/sys/unix"
+
 	"aok/runtime/kernelbridge"
 )
 
@@ -26,7 +28,14 @@ func openKernelInferRoot() (*kernelbridge.Root, error) {
 	if err != nil || number < 0 {
 		return nil, kernelbridge.ErrUnsupported
 	}
-	file := os.NewFile(uintptr(number), "aok-root")
+	// The event bridge wraps the same descriptor; dup before wrapping so a
+	// dropped wrapper's finalizer cannot close the shared fd underneath the
+	// other user.
+	dup, err := unix.Dup(number)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(dup), "aok-root")
 	if file == nil {
 		return nil, kernelbridge.ErrUnsupported
 	}
@@ -63,6 +72,11 @@ type KernelInferProvider struct {
 	inner     Provider
 	limit     uint64
 	maxOutput uint64
+	// slot is the single-session admission: the kernel capability's token
+	// ledger reconciles against this provider's mirror, so only one session
+	// may be in flight. A second concurrent turn returns ErrTurnBusy and
+	// the runner requeues it instead of burning its deadline on a mutex.
+	slot chan struct{}
 
 	// mu serializes Complete: the kernel reports a capability-wide ledger
 	// at Result time, so concurrent sessions could otherwise observe each
@@ -101,8 +115,10 @@ func NewKernelInferProvider(root *kernelbridge.Root, inner Provider, tokenLimit,
 	if err != nil {
 		return nil, err
 	}
-	return &KernelInferProvider{root: root, cap: capability, inner: inner,
-		limit: tokenLimit, maxOutput: maxOutputTokens}, nil
+	p := &KernelInferProvider{root: root, cap: capability, inner: inner,
+		limit: tokenLimit, maxOutput: maxOutputTokens, slot: make(chan struct{}, 1)}
+	p.slot <- struct{}{}
+	return p, nil
 }
 
 func (p *KernelInferProvider) Name() string { return "kernel-infer/" + p.inner.Name() }
@@ -116,14 +132,34 @@ func (p *KernelInferProvider) CompatKey() string {
 func (p *KernelInferProvider) Close() error { return p.cap.Close() }
 
 func (p *KernelInferProvider) Complete(ctx context.Context, prompt string) (string, Usage, error) {
+	text, usage, _, _, err := p.runSession(ctx, prompt)
+	return text, usage, err
+}
+
+// CompleteTracked returns the serving route and the session taint with the
+// turn that produced them; the inner provider may itself be tracked (a
+// router), in which case its decision is the serving route.
+func (p *KernelInferProvider) CompleteTracked(ctx context.Context, prompt string) (string, Usage, RouteInfo, uint64, error) {
+	return p.runSession(ctx, prompt)
+}
+
+func (p *KernelInferProvider) runSession(ctx context.Context, prompt string) (string, Usage, RouteInfo, uint64, error) {
 	if len(prompt) > kernelbridge.DataMax {
-		return "", Usage{}, fmt.Errorf("kernel infer prompt exceeds device limit")
+		return "", Usage{}, RouteInfo{}, 0, fmt.Errorf("kernel infer prompt exceeds device limit")
 	}
+	// Admission before the session: a queued turn never starts its kernel
+	// session, charges nothing, and reports busy instead of failing.
+	select {
+	case <-p.slot:
+	default:
+		return "", Usage{}, RouteInfo{}, 0, ErrTurnBusy
+	}
+	defer func() { p.slot <- struct{}{} }()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	client, backend, err := p.cap.Session()
 	if err != nil {
-		return "", Usage{}, err
+		return "", Usage{}, RouteInfo{}, 0, err
 	}
 	defer client.Close()
 	defer backend.Close()
@@ -137,21 +173,29 @@ func (p *KernelInferProvider) Complete(ctx context.Context, prompt string) (stri
 		OutputTokens: p.maxOutput, Data: []byte(prompt),
 	}); err != nil {
 		// A failed submit reserves nothing and charges nothing.
-		return "", Usage{}, fmt.Errorf("kernel submit: %w", err)
+		return "", Usage{}, RouteInfo{}, 0, fmt.Errorf("kernel submit: %w", err)
 	}
 	request, err := backend.Take()
 	if err != nil {
 		// A failed take leaves the session PENDING, which releases with a
 		// zero charge.
-		return "", Usage{}, fmt.Errorf("kernel take: %w", err)
+		return "", Usage{}, RouteInfo{}, 0, fmt.Errorf("kernel take: %w", err)
 	}
 	// From here the session is RUNNING: the kernel charges the full
 	// reservation on both cancel and an abandoned (failed) completion.
-	text, usage, err := p.inner.Complete(ctx, string(request.Data))
+	route := RouteInfo{Provider: p.Name(), CompatKey: p.CompatKey()}
+	var taint uint64
+	var text string
+	var usage Usage
+	if tracked, ok := p.inner.(TrackedProvider); ok {
+		text, usage, route, taint, err = tracked.CompleteTracked(ctx, string(request.Data))
+	} else {
+		text, usage, err = p.inner.Complete(ctx, string(request.Data))
+	}
 	if err != nil {
 		_ = client.Cancel()
 		p.settled += reservation
-		return "", Usage{}, err
+		return "", Usage{}, RouteInfo{}, 0, err
 	}
 	settled := usage.InputTokens + usage.OutputTokens
 	if err := backend.Complete(kernelbridge.Record{
@@ -159,7 +203,7 @@ func (p *KernelInferProvider) Complete(ctx context.Context, prompt string) (stri
 		OutputTokens: usage.OutputTokens, Data: []byte(text),
 	}); err != nil {
 		p.settled += reservation
-		return "", Usage{}, fmt.Errorf("kernel complete: %w", err)
+		return "", Usage{}, RouteInfo{}, 0, fmt.Errorf("kernel complete: %w", err)
 	}
 	result, err := client.Result()
 	if err != nil {
@@ -167,14 +211,14 @@ func (p *KernelInferProvider) Complete(ctx context.Context, prompt string) (stri
 		// closes a DONE session with no further charge — the ledger must
 		// still advance or every later turn would mismatch.
 		p.settled += settled
-		return "", Usage{}, fmt.Errorf("kernel result: %w", err)
+		return "", Usage{}, RouteInfo{}, 0, fmt.Errorf("kernel result: %w", err)
 	}
 	p.settled += settled
 	p.lastTain = result.Taint
 	reconciled := Usage{InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens}
 	if result.TokensUsed != p.settled || !bytes.Equal(result.Data, []byte(text)) {
-		return "", Usage{}, fmt.Errorf("kernel reconciliation mismatch: used=%d expected=%d",
+		return "", Usage{}, RouteInfo{}, 0, fmt.Errorf("kernel reconciliation mismatch: used=%d expected=%d",
 			result.TokensUsed, p.settled)
 	}
-	return text, reconciled, nil
+	return text, reconciled, route, result.Taint | taint, nil
 }

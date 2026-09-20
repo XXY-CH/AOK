@@ -492,13 +492,32 @@ func (s *Supervisor) executeTurn(ctx context.Context, provider Provider, id stri
 		if err == nil {
 			if err = json.Unmarshal(m.Payload, &p); err == nil {
 				turnCtx, cancel := context.WithTimeout(WithRouteBackends(ctx, policy.Backends), 2*time.Minute)
-				text, usage, err = provider.Complete(turnCtx, p.Text)
+				// Tracked providers carry route and taint with the turn;
+				// latest-wins getters would misattribute under parallel
+				// execution. Untracked providers keep the legacy fold.
+				var kernelTaint uint64
+				if tracked, ok := provider.(TrackedProvider); ok {
+					text, usage, route, kernelTaint, err = tracked.CompleteTracked(turnCtx, p.Text)
+				} else {
+					text, usage, err = provider.Complete(turnCtx, p.Text)
+					if tainted, ok := provider.(interface{ LastTaint() uint64 }); ok && err == nil {
+						kernelTaint = tainted.LastTaint()
+					}
+				}
 				cancel()
+				if err == nil && kernelTaint != 0 {
+					s.foldTaint(id, kernelTaint)
+				}
 			}
 		}
-		if tracker, ok := provider.(interface{ LastRoute() RouteInfo }); ok && err == nil {
-			route = tracker.LastRoute()
+	}
+	// A busy single-slot provider never saw the prompt: requeue without a
+	// failure so the turn retries when the slot frees.
+	if errors.Is(err, ErrTurnBusy) {
+		if requeueErr := s.requeueClaim(id, m.MessageID); requeueErr != nil {
+			return requeueErr
 		}
+		return nil
 	}
 	if ctx.Err() != nil {
 		if requeueErr := s.requeueClaim(id, m.MessageID); requeueErr != nil {
@@ -506,14 +525,6 @@ func (s *Supervisor) executeTurn(ctx context.Context, provider Provider, id stri
 		}
 		return nil
 	} // Recovery requeues the unacknowledged claim.
-	// Kernel inference reports the session taint with each result;
-	// fold it into the application's dataflow ledger so the export
-	// gate sees kernel-side labels too.
-	if err == nil && !prepared {
-		if tainted, ok := provider.(interface{ LastTaint() uint64 }); ok {
-			s.foldTaint(id, tainted.LastTaint())
-		}
-	}
 	if err = s.finishTurn(id, m, text, usage, route, err); err != nil {
 		if requeueErr := s.requeueClaim(id, m.MessageID); requeueErr != nil {
 			return fmt.Errorf("%w (requeue failed: %v)", err, requeueErr)

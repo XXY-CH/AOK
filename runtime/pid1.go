@@ -63,9 +63,14 @@ func RunInit(ctx context.Context, config InitConfig) error {
 		starts = append(starts, now)
 		cmd := exec.Command(config.Supervisor, config.SupervisorArgs...)
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+		// The environment is always explicit: inherited variables plus the
+		// configured entries, so probe configuration cannot silently
+		// disappear when this kernel has no AOK root capability to hand
+		// over.
+		cmd.Env = os.Environ()
 		if kernelRoot != nil {
 			cmd.ExtraFiles = []*os.File{kernelRoot}
-			cmd.Env = append(os.Environ(), "AOK_ROOT_FD=3")
+			cmd.Env = append(cmd.Env, "AOK_ROOT_FD=3")
 		}
 		if len(config.SupervisorEnv) > 0 {
 			cmd.Env = append(cmd.Env, config.SupervisorEnv...)

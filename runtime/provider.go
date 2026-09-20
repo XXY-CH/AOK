@@ -1,6 +1,9 @@
 package runtime
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 type Usage struct {
 	InputTokens  uint64 `json:"input_tokens"`
@@ -11,6 +14,20 @@ type Usage struct {
 type Provider interface {
 	Name() string
 	Complete(context.Context, string) (text string, usage Usage, err error)
+}
+
+// ErrTurnBusy marks a turn that was not attempted because the provider's
+// single execution slot was occupied. The runner requeues the message
+// without counting a failure: the engine never saw the prompt.
+var ErrTurnBusy = errors.New("provider busy, turn not attempted")
+
+// TrackedProvider carries the per-turn routing decision and kernel taint
+// with the call that produced them. Concurrent turns share one provider, so
+// post-hoc getters (LastRoute/LastTaint) can only report the most recent
+// turn — under parallel execution they misattribute. Providers that track
+// per-turn state implement this instead.
+type TrackedProvider interface {
+	CompleteTracked(ctx context.Context, prompt string) (text string, usage Usage, route RouteInfo, taint uint64, err error)
 }
 
 // EchoProvider is deterministic and offline; it is used for protocol tests and

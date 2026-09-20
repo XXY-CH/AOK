@@ -98,14 +98,20 @@ func TestTaintGateHonorsExportMask(t *testing.T) {
 }
 
 // A provider that reports kernel-style session taint: the runner must fold
-// it into the application ledger, and the export gate must then block.
+// it into the application ledger, and the export gate must then block. The
+// taint travels with the call (TrackedProvider); latest-wins getters only
+// work for serial execution.
 type taintedEcho struct{ taint uint64 }
 
 func (p *taintedEcho) Name() string { return "tainted-echo" }
 func (p *taintedEcho) Complete(ctx context.Context, prompt string) (string, Usage, error) {
-	return prompt, Usage{InputTokens: uint64(len(prompt)), OutputTokens: uint64(len(prompt))}, nil
+	text, usage, _, _, err := p.CompleteTracked(ctx, prompt)
+	return text, usage, err
 }
-func (p *taintedEcho) LastTaint() uint64 { return p.taint }
+func (p *taintedEcho) CompleteTracked(ctx context.Context, prompt string) (string, Usage, RouteInfo, uint64, error) {
+	return prompt, Usage{InputTokens: uint64(len(prompt)), OutputTokens: uint64(len(prompt))},
+		RouteInfo{Provider: p.Name()}, p.taint, nil
+}
 
 func TestProviderTaintFlowsToExportGate(t *testing.T) {
 	s := newKernelTestSupervisor(t)

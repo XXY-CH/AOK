@@ -46,7 +46,12 @@ guest 尚无关机路径（vsock 控制面属后续切片），由 harness 在�
 - `aok_kernel_infer=1`：向 supervisor 追加 `-kernel-infer`；
 - `aok_boot_probe=turn`：设置 `AOK_BOOT_PROBE=turn`，supervisor 就绪后经 control
   socket 驱动一个完整 turn（create/send/result/audit），失败打印
-  `AOK_BOOT_TURN=fail` 并退出交由 PID1 重启策略暴露。
+  `AOK_BOOT_TURN=fail` 并退出。initramfs 内 aok-init 未启用 `-restart`，故探测
+  失败最终表现为 PID1 退出与内核 `Attempted to kill init` panic——测试按 guest
+  fault 计失败（比静默降级更响亮，但不是重启恢复路径）。
+
+边界：0006 会话 `data` 上限 512 字节（`AOK_CORE_DATA_MAX`），kernel-infer 路径
+的提示词超过该长度时 turn 直接失败；真实调研长度提示词需要 ABI 分段，属后续。
 
 验收串口标记：`AOK_KERNEL_INFER=on provider=kernel-infer/echo`、
 `AOK_BOOT_TURN=pass provider=kernel-infer/echo input_tokens=19 checkpoint=<hash>`、

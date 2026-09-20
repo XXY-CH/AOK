@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -126,5 +128,72 @@ func TestForkApplicationInheritsTaint(t *testing.T) {
 	}
 	if _, err = s.ForkApplication("admin", "missing", "research", "on_event"); !errors.Is(err, ErrApplicationNotFound) {
 		t.Fatalf("missing parent: %v", err)
+	}
+}
+
+// TestForkControlPlane exercises the wire-level param names and the shared
+// evidence the smoke relies on.
+func TestForkControlPlane(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "aok-fork-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	s := supervisorForTest(t, filepath.Join(dir, "state"))
+	path := filepath.Join(dir, "control.sock")
+	l, err := NewControlListener(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- (&ControlServer{Supervisor: s, Listener: l}).Serve(ctx) }()
+	c, err := DialControl(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	var parent Application
+	if err = c.Call(ctx, "application.create", map[string]any{"owner_agent": "planner"}, &parent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Enqueue("admin", parent.ApplicationID, "plan", json.RawMessage(`{"text":"shared plan"}`)); err != nil {
+		t.Fatal(err)
+	}
+	id, m, err := s.claimTurn()
+	if err != nil || id != parent.ApplicationID {
+		t.Fatalf("claim: %v %v", id, err)
+	}
+	if err = s.executeTurn(context.Background(), EchoProvider{}, id, m); err != nil {
+		t.Fatal(err)
+	}
+	var child Application
+	if err = c.Call(ctx, "application.fork", map[string]any{
+		"parent_application_id": parent.ApplicationID,
+		"owner_agent":           "research",
+		"wake_policy":           "on_event",
+	}, &child); err != nil {
+		t.Fatal(err)
+	}
+	if child.ForkParent != parent.ApplicationID {
+		t.Fatalf("fork parent missing on the wire: %+v", child)
+	}
+	var pages struct {
+		Pages []string `json:"pages"`
+		Tail  string   `json:"tail"`
+	}
+	if err = c.Call(ctx, "context.pages", map[string]string{"application_id": parent.ApplicationID}, &pages); err != nil {
+		t.Fatal(err)
+	}
+	if len(pages.Pages) == 0 || pages.Pages[0] == "" {
+		t.Fatalf("no page hashes on the wire: %+v", pages)
+	}
+	if err = c.Call(ctx, "context.pages", map[string]string{"application_id": "missing"}, &pages); err == nil {
+		t.Fatal("missing application accepted")
+	}
+	cancel()
+	if err = <-done; err != nil {
+		t.Fatal(err)
 	}
 }

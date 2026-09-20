@@ -473,7 +473,8 @@ func (s *Supervisor) ForkApplication(principal, parentID, owner, wake string) (A
 
 // ContextPages exposes a context's sealed page hashes and tail hash so
 // control-plane callers can verify copy-on-write sharing between forked
-// applications.
+// applications. A missing application is the only expected caller error;
+// anything else is an internal contexts-store failure.
 func (s *Supervisor) ContextPages(id string) (pages []string, tail string, err error) {
 	s.mu.Lock()
 	a, ok := s.state.Applications[id]
@@ -481,7 +482,27 @@ func (s *Supervisor) ContextPages(id string) (pages []string, tail string, err e
 	if !ok {
 		return nil, "", ErrApplicationNotFound
 	}
-	return s.contexts.Pages(a.OwnerAgent, a.ContextID)
+	pages, tail, err = s.contexts.Pages(a.OwnerAgent, a.ContextID)
+	if err != nil {
+		return nil, "", err
+	}
+	if pages == nil {
+		pages = []string{}
+	}
+	return pages, tail, nil
+}
+
+// AuditContextPages records a context.pages read in the audit chain: page
+// hashes are capability-adjacent metadata (they prove content sharing), so
+// enumeration is an audited action like export.
+func (s *Supervisor) AuditContextPages(principal, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.Applications[id]; !ok {
+		return ErrApplicationNotFound
+	}
+	_ = s.auditLocked(principal, id, "context.pages", id, "allow", "")
+	return s.persistLocked(nil)
 }
 
 // SetTurnConcurrency bounds how many turns may execute at once. One keeps

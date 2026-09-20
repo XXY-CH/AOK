@@ -73,6 +73,18 @@ func WithRouteBackends(ctx context.Context, backends []string) context.Context {
 }
 
 func (r *RouterProvider) Complete(ctx context.Context, prompt string) (string, Usage, error) {
+	text, usage, _, _, err := r.completeRouted(ctx, prompt)
+	return text, usage, err
+}
+
+// CompleteTracked returns the routing decision with the turn it belongs to:
+// under parallel execution the latest-wins LastRoute getter would attribute
+// another turn's route to this one.
+func (r *RouterProvider) CompleteTracked(ctx context.Context, prompt string) (string, Usage, RouteInfo, uint64, error) {
+	return r.completeRouted(ctx, prompt)
+}
+
+func (r *RouterProvider) completeRouted(ctx context.Context, prompt string) (string, Usage, RouteInfo, uint64, error) {
 	var failures []string
 	allowed, _ := ctx.Value(routeBackendsKey{}).([]string)
 	candidates := r.providers
@@ -90,20 +102,21 @@ func (r *RouterProvider) Complete(ctx context.Context, prompt string) (string, U
 	}
 	for _, provider := range candidates {
 		if err := ctx.Err(); err != nil {
-			return "", Usage{}, err
+			return "", Usage{}, RouteInfo{}, 0, err
 		}
 		text, usage, err := provider.Complete(ctx, prompt)
 		if err == nil {
-			r.mu.Lock()
-			// Policy-skipped providers are not attempts; only real
-			// failures count as fallbacks.
-			r.last = RouteInfo{Provider: provider.Name(),
+			route := RouteInfo{Provider: provider.Name(),
+				// Policy-skipped providers are not attempts; only real
+				// failures count as fallbacks.
 				Fallbacks: uint32(len(failures)), CompatKey: compatKeyOf(provider)}
+			r.mu.Lock()
+			r.last = route
 			r.mu.Unlock()
-			return text, usage, nil
+			return text, usage, route, 0, nil
 		}
 		if ctx.Err() != nil {
-			return "", Usage{}, ctx.Err()
+			return "", Usage{}, RouteInfo{}, 0, ctx.Err()
 		}
 		failures = append(failures, provider.Name()+": "+err.Error())
 	}
@@ -111,9 +124,9 @@ func (r *RouterProvider) Complete(ctx context.Context, prompt string) (string, U
 	r.last = RouteInfo{}
 	r.mu.Unlock()
 	if len(failures) == 0 {
-		return "", Usage{}, errors.New("route policy excludes every backend")
+		return "", Usage{}, RouteInfo{}, 0, errors.New("route policy excludes every backend")
 	}
-	return "", Usage{}, errors.New("all routed providers failed: " + strings.Join(failures, "; "))
+	return "", Usage{}, RouteInfo{}, 0, errors.New("all routed providers failed: " + strings.Join(failures, "; "))
 }
 
 func containsString(list []string, value string) bool {

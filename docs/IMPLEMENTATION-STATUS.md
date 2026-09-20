@@ -207,8 +207,10 @@
   `AOK_KERNEL_INFER=on provider=kernel-infer/echo`、
   `AOK_BOOT_TURN=pass provider=kernel-infer/echo input_tokens=19 checkpoint=<hash>`、
   READY 恰一次、串口干净（`kernel/.build/aok-initramfs/serial-initfs-turn.log`）。
-  kernel-infer capability 单一（per-turn 会话互斥）；同 fd 多后端切换、vsock 心跳与
-  多 slot 联合验收仍未做。
+  kernel-infer capability 单一：并发 turn 下第二个会话立即返回 busy 并由 runner
+  重排队（不计失败、不烧 turn 时限）。同 fd 多后端切换与 vsock 心跳仍未做；
+  0006 `AOK_CORE_DATA_MAX=512` 使该路径提示词上限 512 字节，真实长度需 ABI 分段
+  （属后续）。
 - 2026-09-20 P1/P5 切片：COW fan-out 接线——控制面 `application.fork` 封存父应用
   上下文 tail，子应用（可跨 owner）引用同一 CAS 页，继承污点台账并独立预算/邮箱，
   审计 `application.fork`；`context.pages` 返回封存页与 tail 哈希作共享证据。
@@ -216,14 +218,30 @@
   `TestForkApplicationInheritsTaint`（含退休父拒绝）。mvp_flow 的 researchers 改经
   fork 创建，receipt 记录 `cow_shared_pages`；echo 与真实 llama smoke 实测
   `[1, 1, 1]`。提示词组合仍是文本重放（planner 输出内联），内核 amem 语义的
-  COW 不在本切片。
+  COW 不在本切片。审阅边界：persist 失败时子上下文行可能成为孤儿（与
+  application.create 同型，恢复期无 GC）；跨 owner fork 在当前单 principal 本地
+  控制面（socket 0600）下不做额外授权决策，`context.pages` 枚举已入审计——多
+  principal 语义引入前须补 fork 授权门。
 - 2026-09-20 P5 切片：runner 有界并行——`SetTurnConcurrency`/`-parallel-turns N`
   （1..64，默认 1 保持串行语义）并发执行已认领 turn；认领排序、VTC 公平、节流带
   与每应用单飞（一次最多一个 in-flight turn）不变，in-flight 不落盘（重启由
   load() 重置 claimed 消息承接）。回归 `TestRunnerParallelTurnsFansOut`（三应用
   barrier 同时进入）、`TestRunnerParallelSingleFlightPerApplication`（同应用
   max concurrent == 1）。mvp-research.sh 自建 supervisor 默认
-  `-parallel-turns 3`。llama 多 slot 联合测量与后端侧并行仍未做。
+  `-parallel-turns 3`。独立审阅修复：per-turn 路由与内核污点改经
+  `TrackedProvider.CompleteTracked` 随调用返回（`LastRoute`/`LastTaint` 的
+  latest-wins 读取在并行下会张冠李戴）；kernel-infer 单 slot 占用时返回
+  `ErrTurnBusy`，runner 重排队且不计失败。回归
+  `TestRunnerParallelTurnsBounded`（并发上界）、
+  `TestRunnerParallelTrackedAttribution`（并行下逐 turn 路由归属）、
+  `TestRunnerBusyTurnRequeuesWithoutFailure`。
+- 2026-09-20 P2 切片：多 slot 联合测量——`make runtime-mvp-multislot-smoke`
+  （`runtime/scripts/mvp-multislot-smoke.py`）：llama-server `-np 4 -cb` +
+  supervisor `-parallel-turns 4`，轮询 `/slots` 断言后端同时处理 ≥2 slot。
+  实测 `max_busy_slots=4`、4 turn 批次 164ms 对单条 79ms（串行下界约 316ms，
+  仅报告不作断言）、无 deny；多 slot 下 KV 命中率为逐 slot 行为（0.93/0.93/0/0），
+  不作断言。supervisor 侧并发语义由 Go 回归覆盖。见
+  [RUNTIME-MULTISLOT-VALIDATION.md](RUNTIME-MULTISLOT-VALIDATION.md)。
 - 2026-09-20 P3 切片：manifest→launcher 编译器——`sandbox.Compile` 把 manifest 的
   fs/net/tools 编译为 Landlock+seccomp launcher 计划：路径规则仅接受绝对路径加
   可选 `/**`、禁空白，网络默认拒绝（无 `--net` 时 launcher 保持 socket 过滤），
@@ -245,7 +263,7 @@
 - `kernel/linux` 保持干净的上游基线；AOK 代码位于外层 patch，构建时应用到独立源码目录。
 - 本机 QEMU 构建没有 virtio-vsock device model，当前只完成内核配置检查，未完成 guest↔host
   vsock 心跳；该项转移到 Apple Container 或支持 vsock 的 Linux/QEMU runner。P2 的 guest
-  全栈启动已验收；节流→freeze 渐进降级与前缀命中率/亲和已有实现与证据，cache 亲和
-  spawn（spawn 期放置决策）与多 slot 联合测量尚未实现。
+  全栈启动已验收；节流→freeze 渐进降级与前缀命中率/亲和已有实现与证据，多 slot 联合
+  测量已有 smoke 证据（2026-09-20）；cache 亲和 spawn（spawn 期放置决策）尚未实现。
 - 本机已安装 QEMU 11.1.1，可运行 guest 测试；macOS 系统 GNU Make 为 3.81，内核编译和
   `make kernel-config-probe` 仍使用 Linux builder。

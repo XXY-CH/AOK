@@ -230,14 +230,22 @@ func runBootProbe(ctx context.Context, socket, expectProviderPrefix string) erro
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	if result.Status != "completed" || result.Text != prompt || result.Usage.InputTokens != uint64(len(prompt)) {
+	if result.Status != "completed" || result.Text == "" || result.Usage.InputTokens == 0 || result.Checkpoint == "" {
 		return fmt.Errorf("unexpected turn result: %+v", result)
 	}
-	if !strings.HasPrefix(result.Provider, expectProviderPrefix) {
-		return fmt.Errorf("turn provider %q does not run through %q", result.Provider, expectProviderPrefix)
+	// Exact echo semantics are only checkable on the deterministic engine;
+	// real engines keep the structural checks above. A router records the
+	// serving backend as the provider, so the name check is family-scoped.
+	if strings.Contains(expectProviderPrefix, "echo") {
+		if result.Text != prompt || result.Usage.InputTokens != uint64(len(prompt)) {
+			return fmt.Errorf("echo engine broke deterministic contract: %+v", result)
+		}
+		if !strings.HasPrefix(result.Provider, expectProviderPrefix) {
+			return fmt.Errorf("turn provider %q does not run through %q", result.Provider, expectProviderPrefix)
+		}
 	}
-	if result.Checkpoint == "" {
-		return fmt.Errorf("turn committed no checkpoint")
+	if result.Provider == "" {
+		return fmt.Errorf("turn recorded no provider")
 	}
 	var audit []aok.AuditRecord
 	if err = client.Call(ctx, "audit.list", map[string]string{}, &audit); err != nil {

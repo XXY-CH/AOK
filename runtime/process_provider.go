@@ -129,7 +129,11 @@ func (p *ProcessProvider) startLocked(ctx context.Context) error {
 	command := p.config.Command
 	if p.config.SandboxLauncher != "" {
 		pol := p.config.SandboxPolicy
-		pol.KeepFD = []int{3}
+		// The delegated engine listener is always descriptor 3 (the single
+		// ExtraFile); an explicit policy keeps its own delegation.
+		if len(pol.KeepFD) == 0 {
+			pol.KeepFD = []int{3}
+		}
 		args, err = pol.Args(append([]string{command}, args...))
 		if err != nil {
 			lf.Close()

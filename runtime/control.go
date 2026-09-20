@@ -156,10 +156,15 @@ func (s *ControlServer) handle(req Message, principal string) Message {
 	case "context.pages":
 		pages, tail, err := s.Supervisor.ContextPages(p.ApplicationID)
 		if err != nil {
-			resp.Error = &RPCError{Code: -32004, Message: err.Error()}
-		} else {
-			resp.Result, _ = json.Marshal(map[string]any{"application_id": p.ApplicationID, "pages": pages, "tail": tail})
+			code := -32000
+			if errors.Is(err, ErrApplicationNotFound) {
+				code = -32004
+			}
+			resp.Error = &RPCError{Code: code, Message: err.Error()}
+			break
 		}
+		_ = s.Supervisor.AuditContextPages(p.Principal, p.ApplicationID)
+		resp.Result, _ = json.Marshal(map[string]any{"application_id": p.ApplicationID, "pages": pages, "tail": tail})
 	case "application.inspect":
 		a, err := s.Supervisor.InspectApplication(p.ApplicationID)
 		if err != nil {
