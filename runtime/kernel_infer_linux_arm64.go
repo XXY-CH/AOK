@@ -6,10 +6,50 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
+	"strconv"
 	"sync"
 
 	"aok/runtime/kernelbridge"
 )
+
+// openKernelInferRoot returns the boot root capability for the inference
+// device. The claim is one-shot and owned by PID1, so the production
+// supervisor only accepts a descriptor handed over via AOK_ROOT_FD; a
+// derived probe capability proves the descriptor before use.
+func openKernelInferRoot() (*kernelbridge.Root, error) {
+	fd := os.Getenv("AOK_ROOT_FD")
+	if fd == "" {
+		return nil, fmt.Errorf("kernel infer requires AOK_ROOT_FD from PID1")
+	}
+	number, err := strconv.Atoi(fd)
+	if err != nil || number < 0 {
+		return nil, kernelbridge.ErrUnsupported
+	}
+	file := os.NewFile(uintptr(number), "aok-root")
+	if file == nil {
+		return nil, kernelbridge.ErrUnsupported
+	}
+	root := kernelbridge.RootFromFile(file)
+	probe, err := root.Create(kernelbridge.CapabilitySpec{Rights: kernelbridge.Infer, TokenLimit: 1})
+	if err != nil {
+		return nil, err
+	}
+	_ = probe.Close()
+	return root, nil
+}
+
+// WrapKernelInferProvider wraps a production provider with the kernel
+// inference device: every turn runs through a kernel session with kernel
+// reservation, settlement and revocation. Off the AOK kernel it fails
+// loudly instead of silently bypassing the device.
+func WrapKernelInferProvider(inner Provider, tokenLimit, maxOutputTokens uint64) (Provider, error) {
+	root, err := openKernelInferRoot()
+	if err != nil {
+		return nil, err
+	}
+	return NewKernelInferProvider(root, inner, tokenLimit, maxOutputTokens)
+}
 
 // KernelInferProvider runs every supervisor turn through the kernel
 // inference ABI (patch 0006): the prompt is submitted as a client session,

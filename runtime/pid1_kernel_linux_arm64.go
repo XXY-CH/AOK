@@ -10,6 +10,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// PrepareInitKernel mounts /proc when running as guest PID1 so kernel
+// configuration (boot identity, command line) is readable. It is idempotent
+// and a no-op off the init seat; RunInit calls it again before spawning.
+func PrepareInitKernel() error { return prepareInitKernel() }
+
 func prepareInitKernel() error {
 	if os.Getpid() != 1 {
 		return nil

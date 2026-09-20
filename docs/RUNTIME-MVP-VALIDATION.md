@@ -7,8 +7,10 @@
 
 ```text
 planner 生成 N 个研究方向
-→ 完整 plan 文本和分工编号传给独立创建的 researcher applications
-→ 多条消息入队，runner 按 token 台账和前缀亲和逐 turn 串行执行
+→ 完整 plan 文本和分工编号传给经 application.fork 创建的 researcher applications
+   （COW：子上下文引用 planner 封存 CAS 页，receipt 记录 cow_shared_pages）
+→ 多条消息入队，runner 按 token 台账和前缀亲和认领，self-built supervisor 以
+   `-parallel-turns 3`（AOK_MVP_PARALLEL 可调）并发执行 turn；每应用单飞
 → researcher 实际输出传给 aggregator，由 provider 生成报告
 → context checkpoint + report.txt + receipt.json
 ```
@@ -51,7 +53,9 @@ AOK_MVP_MIXED=pass scope=single_backend full_flow=pass backend=llama.cpp rates=[
 
 ## 未满足的原始要求
 
-尚无 ash 入口、COW researcher、三后端同时混合、并行推理、工具调用、port 回传、
-完整 kernel amem/LSFS/fsd 和 `/proc` 调度统计。当前 checkpoint 是用户态 CAS/SQLite，
+尚无 ash 入口、三后端同时混合、工具调用、port 回传、
+完整 kernel amem/LSFS/fsd 和 `/proc` 调度统计。COW 已在用户态 context 层实现
+（提示词组合仍是文本重放，内核 amem 语义 COW 未实现）；并行是 supervisor 侧
+turn 并发（每应用单飞），多 slot 后端侧并行未验证。当前 checkpoint 是用户态 CAS/SQLite，
 结果通过 control UDS 的 `message.result` 轮询收集。token 台账尚不足以证明 VTC 公平性；
 happy path 没有 deny 也不能替代主动越权测试和内核强制边界验收。

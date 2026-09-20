@@ -90,10 +90,11 @@ func (s *ControlServer) serveConnection(ctx context.Context, conn net.Conn) {
 func (s *ControlServer) handle(req Message, principal string) Message {
 	resp := Message{JSONRPC: "2.0", ID: req.ID}
 	var p struct {
-		Principal     string          `json:"principal"`
-		ApplicationID string          `json:"application_id"`
-		OwnerAgent    string          `json:"owner_agent"`
-		WakePolicy    string          `json:"wake_policy"`
+		Principal           string          `json:"principal"`
+		ApplicationID       string          `json:"application_id"`
+		ParentApplicationID string          `json:"parent_application_id"`
+		OwnerAgent          string          `json:"owner_agent"`
+		WakePolicy          string          `json:"wake_policy"`
 		Key           string          `json:"idempotency_key"`
 		Payload       json.RawMessage `json:"payload"`
 		MessageID     string          `json:"message_id"`
@@ -140,6 +141,24 @@ func (s *ControlServer) handle(req Message, principal string) Message {
 			resp.Error = &RPCError{Code: -32000, Message: err.Error()}
 		} else {
 			resp.Result, _ = json.Marshal(a)
+		}
+	case "application.fork":
+		a, err := s.Supervisor.ForkApplication(p.Principal, p.ParentApplicationID, p.OwnerAgent, p.WakePolicy)
+		if err != nil {
+			code := -32000
+			if errors.Is(err, ErrApplicationNotFound) || errors.Is(err, ErrApplicationRetired) {
+				code = -32004
+			}
+			resp.Error = &RPCError{Code: code, Message: err.Error()}
+		} else {
+			resp.Result, _ = json.Marshal(a)
+		}
+	case "context.pages":
+		pages, tail, err := s.Supervisor.ContextPages(p.ApplicationID)
+		if err != nil {
+			resp.Error = &RPCError{Code: -32004, Message: err.Error()}
+		} else {
+			resp.Result, _ = json.Marshal(map[string]any{"application_id": p.ApplicationID, "pages": pages, "tail": tail})
 		}
 	case "application.inspect":
 		a, err := s.Supervisor.InspectApplication(p.ApplicationID)

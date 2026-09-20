@@ -80,9 +80,8 @@
   把每个 turn 放入 0006 会话（预留/实报/对账/EDQUOT 全内核强制；Cancel/失败完成按
   全额预留计费并保持对账），event probe 在真实内核上验证短 turn 结算、取消后对账
   不发散与超预算 fail-closed，见
-  [AOK-CORE-VALIDATION.md](AOK-CORE-VALIDATION.md) 追加节。生产 supervisor 的
-  engine 开关尚未接入 kernel-infer，当前证据范围是 probe 内以真实 supervisor 栈
-  运行。
+  [AOK-CORE-VALIDATION.md](AOK-CORE-VALIDATION.md) 追加节。生产接线见下方
+  2026-09-20 条目。
 - 2026-09-19 P2 切片：router 记录每 turn 的 provider/fallbacks/compat key 并按
   后端回报分类 cache_hit_kind（kv_exact/prefix_replay/text_replay）；调度带前缀
   亲和（公平带内优先共享前缀的 turn）。真实 llama 证明：无干扰命中 87/88，且在
@@ -154,11 +153,12 @@
   WebExecute 在应用校验前触网，已补修复与回归；旧的“全部安全目标正确”结论撤回。
 - 2026-09-20 P5 首证据：MVP 多应用调研队列（echo 后端）——`make runtime-mvp-smoke`
   以真实 supervisor 控制面驱动 planner → 3 researchers（VTC 排序 + 前缀亲和）→
-  aggregator 报告 checkpoint 落盘，审计与命中率/token 台账可复算；runner 当前串行执行，
+  aggregator 报告 checkpoint 落盘，审计与命中率/token 台账可复算；runner 彼时串行执行，
   echo 只验证数据流，不验证报告质量或并行公平性。
   输出归档 `kernel/.build/smoke-logs/runtime-mvp.log`。见
   [RUNTIME-MVP-VALIDATION.md](RUNTIME-MVP-VALIDATION.md)。三后端混合编排、
-  COW researchers、工具调用、port 回传、完整 LSFS、/proc 观测与 ash 入口属后续。
+  工具调用、port 回传、完整 LSFS、/proc 观测与 ash 入口属后续；COW 与并行见下方
+  2026-09-20 条目。
 - 2026-09-19 P4 独立审查修复：网关回复按**来源会话**路由（多会话应用不再随机
   误投/跨 principal 泄漏）、入站信封展平 text 字段（runner 真正读到正文）并**强制
   external taint**（网关入口不再绕过污点台账）、重绑保留游标（无重放窗口）；web
@@ -197,11 +197,45 @@
   `application.export` 以 `-32007` 返回 pending。
 - 2026-09-20 修复：撤销注册表到达 1024 条时明确拒绝新增，不再逐出有效撤销；
   router 遵循应用指定顺序；内核事件按 boot 分域，回滚恢复所有可选 map 与来源索引。
+- 2026-09-20 P2 收口：生产 supervisor engine 路径接入 kernel ainf——`-kernel-infer`
+  开关把所选 provider（含 router）包入 `KernelInferProvider`，root 仅接受 PID1 经
+  `AOK_ROOT_FD` 移交的描述符，不支持平台显式报错而非静默绕过。新增
+  `make aok-initfs-turn-test`（`runtime/scripts/initfs-turn-boot.sh`）：内核命令行
+  `aok_kernel_infer=1 aok_boot_probe=turn` 由 guest aok-init 解析（initramfs 无根文件
+  系统，命令行是唯一配置通道；仅此两键），supervisor 生产入口以 echo 引擎经真实
+  0006 设备完成一个完整 turn，串口证据
+  `AOK_KERNEL_INFER=on provider=kernel-infer/echo`、
+  `AOK_BOOT_TURN=pass provider=kernel-infer/echo input_tokens=19 checkpoint=<hash>`、
+  READY 恰一次、串口干净（`kernel/.build/aok-initramfs/serial-initfs-turn.log`）。
+  kernel-infer capability 单一（per-turn 会话互斥）；同 fd 多后端切换、vsock 心跳与
+  多 slot 联合验收仍未做。
+- 2026-09-20 P1/P5 切片：COW fan-out 接线——控制面 `application.fork` 封存父应用
+  上下文 tail，子应用（可跨 owner）引用同一 CAS 页，继承污点台账并独立预算/邮箱，
+  审计 `application.fork`；`context.pages` 返回封存页与 tail 哈希作共享证据。
+  回归 `TestForkApplicationSharesContextPages`（fork 后页相同、子 turn 后父不变）、
+  `TestForkApplicationInheritsTaint`（含退休父拒绝）。mvp_flow 的 researchers 改经
+  fork 创建，receipt 记录 `cow_shared_pages`；echo 与真实 llama smoke 实测
+  `[1, 1, 1]`。提示词组合仍是文本重放（planner 输出内联），内核 amem 语义的
+  COW 不在本切片。
+- 2026-09-20 P5 切片：runner 有界并行——`SetTurnConcurrency`/`-parallel-turns N`
+  （1..64，默认 1 保持串行语义）并发执行已认领 turn；认领排序、VTC 公平、节流带
+  与每应用单飞（一次最多一个 in-flight turn）不变，in-flight 不落盘（重启由
+  load() 重置 claimed 消息承接）。回归 `TestRunnerParallelTurnsFansOut`（三应用
+  barrier 同时进入）、`TestRunnerParallelSingleFlightPerApplication`（同应用
+  max concurrent == 1）。mvp-research.sh 自建 supervisor 默认
+  `-parallel-turns 3`。llama 多 slot 联合测量与后端侧并行仍未做。
+- 2026-09-20 P3 切片：manifest→launcher 编译器——`sandbox.Compile` 把 manifest 的
+  fs/net/tools 编译为 Landlock+seccomp launcher 计划：路径规则仅接受绝对路径加
+  可选 `/**`、禁空白，网络默认拒绝（无 `--net` 时 launcher 保持 socket 过滤），
+  tools 声明不编译为 execute 规则，launcher 与引擎命令必须绝对路径。编译器为
+  aok-supervisor `-engine-command` 路径的生产入口；guest 内端到端强制与 unotify、
+  acapd 仍属后续。
 
 ## 尚未完成
 
-- 内核 amem/LSFS 存储、sched_ext Agent 调度仍未实现；ainf 已有内核 0006 + probe 闭环，
-  生产 supervisor 尚未接入 KernelInferProvider。Web fetch/document、HostFS 授权与传输数据模型、
+- 内核 amem/LSFS 存储、sched_ext Agent 调度仍未实现；ainf 已有内核 0006 + probe
+  闭环，生产 supervisor 已接入 KernelInferProvider（2026-09-20，见上），同 fd 多后端
+  切换与多 slot 联合验收未做。Web fetch/document、HostFS 授权与传输数据模型、
   消息 gateway 队列已有用户态实现，但完整控制面、协议适配器和真实外部 transport 未齐备。
   `0009` 的 wake target 仍是 source 私有，dormant aproc 创建与
   `ON_QUIESCENT` 语义不完整；内核 registry 不落盘，跨 VM 持久性由 supervisor snapshot

@@ -56,7 +56,7 @@ else
     (cd "$repo/runtime" && go build -o "$work/supervisor" ./cmd/aok-supervisor)
     printf 'engine: echo\ncapabilities:\n  net: false\n' > "$output/manifest.yaml"
     "$work/supervisor" -state "$output/state" -manifest "$output/manifest.yaml" \
-        -max-tokens 64 >"$output/supervisor.log" 2>&1 &
+        -max-tokens 64 -parallel-turns "${AOK_MVP_PARALLEL:-3}" >"$output/supervisor.log" 2>&1 &
     spid=$!
     sock="$output/state/control.sock"
     i=0

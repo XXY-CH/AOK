@@ -51,7 +51,10 @@ def run_flow(client, jobs, question):
 
     research_ids, messages = [], []
     for i in range(jobs):
-        app = call("application.create", {"owner_agent": "research", "wake_policy": "on_event"})
+        # COW fan-out: each researcher context shares the planner's sealed
+        # CAS pages and diverges only after its own turn.
+        app = call("application.fork", {"parent_application_id": pid,
+                                        "owner_agent": "research", "wake_policy": "on_event"})
         aid = app["application_id"]
         research_ids.append(aid)
         prompt = (brief + "\nPlanner output:\n" + plan["text"] +
@@ -62,6 +65,18 @@ def run_flow(client, jobs, question):
         messages.append(sent["message_id"])
     results = [wait_result(aid, mid) for aid, mid in zip(research_ids, messages)]
     assert all(r["status"] == "completed" and r["text"].strip() for r in results), results
+
+    parent_pages = call("context.pages", {"application_id": pid})["pages"]
+    shared_pages = []
+    for aid in research_ids:
+        child_pages = call("context.pages", {"application_id": aid})["pages"]
+        shared = 0
+        for parent_hash, child_hash in zip(parent_pages, child_pages):
+            if parent_hash != child_hash:
+                break
+            shared += 1
+        assert shared >= 1, f"researcher context shares no page with the planner: {aid}"
+        shared_pages.append(shared)
 
     aggregator = call("application.create", {"owner_agent": "aggregator", "wake_policy": "on_event"})
     agid = aggregator["application_id"]
@@ -83,6 +98,7 @@ def run_flow(client, jobs, question):
     assert not denies, f"capability denials in this run: {denies[:3]}"
     return {"question": question, "planner": plan, "researchers": results,
             "report": result, "vtc_usage": usage, "hit_rates": hit_rates,
+            "cow_shared_pages": shared_pages,
             "audit_records": len(audit), "denies": len(denies)}
 
 
@@ -103,6 +119,7 @@ def main():
     line = (f"AOK_MVP_RESEARCH=pass researchers={jobs} report={output / 'report.txt'} "
             f"receipt={output / 'receipt.json'} checkpoint={receipt['report']['checkpoint']} "
             f"vtc_usage={receipt['vtc_usage']} hit_rates={receipt['hit_rates']} "
+            f"cow_shared_pages={receipt['cow_shared_pages']} "
             f"audit_records={receipt['audit_records']} denies={receipt['denies']}")
     print(line)
     log = os.environ.get("AOK_SMOKE_LOG")

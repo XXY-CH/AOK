@@ -21,3 +21,9 @@ func (p *KernelInferProvider) Name() string { return "kernel-infer" }
 func (p *KernelInferProvider) Complete(context.Context, string) (string, Usage, error) {
 	return "", Usage{}, kernelbridge.ErrUnsupported
 }
+
+// WrapKernelInferProvider fails off the AOK kernel: a supervisor configured
+// for kernel inference must not silently bypass the device.
+func WrapKernelInferProvider(Provider, uint64, uint64) (Provider, error) {
+	return nil, kernelbridge.ErrUnsupported
+}

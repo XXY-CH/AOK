@@ -39,6 +39,20 @@ aok-init/aok-supervisor（CGO_ENABLED=0，linux/arm64 静态），`make aok-init
 
 guest 尚无关机路径（vsock 控制面属后续切片），由 harness 在验收后停止 QEMU。
 
+`make aok-initfs-turn-test`（`runtime/scripts/initfs-turn-boot.sh`）在同一 initramfs
+上追加生产 kernel-infer 验收。内核命令行是 initramfs（无根文件系统）的唯一配置
+通道，guest aok-init 仅识别两键：
+
+- `aok_kernel_infer=1`：向 supervisor 追加 `-kernel-infer`；
+- `aok_boot_probe=turn`：设置 `AOK_BOOT_PROBE=turn`，supervisor 就绪后经 control
+  socket 驱动一个完整 turn（create/send/result/audit），失败打印
+  `AOK_BOOT_TURN=fail` 并退出交由 PID1 重启策略暴露。
+
+验收串口标记：`AOK_KERNEL_INFER=on provider=kernel-infer/echo`、
+`AOK_BOOT_TURN=pass provider=kernel-infer/echo input_tokens=19 checkpoint=<hash>`、
+READY 恰一次、无 panic/WARNING。证据
+`kernel/.build/aok-initramfs/serial-initfs-turn.log`（2026-09-20 通过）。
+
 ## 尚未完成
 
 - 监督重启（supervisor 崩溃后 aok-init 重启再就绪）只有 pid1 单测覆盖，尚未在

@@ -25,22 +25,24 @@ import (
 // current AID/aproc objects; this component owns stable Application identity,
 // mailbox replay and policy/audit state across worker or VM restarts.
 type Supervisor struct {
-	mu           sync.Mutex
-	root         string
-	state        supervisorState
-	policy       CapabilitySet
-	previousHash string
-	db           *sql.DB
-	lock         *os.File
-	committed    []byte
-	contexts     *ContextStore
-	authorizer   CapabilityAuthorizer
-	kernel       KernelEventBridge
-	kernelApps   map[string]KernelApplication
-	kernelSrcs   map[string]KernelEventSource
-	lastClaim    map[string]time.Time
-	lastPrefix   string
-	sourced      map[string]string
+	mu             sync.Mutex
+	root           string
+	state          supervisorState
+	policy         CapabilitySet
+	previousHash   string
+	db             *sql.DB
+	lock           *os.File
+	committed      []byte
+	contexts       *ContextStore
+	authorizer     CapabilityAuthorizer
+	kernel         KernelEventBridge
+	kernelApps     map[string]KernelApplication
+	kernelSrcs     map[string]KernelEventSource
+	lastClaim      map[string]time.Time
+	lastPrefix     string
+	sourced        map[string]string
+	inflight       map[string]bool
+	turnConcurrency int
 }
 
 type supervisorState struct {
@@ -97,6 +99,7 @@ const maxRouteRecords = 512
 type Application struct {
 	ApplicationID   string      `json:"application_id"`
 	OwnerAgent      string      `json:"owner_agent"`
+	ForkParent      string      `json:"fork_parent,omitempty"`
 	ContractVersion uint64      `json:"contract_version"`
 	State           string      `json:"state"`
 	WakePolicy      string      `json:"wake_policy"`
@@ -179,7 +182,7 @@ func NewSupervisor(root string, policy CapabilitySet) (*Supervisor, error) {
 	policy.FSRead = append([]string(nil), policy.FSRead...)
 	policy.FSWrite = append([]string(nil), policy.FSWrite...)
 	policy.Tools = append([]string(nil), policy.Tools...)
-	s := &Supervisor{root: root, policy: policy, lastClaim: map[string]time.Time{}, sourced: map[string]string{}, state: supervisorState{Applications: map[string]*Application{}, Mailbox: map[string][]MailboxMessage{}, Bindings: map[string]WakeBinding{}}, authorizer: CapabilityAuthorizer{Policy: cedarPolicyFromCapabilitySet(policy)}}
+	s := &Supervisor{root: root, policy: policy, lastClaim: map[string]time.Time{}, sourced: map[string]string{}, inflight: map[string]bool{}, state: supervisorState{Applications: map[string]*Application{}, Mailbox: map[string][]MailboxMessage{}, Bindings: map[string]WakeBinding{}}, authorizer: CapabilityAuthorizer{Policy: cedarPolicyFromCapabilitySet(policy)}}
 	s.lock = lock
 	if err := s.load(); err != nil {
 		s.Close()
@@ -415,6 +418,84 @@ func (s *Supervisor) CreateApplication(principal, owner, wake string) (Applicati
 		return Application{}, err
 	}
 	return a, nil
+}
+
+// ForkApplication creates a child application whose context is a
+// copy-on-write fan-out of the parent's: the parent's tail is sealed and the
+// child's pages reference the same CAS blobs. The child inherits the
+// parent's taint ledger — shared content keeps its dataflow labels — and
+// gets its own budget and mailbox. Cross-owner fork is the supervisor's
+// LSFS authority decision, audited as application.fork.
+func (s *Supervisor) ForkApplication(principal, parentID, owner, wake string) (Application, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	parent, ok := s.state.Applications[parentID]
+	if !ok {
+		return Application{}, ErrApplicationNotFound
+	}
+	if parent.State == "tombstoned" {
+		return Application{}, ErrApplicationRetired
+	}
+	if owner == "" || len(owner) > 256 {
+		return Application{}, errors.New("invalid owner")
+	}
+	if wake == "" {
+		wake = "on_event"
+	}
+	if wake != "on_event" && wake != "manual" && wake != "on_quiescent" {
+		return Application{}, errors.New("invalid wake policy")
+	}
+	var idBytes [16]byte
+	if _, err := rand.Read(idBytes[:]); err != nil {
+		return Application{}, err
+	}
+	idBytes[6] = (idBytes[6] & 0x0f) | 0x40
+	idBytes[8] = (idBytes[8] & 0x3f) | 0x80
+	id := fmt.Sprintf("%x-%x-%x-%x-%x", idBytes[0:4], idBytes[4:6], idBytes[6:8], idBytes[8:10], idBytes[10:16])
+	a := Application{ApplicationID: id, OwnerAgent: owner, ForkParent: parentID, State: "serving", WakePolicy: wake, Generation: 1, CreatedAt: time.Now().UnixNano(), TaintBits: parent.TaintBits}
+	s.state.NextKernelID++
+	a.KernelID = s.state.NextKernelID
+	contextID, err := s.contexts.ForkTo(parent.OwnerAgent, parent.ContextID, owner, "fork:"+id)
+	if err != nil {
+		return Application{}, err
+	}
+	a.ContextID = contextID
+	s.state.Applications[id] = &a
+	s.state.Mailbox[id] = nil
+	if err := s.auditLocked(principal, id, "application.fork", parentID, "allow", ""); err != nil {
+		return Application{}, err
+	}
+	if err := s.persistLocked(map[string]any{"type": "application.fork", "application_id": id, "fork_parent": parentID}); err != nil {
+		return Application{}, err
+	}
+	return a, nil
+}
+
+// ContextPages exposes a context's sealed page hashes and tail hash so
+// control-plane callers can verify copy-on-write sharing between forked
+// applications.
+func (s *Supervisor) ContextPages(id string) (pages []string, tail string, err error) {
+	s.mu.Lock()
+	a, ok := s.state.Applications[id]
+	s.mu.Unlock()
+	if !ok {
+		return nil, "", ErrApplicationNotFound
+	}
+	return s.contexts.Pages(a.OwnerAgent, a.ContextID)
+}
+
+// SetTurnConcurrency bounds how many turns may execute at once. One keeps
+// the strictly serial execution model; higher values fan turns out to the
+// provider concurrently while claim ordering, per-application single-flight
+// and VTC fairness stay enforced.
+func (s *Supervisor) SetTurnConcurrency(n int) error {
+	if n < 1 || n > 64 {
+		return errors.New("turn concurrency must be between 1 and 64")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.turnConcurrency = n
+	return nil
 }
 
 func (s *Supervisor) InspectApplication(id string) (Application, error) {

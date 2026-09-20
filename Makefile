@@ -146,6 +146,10 @@ aok-event-probe-test:
 aok-initfs-boot-test:
 	@sh runtime/scripts/initfs-boot.sh
 
+.PHONY: aok-initfs-turn-test
+aok-initfs-turn-test:
+	@sh runtime/scripts/initfs-turn-boot.sh
+
 runtime-smoke:
 	@python3 runtime/scripts/smoke.py
 

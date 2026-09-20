@@ -12,9 +12,11 @@ import (
 
 // InitConfig describes the one child owned by the AOK guest PID1.
 // SupervisorArgs are passed verbatim and cannot be selected by a guest request.
+// Env entries are appended to the child environment (KEY=VALUE form).
 type InitConfig struct {
 	Supervisor     string
 	SupervisorArgs []string
+	SupervisorEnv  []string
 	Restart        bool
 	MaxRestarts    int
 	RestartWindow  time.Duration
@@ -64,6 +66,9 @@ func RunInit(ctx context.Context, config InitConfig) error {
 		if kernelRoot != nil {
 			cmd.ExtraFiles = []*os.File{kernelRoot}
 			cmd.Env = append(os.Environ(), "AOK_ROOT_FD=3")
+		}
+		if len(config.SupervisorEnv) > 0 {
+			cmd.Env = append(cmd.Env, config.SupervisorEnv...)
 		}
 		if err := cmd.Start(); err != nil {
 			return err

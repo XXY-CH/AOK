@@ -11,10 +11,13 @@ class FakeControl:
         self.prompts = {}
 
     def call(self, method, params):
-        if method == "application.create":
+        if method in ("application.create", "application.fork"):
             aid = f"app-{len(self.apps)}"
             self.apps[aid] = params["owner_agent"]
             return {"application_id": aid}
+        if method == "context.pages":
+            return {"application_id": params["application_id"],
+                    "pages": ["page-plan"], "tail": ""}
         if method == "message.send":
             aid = params["application_id"]
             self.prompts[aid] = params["payload"]["text"]

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -182,6 +183,11 @@ func (s *Supervisor) claimTurn() (string, MailboxMessage, error) {
 		if a.State != "serving" || a.WakePolicy == "manual" {
 			continue
 		}
+		// One turn per application at a time: parallel fan-out spreads
+		// across applications, never within one application's turn order.
+		if s.inflight[id] {
+			continue
+		}
 		// Admission throttle: in the pressure band admit at most one
 		// turn per interval; freezing only happens at the hard limit.
 		if a.TokenLimit > 0 && a.TokensUsed < a.TokenLimit &&
@@ -231,7 +237,17 @@ func (s *Supervisor) claimTurn() (string, MailboxMessage, error) {
 		return "", MailboxMessage{}, err
 	}
 	s.lastClaim[chosen] = now
+	s.inflight[chosen] = true
 	return chosen, copy, nil
+}
+
+// clearInflight releases an application's single-turn slot. It runs when the
+// turn settles or is requeued, including the stop path; the in-memory map
+// resets on restart because load() requeues every claimed message.
+func (s *Supervisor) clearInflight(id string) {
+	s.mu.Lock()
+	delete(s.inflight, id)
+	s.mu.Unlock()
 }
 
 // maxThrottleBand bounds how far prefix affinity may jump past the
@@ -265,6 +281,9 @@ func (s *Supervisor) finishTurn(id string, m MailboxMessage, text string, usage 
 	overflowed := false
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Any finish settles the application's single-flight slot, including
+	// the idempotent replay of an already committed result.
+	delete(s.inflight, id)
 	a := s.state.Applications[id]
 	if a == nil {
 		return ErrApplicationNotFound
@@ -439,8 +458,75 @@ func (s *Supervisor) Result(id, messageID string) (TurnResult, error) {
 	return r, nil
 }
 
+// executeTurn runs one claimed turn to a terminal state: route-policy
+// check, provider execution, kernel taint fold and durable commit. It is
+// the single turn body for both the serial and the concurrent runner.
+func (s *Supervisor) executeTurn(ctx context.Context, provider Provider, id string, m MailboxMessage) error {
+	defer s.clearInflight(id)
+	var p struct {
+		Text string `json:"text"`
+	}
+	var text string
+	var usage Usage
+	var err error
+	s.mu.Lock()
+	_, prepared := s.state.Prepared[m.MessageID]
+	s.mu.Unlock()
+	route := RouteInfo{Provider: provider.Name(), CompatKey: compatKeyOf(provider)}
+	if !prepared {
+		s.mu.Lock()
+		app := s.state.Applications[id]
+		var policy RoutePolicy
+		if app != nil {
+			policy = app.RoutePolicy
+		}
+		s.mu.Unlock()
+		// Self-enforcing providers (routers) read the policy from the
+		// context; direct providers are checked here.
+		if len(policy.Backends) > 0 {
+			if _, selfEnforcing := provider.(interface{ LastRoute() RouteInfo }); !selfEnforcing &&
+				!containsString(policy.Backends, provider.Name()) {
+				err = ErrRouteDenied
+			}
+		}
+		if err == nil {
+			if err = json.Unmarshal(m.Payload, &p); err == nil {
+				turnCtx, cancel := context.WithTimeout(WithRouteBackends(ctx, policy.Backends), 2*time.Minute)
+				text, usage, err = provider.Complete(turnCtx, p.Text)
+				cancel()
+			}
+		}
+		if tracker, ok := provider.(interface{ LastRoute() RouteInfo }); ok && err == nil {
+			route = tracker.LastRoute()
+		}
+	}
+	if ctx.Err() != nil {
+		if requeueErr := s.requeueClaim(id, m.MessageID); requeueErr != nil {
+			return requeueErr
+		}
+		return nil
+	} // Recovery requeues the unacknowledged claim.
+	// Kernel inference reports the session taint with each result;
+	// fold it into the application's dataflow ledger so the export
+	// gate sees kernel-side labels too.
+	if err == nil && !prepared {
+		if tainted, ok := provider.(interface{ LastTaint() uint64 }); ok {
+			s.foldTaint(id, tainted.LastTaint())
+		}
+	}
+	if err = s.finishTurn(id, m, text, usage, route, err); err != nil {
+		if requeueErr := s.requeueClaim(id, m.MessageID); requeueErr != nil {
+			return fmt.Errorf("%w (requeue failed: %v)", err, requeueErr)
+		}
+		return err
+	}
+	return nil
+}
+
 // Run processes durable messages without a connected control client. The
 // provider is supervisor-owned; message data never selects a backend or program.
+// Turn concurrency above one fans claimed turns out concurrently; claim
+// ordering, per-application single-flight and VTC fairness are unchanged.
 func (s *Supervisor) Run(ctx context.Context, provider Provider) error {
 	if provider == nil {
 		return errors.New("runner requires provider")
@@ -450,10 +536,22 @@ func (s *Supervisor) Run(ctx context.Context, provider Provider) error {
 	if err := s.attachKernel(); err != nil {
 		return err
 	}
+	s.mu.Lock()
+	concurrency := s.turnConcurrency
+	s.mu.Unlock()
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	var workers sync.WaitGroup
+	defer workers.Wait()
+	slots := make(chan struct{}, concurrency)
+	failures := make(chan error, concurrency)
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
+		case err := <-failures:
+			return err
 		case <-ticker.C:
 		}
 		if err := s.deliverTimers(); err != nil {
@@ -472,57 +570,24 @@ func (s *Supervisor) Run(ctx context.Context, provider Provider) error {
 		if id == "" {
 			continue
 		}
-		var p struct {
-			Text string `json:"text"`
-		}
-		var text string
-		var usage Usage
-		s.mu.Lock()
-		_, prepared := s.state.Prepared[m.MessageID]
-		s.mu.Unlock()
-		route := RouteInfo{Provider: provider.Name(), CompatKey: compatKeyOf(provider)}
-		if !prepared {
-			s.mu.Lock()
-			policy := s.state.Applications[id].RoutePolicy
-			s.mu.Unlock()
-			// Self-enforcing providers (routers) read the policy from the
-			// context; direct providers are checked here.
-			if len(policy.Backends) > 0 {
-				if _, selfEnforcing := provider.(interface{ LastRoute() RouteInfo }); !selfEnforcing &&
-					!containsString(policy.Backends, provider.Name()) {
-					err = ErrRouteDenied
-				}
-			}
-			if err == nil {
-				if err = json.Unmarshal(m.Payload, &p); err == nil {
-					turnCtx, cancel := context.WithTimeout(WithRouteBackends(ctx, policy.Backends), 2*time.Minute)
-					text, usage, err = provider.Complete(turnCtx, p.Text)
-					cancel()
-				}
-			}
-			if tracker, ok := provider.(interface{ LastRoute() RouteInfo }); ok && err == nil {
-				route = tracker.LastRoute()
-			}
-		}
-		if ctx.Err() != nil {
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
 			if requeueErr := s.requeueClaim(id, m.MessageID); requeueErr != nil {
 				return requeueErr
 			}
 			return nil
-		} // Recovery requeues the unacknowledged claim.
-		// Kernel inference reports the session taint with each result;
-		// fold it into the application's dataflow ledger so the export
-		// gate sees kernel-side labels too.
-		if err == nil && !prepared {
-			if tainted, ok := provider.(interface{ LastTaint() uint64 }); ok {
-				s.foldTaint(id, tainted.LastTaint())
-			}
 		}
-		if err = s.finishTurn(id, m, text, usage, route, err); err != nil {
-			if requeueErr := s.requeueClaim(id, m.MessageID); requeueErr != nil {
-				return fmt.Errorf("%w (requeue failed: %v)", err, requeueErr)
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			defer func() { <-slots }()
+			if err := s.executeTurn(ctx, provider, id, m); err != nil {
+				select {
+				case failures <- err:
+				default:
+				}
 			}
-			return err
-		}
+		}()
 	}
 }

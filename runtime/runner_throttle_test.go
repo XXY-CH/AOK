@@ -27,6 +27,12 @@ func TestClaimTurnTokenThrottle(t *testing.T) {
 	if err != nil || id != app.ApplicationID {
 		t.Fatalf("first claim in throttle band must still run: %v %v", id, err)
 	}
+	// A turn settles before the application claims again: parallel fan-out
+	// spreads across applications, never within one application.
+	if err := s.finishTurn(id, first, "ok", Usage{},
+		RouteInfo{Provider: "echo"}, nil); err != nil {
+		t.Fatal(err)
+	}
 	if id, _, err = s.claimTurn(); err != nil || id != "" {
 		t.Fatalf("immediate re-claim must be throttled: %v %v", id, err)
 	}
@@ -36,6 +42,10 @@ func TestClaimTurnTokenThrottle(t *testing.T) {
 	id, second, err := s.claimTurn()
 	if err != nil || id != app.ApplicationID || second.MessageID == first.MessageID {
 		t.Fatalf("claim after the interval must resume: %v %v", id, err)
+	}
+	if err := s.finishTurn(id, second, "ok", Usage{},
+		RouteInfo{Provider: "echo"}, nil); err != nil {
+		t.Fatal(err)
 	}
 
 	// Below the band, admission stays immediate.

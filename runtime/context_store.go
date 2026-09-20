@@ -236,24 +236,75 @@ func (s *ContextStore) Append(owner, id, key string, data []byte) (string, error
 // Fork seals the parent's current tail into its immutable prefix. Both contexts
 // reference the same CAS pages; later appends allocate independent tails.
 func (s *ContextStore) Fork(owner, id, key string) (string, error) {
-	return s.mutate(owner, id, key, "fork", nil, func(tx *sql.Tx) (string, error) {
+	return s.ForkTo(owner, id, owner, key)
+}
+
+// ForkTo seals the parent context and creates a child owned by childOwner.
+// The child's pages reference the same CAS blobs (copy-on-write fan-out);
+// only the divergence after the fork allocates new content.
+func (s *ContextStore) ForkTo(parentOwner, parentID, childOwner, key string) (string, error) {
+	if strings.TrimSpace(childOwner) == "" {
+		return "", ErrContextAccess
+	}
+	return s.mutate(parentOwner, parentID, key, "fork", nil, func(tx *sql.Tx) (string, error) {
 		child, err := newContextID()
 		if err != nil {
 			return "", err
 		}
-		if _, err = tx.Exec("INSERT INTO contexts(id,owner) VALUES(?,?)", child, owner); err != nil {
+		if _, err = tx.Exec("INSERT INTO contexts(id,owner) VALUES(?,?)", child, childOwner); err != nil {
 			return "", err
 		}
 		if _, err = tx.Exec(`INSERT INTO pages(context_id,position,hash)
-SELECT id,(SELECT COALESCE(MAX(position)+1,0) FROM pages WHERE context_id=?),tail FROM contexts WHERE id=? AND tail IS NOT NULL`, id, id); err != nil {
+SELECT id,(SELECT COALESCE(MAX(position)+1,0) FROM pages WHERE context_id=?),tail FROM contexts WHERE id=? AND tail IS NOT NULL`, parentID, parentID); err != nil {
 			return "", err
 		}
-		if _, err = tx.Exec("UPDATE contexts SET tail=NULL WHERE id=?", id); err != nil {
+		if _, err = tx.Exec("UPDATE contexts SET tail=NULL WHERE id=?", parentID); err != nil {
 			return "", err
 		}
-		_, err = tx.Exec("INSERT INTO pages SELECT ?,position,hash FROM pages WHERE context_id=?", child, id)
+		_, err = tx.Exec("INSERT INTO pages SELECT ?,position,hash FROM pages WHERE context_id=?", child, parentID)
 		return child, err
 	})
+}
+
+// Pages returns the sealed page hashes of a context in order plus the
+// current unsealed tail hash, if any. Identical page lists are the evidence
+// that forked contexts share CAS content.
+func (s *ContextStore) Pages(owner, id string) (pages []string, tail string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, "", err
+	}
+	defer tx.Rollback()
+	if err = authorizeContext(tx, owner, id); err != nil {
+		return nil, "", err
+	}
+	rows, err := tx.Query("SELECT hash FROM pages WHERE context_id=? ORDER BY position", id)
+	if err != nil {
+		return nil, "", err
+	}
+	for rows.Next() {
+		var hash string
+		if err = rows.Scan(&hash); err != nil {
+			rows.Close()
+			return nil, "", err
+		}
+		pages = append(pages, hash)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, "", err
+	}
+	var nullable sql.NullString
+	if err = tx.QueryRow("SELECT tail FROM contexts WHERE id=?", id).Scan(&nullable); err != nil {
+		return nil, "", err
+	}
+	if nullable.Valid {
+		tail = nullable.String
+	}
+	return pages, tail, nil
 }
 
 func snapshotContext(tx *sql.Tx, id string) (ContextSnapshot, error) {
